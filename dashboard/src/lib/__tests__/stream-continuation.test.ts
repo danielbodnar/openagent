@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isStreamContinuation } from "../stream-continuation";
+import { isStreamContinuation, mergeStreamFragment } from "../stream-continuation";
 
 describe("isStreamContinuation", () => {
   it("treats empty strings as continuation", () => {
@@ -53,5 +53,29 @@ describe("isStreamContinuation", () => {
         "Reasoning about completely different topic"
       )
     ).toBe(false);
+  });
+});
+
+describe("mergeStreamFragment", () => {
+  it("accepts cumulative snapshots", () => {
+    expect(mergeStreamFragment("Hello", "Hello world")).toBe("Hello world");
+  });
+
+  it("appends incremental fragments with overlap", () => {
+    expect(mergeStreamFragment("No, it is not actually enforced yet.", "\n\nCurrent state:")).toBe(
+      "No, it is not actually enforced yet.\n\nCurrent state:",
+    );
+    expect(mergeStreamFragment("I am going", "going to fix it")).toBe(
+      "I am going to fix it",
+    );
+  });
+
+  it("ignores replayed shorter prefixes", () => {
+    expect(
+      mergeStreamFragment(
+        "The docs are accurate about this current state.",
+        "The docs are accurate",
+      ),
+    ).toBe("The docs are accurate about this current state.");
   });
 });

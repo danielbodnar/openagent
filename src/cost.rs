@@ -40,9 +40,9 @@ const fn pricing(
 // Prices are nanodollars per token. Provider rates are published per 1M tokens,
 // so "$1.25 / 1M tokens" becomes 1_250 nanodollars per token.
 //
-// Sources checked May 22, 2026:
+// Sources checked May 26, 2026:
 // - OpenAI API pricing and model pages: https://developers.openai.com/api/docs/pricing
-// - xAI model pricing: https://docs.x.ai/developers/models/grok-4
+// - xAI model pricing: https://docs.x.ai/developers/pricing
 // - Z.AI pricing: https://docs.z.ai/guides/overview/pricing
 // - MiniMax pay-as-you-go pricing: https://platform.minimax.io/docs/guides/pricing-paygo
 const PRICING_ENTRIES: &[PricingEntry] = &[
@@ -80,6 +80,11 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         canonical: "claude-3-opus",
         aliases: &["claude-3-opus", "claude-3.0-opus"],
         pricing: pricing(15_000, 75_000, Some(18_750), Some(1_500)),
+    },
+    PricingEntry {
+        canonical: "claude-opus-4-8",
+        aliases: &["claude-opus-4-8", "claude-4-8-opus"],
+        pricing: pricing(5_000, 25_000, Some(6_250), Some(500)),
     },
     PricingEntry {
         canonical: "claude-opus-4-7",
@@ -218,8 +223,13 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
     },
     PricingEntry {
         canonical: "grok-4-fast",
-        aliases: &["grok-4-fast", "grok-inference", "grok-build"],
+        aliases: &["grok-4-fast", "grok-inference"],
         pricing: pricing(1_250, 2_500, None, Some(200)),
+    },
+    PricingEntry {
+        canonical: "grok-build",
+        aliases: &["grok-build-0.1", "grok-build"],
+        pricing: pricing(1_000, 2_000, None, Some(200)),
     },
     PricingEntry {
         canonical: "grok-4",
@@ -502,7 +512,7 @@ mod tests {
         assert_eq!(normalize_model("gemini-3-pro-preview"), "gemini-3-pro");
         assert_eq!(normalize_model("grok-4-fast-reasoning"), "grok-4-fast");
         assert_eq!(normalize_model("xAI/Grok Inference"), "grok-4-fast");
-        assert_eq!(normalize_model("grok-build"), "grok-4-fast");
+        assert_eq!(normalize_model("grok-build"), "grok-build");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
         assert_eq!(normalize_model("zai/glm-5.1"), "glm-5.1");
         assert_eq!(normalize_model("zai/glm-5-turbo"), "glm-5-turbo");
@@ -550,9 +560,14 @@ mod tests {
         assert_eq!(gpt_53.output_nano_per_token, 14_000);
 
         let grok = pricing_for_model("grok-build").expect("grok pricing");
-        assert_eq!(grok.input_nano_per_token, 1_250);
-        assert_eq!(grok.output_nano_per_token, 2_500);
+        assert_eq!(grok.input_nano_per_token, 1_000);
+        assert_eq!(grok.output_nano_per_token, 2_000);
         assert_eq!(grok.cache_read_nano_per_token, Some(200));
+
+        let grok_fast = pricing_for_model("grok-4-fast").expect("grok fast pricing");
+        assert_eq!(grok_fast.input_nano_per_token, 1_250);
+        assert_eq!(grok_fast.output_nano_per_token, 2_500);
+        assert_eq!(grok_fast.cache_read_nano_per_token, Some(200));
 
         let glm = pricing_for_model("zai/glm-5.1").expect("glm-5.1 pricing");
         assert_eq!(glm.input_nano_per_token, 1_400);

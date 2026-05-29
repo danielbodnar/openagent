@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { login, getHealth } from '@/lib/api';
 import { clearJwt, getStoredUsername, getValidJwt, setJwt, setStoredUsername, signalAuthSuccess } from '@/lib/auth';
 import { Lock } from 'lucide-react';
+import { FullScreenLoader } from '@/components/ui/loading-ring';
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
@@ -137,13 +138,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   };
 
   if (!ready) {
-    return (
-      <div className="min-h-screen bg-[#121214] text-white" aria-label="Checking authentication">
-        <div className="flex min-h-screen items-center justify-center">
-          <div className="h-6 w-6 animate-spin rounded-full border-2 border-white/20 border-t-indigo-400" />
-        </div>
-      </div>
-    );
+    return <FullScreenLoader />;
   }
 
   if (!needsLogin) {

@@ -28,23 +28,27 @@ import { cn } from '@/lib/utils';
 const componentNames: Record<string, string> = {
   open_agent: 'sandboxed.sh',
   sandboxed_sh: 'sandboxed.sh',
+  assistant_mcp: 'Assistant MCP',
+  hermes_assistant: 'Hermes Assistant',
   opencode: 'OpenCode',
   claude_code: 'Claude Code',
   codex: 'Codex',
   grok: 'Grok Build',
-  oh_my_opencode: 'oh-my-opencode',
 };
 
 // Component icons
 const componentIcons: Record<string, string> = {
   open_agent: '🚀',
   sandboxed_sh: '🚀',
+  assistant_mcp: '🔌',
+  hermes_assistant: '◈',
   opencode: '⚡',
   claude_code: '🤖',
   codex: '🧠',
   grok: '𝕏',
-  oh_my_opencode: '🎭',
 };
+
+const readonlyComponents = new Set(['assistant_mcp', 'hermes_assistant']);
 
 interface UpdateLog {
   message: string;
@@ -100,8 +104,7 @@ export function ServerConnectionCard({
   const [updateLogsByOp, setUpdateLogsByOp] = useState<Record<OpKey, UpdateLog[]>>({});
   const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({});
 
-  // Fetch the legacy host-only summary AND the new per-workspace report in parallel.
-  // The legacy endpoint still owns host-only components (sandboxed.sh, oh-my-opencode).
+  // Fetch the host summary and the per-workspace report in parallel.
   const { data: legacyData, isLoading: legacyLoading, mutate: mutateLegacy } = useSWR(
     'system-components',
     async () => (await getSystemComponents()).components,
@@ -180,6 +183,7 @@ export function ServerConnectionCard({
   };
 
   const handleHostUpdate = (component: ComponentInfo) => {
+    if (readonlyComponents.has(component.name)) return;
     runOperation(
       component.name,
       'update',
@@ -193,6 +197,7 @@ export function ServerConnectionCard({
       toast.error('Cannot uninstall sandboxed.sh - it is the main application');
       return;
     }
+    if (readonlyComponents.has(component.name)) return;
     runOperation(
       component.name,
       'uninstall',
@@ -276,13 +281,17 @@ export function ServerConnectionCard({
 
   const toneBadgeClass = (tone: 'emerald' | 'amber' | 'red') =>
     tone === 'emerald'
-      ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+      ? 'harness-status-badge harness-status-badge-emerald'
       : tone === 'amber'
-      ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-      : 'border-red-500/30 bg-red-500/10 text-red-300';
+      ? 'harness-status-badge harness-status-badge-amber'
+      : 'harness-status-badge harness-status-badge-red';
 
   const toneDotClass = (tone: 'emerald' | 'amber' | 'red') =>
-    tone === 'emerald' ? 'bg-emerald-400' : tone === 'amber' ? 'bg-amber-400' : 'bg-red-400';
+    tone === 'emerald'
+      ? 'harness-status-dot-emerald'
+      : tone === 'amber'
+      ? 'harness-status-dot-amber'
+      : 'harness-status-dot-red';
 
   const isOpInProgress = (key: OpKey) => activeOps[key] === 'update';
   const hasActiveOpsForComponent = (componentName: string) =>
@@ -378,6 +387,7 @@ export function ServerConnectionCard({
                     if (components.some((c) => c.name === 'opencode' && c.installed)) backends.push('OpenCode');
                     if (components.some((c) => c.name === 'claude_code' && c.installed)) backends.push('Claude Code');
                     if (components.some((c) => c.name === 'codex' && c.installed)) backends.push('Codex');
+                    if (components.some((c) => c.name === 'grok' && c.installed)) backends.push('Grok Build');
                     return backends.length > 0 ? `${backends.join(' + ')} stack` : 'No backends';
                   })()
                 : 'Loading...'}
@@ -394,6 +404,7 @@ export function ServerConnectionCard({
             </button>
             <button
               onClick={() => setComponentsExpanded(!componentsExpanded)}
+              aria-label={componentsExpanded ? 'Collapse components' : 'Expand components'}
               className="p-1 rounded-lg text-white/40 hover:text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer"
             >
               {componentsExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
@@ -470,11 +481,11 @@ export function ServerConnectionCard({
 
                       <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
                         {/* Host-level Update/Install button stays available even when collapsed. */}
-                        {component.status === 'update_available' && (
+                        {component.status === 'update_available' && !readonlyComponents.has(component.name) && (
                           <button
                             onClick={() => handleHostUpdate(component)}
                             disabled={!!activeOps[component.name]}
-                            className="flex items-center gap-1.5 rounded-lg bg-indigo-500/20 border border-indigo-500/30 px-2.5 py-1 text-xs text-indigo-300 hover:bg-indigo-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="harness-action harness-action-primary"
                             title="Update host installation"
                           >
                             {hostOpInFlight ? (
@@ -485,11 +496,11 @@ export function ServerConnectionCard({
                             Update host
                           </button>
                         )}
-                        {component.status === 'not_installed' && (
+                        {component.status === 'not_installed' && !readonlyComponents.has(component.name) && (
                           <button
                             onClick={() => handleHostUpdate(component)}
                             disabled={!!activeOps[component.name]}
-                            className="flex items-center gap-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="harness-action harness-action-success"
                           >
                             <ArrowUp className="h-3 w-3" />
                             Install
@@ -499,18 +510,18 @@ export function ServerConnectionCard({
                           <button
                             onClick={() => handleSyncAll(report)}
                             disabled={hasActiveOpsForComponent(component.name)}
-                            className="flex items-center gap-1.5 rounded-lg bg-amber-500/20 border border-amber-500/30 px-2.5 py-1 text-xs text-amber-300 hover:bg-amber-500/30 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="harness-action harness-action-warning"
                             title="Sync installed workspaces that are behind the host version"
                           >
                             <ArrowUp className="h-3 w-3" />
                             Sync {outOfSync.length}
                           </button>
                         )}
-                        {component.installed && component.name !== 'sandboxed_sh' && (
+                        {component.installed && component.name !== 'sandboxed_sh' && !readonlyComponents.has(component.name) && (
                           <button
                             onClick={() => handleHostUninstall(component)}
                             disabled={!!activeOps[component.name]}
-                            className="p-1.5 rounded-lg text-white/30 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="harness-icon-action harness-icon-action-danger"
                             title={`Uninstall ${componentNames[component.name] || component.name}`}
                           >
                             <Trash2 className="h-3.5 w-3.5" />
@@ -554,7 +565,9 @@ export function ServerConnectionCard({
                               <span
                                 className={cn(
                                   'shrink-0',
-                                  ws.in_sync ? 'text-emerald-300/80' : 'text-amber-300/80'
+                                  ws.in_sync
+                                    ? 'harness-workspace-version-synced'
+                                    : 'harness-workspace-version-stale'
                                 )}
                               >
                                 {versionLabel}
@@ -567,7 +580,7 @@ export function ServerConnectionCard({
                                 <button
                                   onClick={() => handleWorkspaceUpdate(component.name, ws)}
                                   disabled={!!activeOps[opKey]}
-                                  className="flex items-center gap-1.5 rounded-md bg-indigo-500/15 border border-indigo-500/25 px-2 py-0.5 text-[10px] text-indigo-300 hover:bg-indigo-500/25 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                                  className="harness-action harness-action-primary harness-action-compact"
                                 >
                                   {inFlight ? (
                                     <Loader className="h-3 w-3 animate-spin" />

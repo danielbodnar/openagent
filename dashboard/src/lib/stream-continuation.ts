@@ -54,3 +54,22 @@ export function isStreamContinuation(a: string, b: string): boolean {
   if (longer.length - shorter.length > TAIL_TOLERANCE) return false;
   return longer.slice(0, shorter.length) === shorter;
 }
+
+function suffixPrefixOverlapLength(existing: string, incoming: string): number {
+  const maxOverlap = Math.min(existing.length, incoming.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap--) {
+    if (existing.slice(existing.length - overlap) === incoming.slice(0, overlap)) {
+      return overlap;
+    }
+  }
+  return 0;
+}
+
+export function mergeStreamFragment(existing: string, incoming: string): string {
+  if (!incoming) return existing;
+  if (!existing || incoming.startsWith(existing)) return incoming;
+  if (existing.startsWith(incoming)) return existing;
+
+  const overlap = suffixPrefixOverlapLength(existing, incoming);
+  return existing + incoming.slice(overlap);
+}

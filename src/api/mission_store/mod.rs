@@ -105,6 +105,15 @@ pub struct Mission {
     pub first_viewed_at: Option<String>,
 }
 
+/// Aggregate mission counts by status.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MissionStatusCounts {
+    pub total: usize,
+    pub active: usize,
+    pub completed: usize,
+    pub failed: usize,
+}
+
 fn default_backend() -> String {
     "claudecode".to_string()
 }
@@ -1069,6 +1078,9 @@ pub trait MissionStore: Send + Sync {
 
     /// List missions, ordered by updated_at descending.
     async fn list_missions(&self, limit: usize, offset: usize) -> Result<Vec<Mission>, String>;
+
+    /// Count missions by status without applying list pagination.
+    async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String>;
 
     /// Get a single mission by ID.
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String>;

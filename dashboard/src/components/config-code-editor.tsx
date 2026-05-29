@@ -6,15 +6,16 @@ import { cn } from '@/lib/utils';
 import type { Extension } from '@codemirror/state';
 import { RangeSetBuilder } from '@codemirror/state';
 import { Decoration, EditorView, ViewPlugin, placeholder as placeholderExt } from '@codemirror/view';
-import { StreamLanguage } from '@codemirror/language';
+import { HighlightStyle, StreamLanguage, syntaxHighlighting } from '@codemirror/language';
 import { json as jsonLanguage } from '@codemirror/lang-json';
 import { markdown as markdownLanguage } from '@codemirror/lang-markdown';
 import { shell } from '@codemirror/legacy-modes/mode/shell';
 import { toml } from '@codemirror/legacy-modes/mode/toml';
+import { tags } from '@lezer/highlight';
 
 const CodeMirror = dynamic(() => import('@uiw/react-codemirror').then(mod => mod.default), {
   ssr: false,
-  loading: () => <div className="animate-pulse bg-white/5 rounded h-32" />,
+  loading: () => <div className="code-block animate-pulse h-32" />,
 });
 
 type Language = 'json' | 'markdown' | 'bash' | 'toml' | 'plain';
@@ -94,7 +95,7 @@ function editorTheme(padding: number | undefined): Extension {
     {
       '&': {
         backgroundColor: 'transparent',
-        color: 'rgba(255, 255, 255, 0.9)',
+        color: 'rgb(var(--code-foreground))',
       },
       '&.cm-editor': {
         backgroundColor: 'transparent',
@@ -128,19 +129,29 @@ function editorTheme(padding: number | undefined): Extension {
       '.cm-gutters': {
         backgroundColor: 'transparent',
         border: 'none',
-        color: 'rgba(255, 255, 255, 0.35)',
+        color: 'rgb(var(--foreground-tertiary) / 0.72)',
       },
       '.cm-content': {
         backgroundColor: 'transparent',
         padding: paddingValue,
-        caretColor: 'white',
+        caretColor: 'rgb(var(--foreground))',
         fontVariantLigatures: 'none',
         fontFeatureSettings: '"liga" 0, "calt" 0',
         fontKerning: 'none',
         letterSpacing: '0',
       },
       '.cm-placeholder': {
-        color: 'rgba(255, 255, 255, 0.25)',
+        color: 'rgb(var(--foreground-tertiary) / 0.72)',
+      },
+      '.cm-activeLine': {
+        backgroundColor: 'transparent',
+      },
+      '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': {
+        backgroundColor: 'rgb(var(--accent) / 0.22)',
+      },
+      '.cm-matchingBracket': {
+        backgroundColor: 'rgb(var(--accent) / 0.12)',
+        outline: '1px solid rgb(var(--accent) / 0.28)',
       },
       '.cm-encrypted-tag': {
         color: '#f59e0b',
@@ -156,10 +167,23 @@ function editorTheme(padding: number | undefined): Extension {
         textDecoration: 'line-through',
         textDecorationColor: 'rgba(239, 68, 68, 0.5)',
       },
-    },
-    { dark: true }
+    }
   );
 }
+
+const codeHighlightTheme = syntaxHighlighting(
+  HighlightStyle.define([
+    { tag: [tags.keyword, tags.operatorKeyword, tags.modifier], color: 'rgb(79 70 229)' },
+    { tag: [tags.string, tags.special(tags.string)], color: 'rgb(4 120 87)' },
+    { tag: [tags.number, tags.bool, tags.null], color: 'rgb(180 83 9)' },
+    { tag: [tags.propertyName, tags.attributeName], color: 'rgb(37 99 235)' },
+    { tag: [tags.variableName, tags.definition(tags.variableName)], color: 'rgb(var(--code-foreground))' },
+    { tag: [tags.comment, tags.lineComment, tags.blockComment], color: 'rgb(var(--foreground-tertiary) / 0.86)' },
+    { tag: [tags.heading], color: 'rgb(var(--foreground))', fontWeight: '600' },
+    { tag: [tags.link], color: 'rgb(67 56 202)', textDecoration: 'underline' },
+    { tag: [tags.invalid], color: 'rgb(185 28 28)' },
+  ])
+);
 
 export function ConfigCodeEditor({
   value,
@@ -179,7 +203,7 @@ export function ConfigCodeEditor({
   const hasFailedEncryptedContent = highlightEncrypted && /<encrypted-failed/i.test(value);
 
   const extensions = useMemo<Extension[]>(() => {
-    const list: Extension[] = [editorTheme(padding), EditorView.lineWrapping];
+    const list: Extension[] = [editorTheme(padding), codeHighlightTheme, EditorView.lineWrapping];
     if (placeholder) {
       list.push(placeholderExt(placeholder));
     }
@@ -208,7 +232,7 @@ export function ConfigCodeEditor({
   return (
     <div
       className={cn(
-        'rounded-lg bg-black/20 border border-white/[0.06] focus-within:border-indigo-500/50 transition-colors relative overflow-hidden',
+        'code-block p-0 focus-within:border-indigo-500/50 transition-colors relative overflow-hidden',
         disabled && 'opacity-60',
         className
       )}

@@ -9,7 +9,7 @@ import type { MissionStatus } from "@/lib/api/missions";
 const STATUS_COLORS: Record<MissionStatus, string> = {
   pending: "#fbbf24", // amber-400
   active: "#818cf8", // indigo-400
-  awaiting_user: "#38bdf8", // sky-400
+  awaiting_user: "#f472b6", // pink-400, reserved for "needs user"
   acknowledged: "#34d399", // emerald-400
   completed: "#34d399", // emerald-400
   // Failure statuses all share `bg-red-400` in `STATUS_DOT_COLORS`
@@ -35,24 +35,31 @@ const DATA_ATTR = "data-favicon-status";
 /**
  * Dynamically overlays a coloured status dot on the favicon.
  *
- * Creates its own <link> element and removes Next.js-managed favicon links
- * to ensure Chrome picks up the dynamic version. Restores originals on
- * unmount or when status is null.
+ * Creates its own <link> element after Next.js-managed favicon links. Do not
+ * remove framework-managed head nodes: React tracks those as hoistable
+ * resources and expects to own their lifecycle during route updates.
  */
 export function useFaviconStatus(status: MissionStatus | null, isRunning: boolean) {
   const cachedImg = useRef<HTMLImageElement | null>(null);
-  const removedLinks = useRef<HTMLLinkElement[]>([]);
+  const originalLinks = useRef(new Map<HTMLLinkElement, { href: string; type: string | null }>());
+
+  const restoreOriginalLinks = () => {
+    originalLinks.current.forEach((original, link) => {
+      if (!document.head.contains(link)) return;
+      link.href = original.href;
+      if (original.type === null) {
+        link.removeAttribute("type");
+      } else {
+        link.type = original.type;
+      }
+    });
+    originalLinks.current.clear();
+  };
 
   useEffect(() => {
-    // No active mission → ensure originals are restored and our link removed
+    // No active mission: remove only our managed dynamic icon.
     if (!status) {
-      // Restore any previously removed links
-      removedLinks.current.forEach((link) => {
-        if (!document.head.contains(link)) {
-          document.head.appendChild(link);
-        }
-      });
-      removedLinks.current = [];
+      restoreOriginalLinks();
       // Remove our managed link
       document.querySelector(`link[${DATA_ATTR}]`)?.remove();
       return;
@@ -84,16 +91,18 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
 
       const dataUrl = canvas.toDataURL("image/png");
 
-      // Remove all existing Next.js favicon links (store refs to restore later)
-      const existingLinks = document.querySelectorAll<HTMLLinkElement>(
-        `link[rel="icon"]:not([${DATA_ATTR}])`
-      );
-      existingLinks.forEach((link) => {
-        if (!removedLinks.current.includes(link)) {
-          removedLinks.current.push(link);
-        }
-        link.remove();
-      });
+      document
+        .querySelectorAll<HTMLLinkElement>(`link[rel="icon"]:not([${DATA_ATTR}])`)
+        .forEach((link) => {
+          if (!originalLinks.current.has(link)) {
+            originalLinks.current.set(link, {
+              href: link.href,
+              type: link.getAttribute("type"),
+            });
+          }
+          link.type = "image/png";
+          link.href = dataUrl;
+        });
 
       // Create or update our managed link
       let managed = document.querySelector<HTMLLinkElement>(`link[${DATA_ATTR}]`);
@@ -134,22 +143,20 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
       if (document.visibilityState === "visible") apply();
     };
     document.addEventListener("visibilitychange", onVisibility);
+    const observer = new MutationObserver(() => apply());
+    observer.observe(document.head, { childList: true });
 
     return () => {
       cancelled = true;
       document.removeEventListener("visibilitychange", onVisibility);
+      observer.disconnect();
     };
   }, [status, isRunning]);
 
   // Cleanup on full unmount: restore originals, remove managed link
   useEffect(() => {
     return () => {
-      removedLinks.current.forEach((link) => {
-        if (!document.head.contains(link)) {
-          document.head.appendChild(link);
-        }
-      });
-      removedLinks.current = [];
+      restoreOriginalLinks();
       document.querySelector(`link[${DATA_ATTR}]`)?.remove();
     };
   }, []);

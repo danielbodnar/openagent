@@ -36,8 +36,9 @@ export interface AIProviderTypeInfo {
 }
 
 export interface AIProviderStatus {
-  type: "unknown" | "connected" | "needs_auth" | "error";
+  type: "unknown" | "connected" | "needs_auth" | "needs_reauth" | "error";
   auth_url?: string;
+  reason?: string;
   message?: string;
 }
 
@@ -402,10 +403,16 @@ export async function getUsageSummary(window: UsageWindow = "all"): Promise<Usag
   );
 }
 
-export async function listProviders(options?: { includeAll?: boolean }): Promise<ProvidersResponse> {
+export async function listProviders(options?: {
+  includeAll?: boolean;
+  includeUnverified?: boolean;
+}): Promise<ProvidersResponse> {
   const params = new URLSearchParams();
   if (options?.includeAll) {
     params.set("include_all", "true");
+  }
+  if (options?.includeUnverified) {
+    params.set("include_unverified", "true");
   }
   const query = params.toString();
   const res = await apiFetch(`/api/providers${query ? `?${query}` : ""}`);
@@ -415,10 +422,14 @@ export async function listProviders(options?: { includeAll?: boolean }): Promise
 
 export async function listBackendModelOptions(options?: {
   includeAll?: boolean;
+  includeUnverified?: boolean;
 }): Promise<BackendModelOptionsResponse> {
   const params = new URLSearchParams();
   if (options?.includeAll) {
     params.set("include_all", "true");
+  }
+  if (options?.includeUnverified) {
+    params.set("include_unverified", "true");
   }
   const query = params.toString();
   const res = await apiFetch(

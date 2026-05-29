@@ -67,7 +67,7 @@ impl OpenCodeAgent {
         };
 
         let agent_event = match oc_event {
-            OpenCodeEvent::Thinking { content } => {
+            OpenCodeEvent::Thinking { content, .. } => {
                 tracing::info!(
                     content_len = content.len(),
                     content_preview = %content.chars().take(100).collect::<String>(),

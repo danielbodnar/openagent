@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Loader } from "lucide-react";
+import { CircleNotch } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 
 type AsyncClickHandler = (
@@ -86,7 +86,7 @@ export const AsyncButton = forwardRef<HTMLButtonElement, AsyncButtonProps>(
     );
 
     const spinnerNode = spinner ?? (
-      <Loader
+      <CircleNotch
         className={cn("h-3.5 w-3.5 animate-spin", spinnerClassName)}
         aria-hidden
       />

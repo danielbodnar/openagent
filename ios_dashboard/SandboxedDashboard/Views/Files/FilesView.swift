@@ -12,6 +12,7 @@ struct FilesView: View {
     private var workspaceState = WorkspaceState.shared
     @State private var currentPath = "/root/context"
     @State private var entries: [FileEntry] = []
+    @State private var sortedEntries: [FileEntry] = []
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var selectedEntry: FileEntry?
@@ -42,10 +43,10 @@ struct FilesView: View {
 
     private let api = APIService.shared
     
-    private var sortedEntries: [FileEntry] {
+    private func recomputeSortedEntries() {
         let dirs = entries.filter { $0.isDirectory }.sorted { $0.name < $1.name }
         let files = entries.filter { !$0.isDirectory }.sorted { $0.name < $1.name }
-        return dirs + files
+        sortedEntries = dirs + files
     }
     
     private var breadcrumbs: [(name: String, path: String)] {
@@ -450,10 +451,12 @@ struct FilesView: View {
         // have nothing to show. Refresh happens in the background regardless.
         if let cached = pathCache[pathToLoad] {
             entries = cached
+            recomputeSortedEntries()
             isLoading = false
             touchCacheKey(pathToLoad)
         } else {
             entries = []
+            recomputeSortedEntries()
             isLoading = true
         }
 
@@ -466,6 +469,7 @@ struct FilesView: View {
             }
 
             entries = result
+            recomputeSortedEntries()
             cachePath(pathToLoad, entries: result)
         } catch {
             // Race condition guard

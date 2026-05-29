@@ -13,6 +13,20 @@ Runs:
 
 Use `--help` for all options, including backend-specific model overrides and expected model assertions.
 
+### assistant_mcp_smoke.sh
+Smoke test for the Hermes assistant MCP bridge. It checks
+`/api/system/components` for `assistant_mcp`, initializes `assistant-mcp`, calls
+`list_active_missions`, and validates the JSON-RPC responses. Use
+`--require-hermes-runtime` after installing the external Hermes service.
+
+Example:
+- `scripts/assistant_mcp_smoke.sh --base-url https://agent-backend-dev.thomas.md`
+- `scripts/assistant_mcp_smoke.sh --base-url https://agent-backend-dev.thomas.md --require-hermes-runtime`
+
+The second command is the cutover gate. It should fail until
+`hermes-assistant-dev.service` is installed, active, and reported as
+`hermes_assistant` with status `ok` from `/api/system/components`.
+
 ### harness_contract_tests.sh
 Runs a curated set of fast cross-harness contract tests that guard event-conversion invariants and OpenCode SSE parsing behavior.
 Used by CI job `harness-contract`.

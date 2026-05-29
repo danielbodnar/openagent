@@ -807,6 +807,50 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/assistants",
             get(control::list_assistant_missions),
         )
+        // Assistant gateway endpoints. These are assistant-owned aliases over
+        // the existing Telegram compatibility bridge while Hermes cutover is
+        // staged. Keep the Telegram routes below for older clients.
+        .route(
+            "/api/control/assistant/gateways",
+            get(control::list_telegram_bots).post(control::create_telegram_bot),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id",
+            axum::routing::delete(control::delete_telegram_channel)
+                .patch(control::update_telegram_channel),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/toggle",
+            post(control::toggle_telegram_channel),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/chats",
+            get(control::list_bot_chats),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/scheduled",
+            get(control::list_bot_scheduled_messages),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/actions",
+            get(control::list_bot_action_executions),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/conversations",
+            get(control::list_bot_conversations),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/workflows",
+            get(control::list_bot_workflows),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/memory",
+            get(control::list_bot_structured_memory),
+        )
+        .route(
+            "/api/control/assistant/gateways/:id/memory-search",
+            get(control::search_bot_structured_memory),
+        )
         // Telegram channel endpoints
         .route(
             "/api/control/missions/:id/telegram-channels",
@@ -939,15 +983,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // OpenCode connection endpoints
         .nest("/api/opencode/connections", opencode_api::routes())
         .route("/api/opencode/agents", get(opencode_api::list_agents))
-        // OpenCode settings (oh-my-opencode.json)
-        .route(
-            "/api/opencode/settings",
-            get(opencode_api::get_opencode_settings),
-        )
-        .route(
-            "/api/opencode/settings",
-            axum::routing::put(opencode_api::update_opencode_settings),
-        )
         .route(
             "/api/opencode/config",
             get(opencode_api::get_opencode_config),
@@ -1267,24 +1302,15 @@ async fn get_stats(
     let control_state = state.control.get_or_spawn(&user).await;
 
     // Count missions by status
-    let missions = control_state
+    let mission_counts = control_state
         .mission_store
-        .list_missions(1000, 0)
+        .count_missions_by_status()
         .await
         .unwrap_or_default();
-    let mission_total = missions.len();
-    let mission_active = missions
-        .iter()
-        .filter(|m| m.status == super::control::MissionStatus::Active)
-        .count();
-    let mission_completed = missions
-        .iter()
-        .filter(|m| m.status == super::control::MissionStatus::Completed)
-        .count();
-    let mission_failed = missions
-        .iter()
-        .filter(|m| m.status == super::control::MissionStatus::Failed)
-        .count();
+    let mission_total = mission_counts.total;
+    let mission_active = mission_counts.active;
+    let mission_completed = mission_counts.completed;
+    let mission_failed = mission_counts.failed;
 
     // Combine legacy tasks and missions
     let total_tasks = legacy_total + mission_total;

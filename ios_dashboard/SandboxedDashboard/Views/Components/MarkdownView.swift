@@ -36,13 +36,18 @@ extension EnvironmentValues {
 
 struct MarkdownView: View {
     let content: String
+    @Environment(\.controlPerformanceDiagnosticsEnabled) private var diagnosticsEnabled
+    private static let parseCache = MarkdownParseCache()
 
     init(_ content: String) {
         self.content = content
     }
 
     var body: some View {
-        let blocks = MarkdownParser.parse(content)
+        let blocks = Self.parseCache.blocks(
+            for: content,
+            diagnosticsEnabled: diagnosticsEnabled
+        )
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 switch block {
@@ -77,6 +82,75 @@ struct MarkdownView: View {
     }
 }
 
+@MainActor
+private final class MarkdownParseCache {
+    private final class Entry {
+        let blocks: [MarkdownBlock]
+
+        init(blocks: [MarkdownBlock]) {
+            self.blocks = blocks
+        }
+    }
+
+    private let cache = NSCache<NSString, Entry>()
+
+    init() {
+        cache.countLimit = 500
+    }
+
+    func blocks(for content: String, diagnosticsEnabled: Bool) -> [MarkdownBlock] {
+        let key = "\(content.count):\(content.hashValue)" as NSString
+        if let cached = cache.object(forKey: key) {
+            return cached.blocks
+        }
+
+        let parsed = diagnosticsEnabled
+            ? ControlPerformanceDiagnostics.shared.measure(
+                "markdown.parse",
+                detail: "\(content.count) chars",
+                count: content.count
+            ) {
+                MarkdownParser.parse(content)
+            }
+            : MarkdownParser.parse(content)
+        cache.setObject(Entry(blocks: parsed), forKey: key)
+        return parsed
+    }
+}
+
+@MainActor
+private final class MarkdownInlineTextCache {
+    static let shared = MarkdownInlineTextCache()
+
+    private final class Entry {
+        let attributed: AttributedString?
+
+        init(attributed: AttributedString?) {
+            self.attributed = attributed
+        }
+    }
+
+    private let cache = NSCache<NSString, Entry>()
+
+    init() {
+        cache.countLimit = 1_500
+    }
+
+    func attributedString(for content: String) -> AttributedString? {
+        let key = "\(content.count):\(content.hashValue)" as NSString
+        if let cached = cache.object(forKey: key) {
+            return cached.attributed
+        }
+
+        let attributed = try? AttributedString(
+            markdown: content,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )
+        cache.setObject(Entry(attributed: attributed), forKey: key)
+        return attributed
+    }
+}
+
 private struct MarkdownInlineText: View {
     let content: String
 
@@ -85,7 +159,7 @@ private struct MarkdownInlineText: View {
     }
 
     var body: some View {
-        if let attributed = try? AttributedString(markdown: content, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+        if let attributed = MarkdownInlineTextCache.shared.attributedString(for: content) {
             Text(attributed)
                 .font(.body)
                 .foregroundStyle(Theme.textPrimary)
@@ -257,7 +331,7 @@ struct MarkdownInlineImageView: View {
 
     var body: some View {
         Group {
-            if let data = imageData, let uiImage = UIImage(data: data) {
+            if let data = imageData, let uiImage = ImageMemoryCache.shared.cachedImage(for: imageCacheURL) ?? UIImage(data: data) {
                 Image(uiImage: uiImage)
                     .resizable()
                     .scaledToFit()
@@ -295,6 +369,10 @@ struct MarkdownInlineImageView: View {
         .task(id: imageTaskKey) {
             await load()
         }
+    }
+
+    private var imageCacheURL: URL {
+        URL(string: imageTaskKey) ?? URL(fileURLWithPath: imageTaskKey)
     }
 
     /// Key the `.task` view modifier so a context change (workspace/mission
@@ -339,8 +417,9 @@ struct MarkdownInlineImageView: View {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             if let http = response as? HTTPURLResponse, http.statusCode == 200,
-               UIImage(data: data) != nil {
+               let image = await ImageMemoryCache.shared.image(from: data, url: url) {
                 await MainActor.run {
+                    ImageMemoryCache.shared.store(image, for: imageCacheURL)
                     imageData = data
                     isLoading = false
                 }

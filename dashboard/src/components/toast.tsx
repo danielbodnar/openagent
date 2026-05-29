@@ -41,21 +41,21 @@ const toastStyles: Record<
   { bg: string; text: string; icon: string; defaultTitle: string }
 > = {
   success: {
-    bg: 'bg-[#1c1c1e]/95',
+    bg: 'panel',
     text: 'text-emerald-400',
     icon: 'text-emerald-400',
     defaultTitle: 'Success',
   },
   error: {
-    bg: 'bg-[#1c1c1e]/95',
+    bg: 'panel',
     text: 'text-red-400',
     icon: 'text-red-400',
     defaultTitle: 'Error',
   },
   info: {
-    bg: 'bg-[#1c1c1e]/95',
-    text: 'text-white/90',
-    icon: 'text-white/60',
+    bg: 'panel',
+    text: 'text-foreground',
+    icon: 'muted-text',
     defaultTitle: 'Info',
   },
 };
@@ -186,7 +186,7 @@ function ToastItem({ toast, onDismiss, onShowDetails }: ToastItemProps) {
   return (
     <div
       className={cn(
-        'relative flex items-start gap-3 p-4 rounded-xl shadow-lg transition-all duration-200 max-w-[400px] overflow-hidden border border-white/[0.06] backdrop-blur-xl',
+        'relative flex items-start gap-3 p-4 rounded-xl shadow-lg transition-all duration-200 max-w-[400px] overflow-hidden backdrop-blur-xl',
         style.bg,
         hasDetails && 'cursor-pointer hover:brightness-110',
         isExiting ? 'animate-toast-out' : 'animate-toast-in'
@@ -201,9 +201,9 @@ function ToastItem({ toast, onDismiss, onShowDetails }: ToastItemProps) {
       {/* Content */}
       <div className="flex-1 min-w-0 pr-6">
         <p className={cn('text-sm font-medium', style.text)}>{toast.title}</p>
-        <p className="text-sm text-white/70 mt-1 line-clamp-2">{truncated}</p>
+        <p className="text-sm muted-text mt-1 line-clamp-2">{truncated}</p>
         {hasDetails && (
-          <p className="text-xs text-white/40 mt-2">Click to view details</p>
+          <p className="text-xs muted-text mt-2">Click to view details</p>
         )}
       </div>
 
@@ -213,7 +213,7 @@ function ToastItem({ toast, onDismiss, onShowDetails }: ToastItemProps) {
           e.stopPropagation();
           dismiss();
         }}
-        className="absolute top-3 right-3 flex h-6 w-6 items-center justify-center rounded-md text-white/40 hover:bg-white/[0.08] hover:text-white/70 transition-colors"
+        className="icon-button absolute top-3 right-3 flex h-6 w-6 items-center justify-center rounded-md"
       >
         <X className="h-3.5 w-3.5" />
       </button>
@@ -262,13 +262,13 @@ function DetailsModal({ message, onClose }: DetailsModalProps) {
           className="w-full max-w-lg animate-scale-in-simple"
           onClick={(e) => e.stopPropagation()}
         >
-        <div className="rounded-xl bg-[#1c1c1e]/95 border border-white/[0.08] shadow-2xl">
+        <div className="panel rounded-xl shadow-2xl">
           {/* Header */}
-          <div className="flex items-center justify-between p-4 border-b border-white/[0.06]">
-            <h2 className="font-semibold text-white">Details</h2>
+          <div className="border-subtle flex items-center justify-between border-b p-4">
+            <h2 className="font-semibold text-foreground">Details</h2>
             <button
               onClick={onClose}
-              className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.06] hover:text-white transition-colors"
+              className="icon-button flex h-8 w-8 items-center justify-center rounded-lg"
             >
               <X className="h-4 w-4" />
             </button>
@@ -276,22 +276,22 @@ function DetailsModal({ message, onClose }: DetailsModalProps) {
 
           {/* Content */}
           <div className="p-4">
-            <div className="rounded-lg bg-white/[0.02] border border-white/[0.06] p-4 max-h-[300px] overflow-y-auto">
-              <pre className="text-sm text-white/80 whitespace-pre-wrap break-words font-mono">
+            <div className="code-block max-h-[300px] overflow-y-auto p-4">
+              <pre className="whitespace-pre-wrap break-words font-mono text-sm">
                 {message}
               </pre>
             </div>
           </div>
 
           {/* Footer */}
-          <div className="flex justify-end gap-2 p-4 border-t border-white/[0.06]">
+          <div className="border-subtle flex justify-end gap-2 border-t p-4">
             <button
               onClick={handleCopy}
               className={cn(
                 'flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors',
                 copied
                   ? 'bg-emerald-500/10 text-emerald-400'
-                  : 'bg-white/[0.04] text-white/60 hover:bg-white/[0.08] hover:text-white'
+                  : 'icon-button bg-[rgb(var(--text)/0.04)]'
               )}
             >
               {copied ? (
@@ -308,7 +308,7 @@ function DetailsModal({ message, onClose }: DetailsModalProps) {
             </button>
             <button
               onClick={onClose}
-              className="px-3 py-2 rounded-lg text-sm bg-white/[0.04] text-white/60 hover:bg-white/[0.08] hover:text-white transition-colors"
+              className="icon-button rounded-lg bg-[rgb(var(--text)/0.04)] px-3 py-2 text-sm"
             >
               Close
             </button>

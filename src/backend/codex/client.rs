@@ -24,11 +24,22 @@ pub struct CodexConfig {
     pub oauth_token: Option<String>,
     pub default_model: Option<String>,
     pub model_effort: Option<String>,
+    /// ChatGPT OAuth account supplied by the host app. When set, the app-server
+    /// uses external `chatgptAuthTokens` mode and asks the host to refresh.
+    pub external_chatgpt_auth: Option<CodexExternalChatgptAuth>,
     /// Deprecated. App-server is the only path now. Setting this to
     /// `false` does nothing — the legacy exec branch is gone. Kept on
     /// the struct so existing call sites that set the field still
     /// compile; remove in a follow-up cleanup PR.
     pub use_app_server: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodexExternalChatgptAuth {
+    pub access_token: String,
+    pub chatgpt_account_id: String,
+    pub chatgpt_plan_type: Option<String>,
+    pub working_dir: std::path::PathBuf,
 }
 
 impl Default for CodexConfig {
@@ -38,6 +49,7 @@ impl Default for CodexConfig {
             oauth_token: std::env::var("OPENAI_OAUTH_TOKEN").ok(),
             default_model: None,
             model_effort: None,
+            external_chatgpt_auth: None,
             use_app_server: true,
         }
     }

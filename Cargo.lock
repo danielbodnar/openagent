@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "sandboxed_sh"
-version = "0.12.0"
+version = "1.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

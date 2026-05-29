@@ -73,7 +73,7 @@ function getWorkerStatusInfo(
       return {
         icon: <CheckCircle className="h-3.5 w-3.5" />,
         label: 'Completed',
-        color: 'text-emerald-400',
+        color: 'text-emerald-700 dark:text-emerald-400',
         bgColor: 'bg-emerald-500/10 border-emerald-500/20',
         isActive: false,
       };
@@ -81,7 +81,7 @@ function getWorkerStatusInfo(
       return {
         icon: <XCircle className="h-3.5 w-3.5" />,
         label: 'Failed',
-        color: 'text-red-400',
+        color: 'text-red-700 dark:text-red-400',
         bgColor: 'bg-red-500/10 border-red-500/20',
         isActive: false,
       };
@@ -89,7 +89,7 @@ function getWorkerStatusInfo(
       return {
         icon: <AlertTriangle className="h-3.5 w-3.5" />,
         label: 'Interrupted',
-        color: 'text-amber-400',
+        color: 'text-amber-700 dark:text-amber-400',
         bgColor: 'bg-amber-500/10 border-amber-500/20',
         isActive: false,
       };
@@ -97,7 +97,7 @@ function getWorkerStatusInfo(
       return {
         icon: <Ban className="h-3.5 w-3.5" />,
         label: 'Not feasible',
-        color: 'text-rose-400',
+        color: 'text-rose-700 dark:text-rose-400',
         bgColor: 'bg-rose-500/10 border-rose-500/20',
         isActive: false,
       };
@@ -105,7 +105,7 @@ function getWorkerStatusInfo(
       return {
         icon: <Loader2 className="h-3.5 w-3.5 animate-spin" />,
         label: 'Active',
-        color: 'text-indigo-400',
+        color: 'text-indigo-700 dark:text-indigo-400',
         bgColor: 'bg-indigo-500/10 border-indigo-500/20',
         isActive: true,
       };
@@ -113,7 +113,7 @@ function getWorkerStatusInfo(
       return {
         icon: <Clock className="h-3.5 w-3.5" />,
         label: mission.status || 'Unknown',
-        color: 'text-white/40',
+        color: 'text-foreground/60 dark:text-white/40',
         bgColor: 'bg-white/[0.03] border-white/[0.08]',
         isActive: false,
       };
@@ -188,10 +188,10 @@ const WorkerCard = memo(function WorkerCard({
       {/* Header row */}
       <div className="flex items-center gap-2 mb-1">
         <span className={status.color}>{status.icon}</span>
-        <span className="text-sm font-medium text-white/90 truncate flex-1">
+        <span className="text-sm font-medium text-foreground/90 truncate flex-1">
           {title}
         </span>
-        <ExternalLink className="h-3 w-3 text-white/20 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
+        <ExternalLink className="h-3 w-3 text-foreground/50 dark:text-white/20 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
       </div>
 
       {/* Description */}

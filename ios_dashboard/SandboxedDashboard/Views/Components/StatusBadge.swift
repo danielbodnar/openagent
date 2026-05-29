@@ -65,20 +65,29 @@ enum StatusType {
         }
     }
 
-    var icon: String {
+    var phosphorIcon: PhosphorSymbol {
         switch self {
-        case .pending: return "clock.fill"
-        case .running, .connecting: return "arrow.trianglehead.2.clockwise"
-        case .active: return "arrow.trianglehead.2.clockwise"
-        case .awaitingUser: return "hand.wave.fill"
-        case .completed: return "checkmark.circle.fill"
-        case .failed, .error: return "xmark.circle.fill"
-        case .cancelled: return "slash.circle"
-        case .idle: return "moon.fill"
-        case .connected: return "wifi"
-        case .disconnected: return "wifi.slash"
-        case .interrupted: return "pause.circle.fill"
-        case .blocked: return "exclamationmark.triangle.fill"
+        case .pending: return .clock
+        case .running, .connecting: return .arrowsClockwise
+        case .active: return .arrowsClockwise
+        case .awaitingUser: return .handWaving
+        case .completed: return .checkCircle
+        case .failed, .error: return .xCircle
+        case .cancelled: return .prohibit
+        case .idle: return .moon
+        case .connected: return .wifiHigh
+        case .disconnected: return .wifiSlash
+        case .interrupted: return .pauseCircle
+        case .blocked: return .warning
+        }
+    }
+
+    var phosphorWeight: PhosphorIconWeight {
+        switch self {
+        case .completed, .failed, .error, .interrupted, .blocked:
+            return .fill
+        default:
+            return .regular
         }
     }
 
@@ -100,8 +109,8 @@ struct StatusBadge: View {
     var body: some View {
         HStack(spacing: compact ? 4 : 6) {
             if showIcon {
-                Image(systemName: status.icon)
-                    .font(.system(size: compact ? 10 : 12, weight: .medium))
+                PhosphorIcon(symbol: status.phosphorIcon, weight: status.phosphorWeight, color: status.color)
+                    .frame(width: compact ? 10 : 12, height: compact ? 10 : 12)
                     .symbolEffect(.pulse, options: status.shouldPulse ? .repeating : .nonRepeating)
             }
             Text(status.label)

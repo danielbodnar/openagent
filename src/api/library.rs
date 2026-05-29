@@ -6,7 +6,7 @@
 //! - Skills CRUD
 //! - Commands CRUD
 //! - Library Agents CRUD
-//! - OpenCode settings (oh-my-opencode.json)
+//! - OpenCode settings
 //! - Sandboxed config (agent visibility, defaults)
 //! - Migration
 
@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -223,9 +224,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/migrate", post(migrate_library))
         // Rename (works for all item types)
         .route("/rename/:item_type/:name", post(rename_item))
-        // OpenCode Settings (oh-my-opencode.json)
-        .route("/opencode/settings", get(get_opencode_settings))
-        .route("/opencode/settings", put(save_opencode_settings))
         // Sandboxed Config
         .route("/sandboxed-sh/config", get(get_sandboxed_config))
         .route("/sandboxed-sh/config", put(save_sandboxed_config))
@@ -240,14 +238,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         .route("/config-profile/:name", put(save_config_profile))
         .route("/config-profile/:name", delete(delete_config_profile))
         // Profile-specific config endpoints
-        .route(
-            "/config-profile/:name/opencode/settings",
-            get(get_opencode_settings_for_profile),
-        )
-        .route(
-            "/config-profile/:name/opencode/settings",
-            put(save_opencode_settings_for_profile),
-        )
         .route(
             "/config-profile/:name/sandboxed-sh/config",
             get(get_sandboxed_config_for_profile),
@@ -354,6 +344,46 @@ fn normalize_skill_name(name: &str) -> Result<String, (StatusCode, String)> {
     Ok(skill_name)
 }
 
+async fn find_registry_installed_skill_dir(
+    temp_dir: &FsPath,
+    requested_skill_names: &[String],
+) -> Result<Option<PathBuf>, std::io::Error> {
+    let mut candidates = Vec::new();
+    let skill_roots = [
+        temp_dir.join(".claude").join("skills"),
+        temp_dir.join(".agents").join("skills"),
+    ];
+
+    for skill_root in skill_roots {
+        if tokio::fs::metadata(&skill_root).await.is_err() {
+            continue;
+        }
+
+        let mut entries = tokio::fs::read_dir(&skill_root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() && path.join("SKILL.md").exists() {
+                candidates.push(path);
+            }
+        }
+    }
+
+    for requested in requested_skill_names {
+        let requested = normalize_skill_name(requested).map_err(|(_, message)| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+        })?;
+        if let Some(path) = candidates.iter().find(|candidate| {
+            candidate
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy() == requested)
+        }) {
+            return Ok(Some(path.clone()));
+        }
+    }
+
+    Ok(candidates.into_iter().next())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SaveWorkspaceTemplateRequest {
     pub description: Option<String>,
@@ -414,11 +444,6 @@ async fn sync_library_configs(
     crate::opencode_config::sync_global_plugins(&plugins)
         .await
         .map_err(internal_error)?;
-
-    // Sync OpenCode settings (oh-my-opencode.json) from Library to system
-    if let Err(e) = workspace::sync_opencode_settings(library).await {
-        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings during library sync");
-    }
 
     // Sync Sandboxed config from Library to working directory
     if let Err(e) = workspace::sync_sandboxed_config(library, &state.config.working_dir).await {
@@ -949,7 +974,7 @@ async fn delete_command(
 /// Response for builtin commands endpoint.
 #[derive(Debug, serde::Serialize)]
 struct BuiltinCommandsResponse {
-    /// Commands for OpenCode (oh-my-opencode)
+    /// Commands for OpenCode
     opencode: Vec<CommandSummary>,
     /// Commands for Claude Code
     claudecode: Vec<CommandSummary>,
@@ -987,43 +1012,7 @@ async fn get_builtin_commands() -> (HeaderMap, Json<BuiltinCommandsResponse>) {
 }
 
 fn build_builtin_commands() -> BuiltinCommandsResponse {
-    // OpenCode builtin commands (oh-my-opencode)
-    let opencode_commands = vec![
-        CommandSummary {
-            name: "ralph-loop".to_string(),
-            description: Some(
-                "Start self-referential development loop until completion".to_string(),
-            ),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-        CommandSummary {
-            name: "cancel-ralph".to_string(),
-            description: Some("Cancel active Ralph Loop".to_string()),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-        CommandSummary {
-            name: "start-work".to_string(),
-            description: Some("Start Sisyphus work session from Prometheus plan".to_string()),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-        CommandSummary {
-            name: "refactor".to_string(),
-            description: Some(
-                "Intelligent refactoring with LSP, AST-grep, and TDD verification".to_string(),
-            ),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-        CommandSummary {
-            name: "init-deep".to_string(),
-            description: Some("Initialize hierarchical AGENTS.md knowledge base".to_string()),
-            path: "builtin".to_string(),
-            params: vec![],
-        },
-    ];
+    let opencode_commands = vec![];
 
     // Claude Code builtin commands
     let claudecode_commands = vec![
@@ -1396,55 +1385,6 @@ async fn migrate_library(
         .await
         .map(Json)
         .map_err(internal_error)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OpenCode Settings (oh-my-opencode.json)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// GET /api/library/opencode/settings - Get oh-my-opencode settings from Library.
-async fn get_opencode_settings(
-    State(state): State<Arc<super::routes::AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .get_opencode_settings()
-        .await
-        .map(Json)
-        .map_err(internal_error)
-}
-
-/// PUT /api/library/opencode/settings - Save oh-my-opencode settings to Library.
-async fn save_opencode_settings(
-    State(state): State<Arc<super::routes::AppState>>,
-    headers: HeaderMap,
-    Json(settings): Json<serde_json::Value>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-
-    // Validate that the input is a valid JSON object
-    if !settings.is_object() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Settings must be a JSON object".to_string(),
-        ));
-    }
-
-    library
-        .save_opencode_settings(&settings)
-        .await
-        .map_err(internal_error)?;
-
-    // Sync to system location
-    if let Err(e) = workspace::sync_opencode_settings(&library).await {
-        tracing::warn!(error = %e, "Failed to sync oh-my-opencode settings to system");
-    }
-
-    Ok((
-        StatusCode::OK,
-        "OpenCode settings saved successfully".to_string(),
-    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1979,48 +1919,6 @@ async fn delete_config_profile(
         })
 }
 
-/// GET /api/library/config-profile/:name/opencode/settings - Get OpenCode settings for a profile.
-async fn get_opencode_settings_for_profile(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .get_opencode_settings_for_profile(&name)
-        .await
-        .map(Json)
-        .map_err(internal_error)
-}
-
-/// PUT /api/library/config-profile/:name/opencode/settings - Save OpenCode settings for a profile.
-async fn save_opencode_settings_for_profile(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(settings): Json<serde_json::Value>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-
-    if !settings.is_object() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Settings must be a JSON object".to_string(),
-        ));
-    }
-
-    library
-        .save_opencode_settings_for_profile(&name, &settings)
-        .await
-        .map(|_| {
-            (
-                StatusCode::OK,
-                "OpenCode settings saved successfully".to_string(),
-            )
-        })
-        .map_err(internal_error)
-}
-
 /// GET /api/library/config-profile/:name/sandboxed-sh/config - Get Sandboxed config for a profile.
 async fn get_sandboxed_config_for_profile(
     State(state): State<Arc<super::routes::AppState>>,
@@ -2258,10 +2156,14 @@ async fn install_from_registry(
         .await
         .map_err(internal_error)?;
 
-    // Initialize a minimal structure for the skills CLI
-    // The skills CLI expects certain directories to exist
+    // Initialize minimal structures for the skills CLI. Depending on the
+    // agent it detects, it may write to either Claude or Codex-style roots.
     let claude_skills_dir = temp_dir.join(".claude").join("skills");
     tokio::fs::create_dir_all(&claude_skills_dir)
+        .await
+        .map_err(internal_error)?;
+    let agents_skills_dir = temp_dir.join(".agents").join("skills");
+    tokio::fs::create_dir_all(&agents_skills_dir)
         .await
         .map_err(internal_error)?;
 
@@ -2286,26 +2188,15 @@ async fn install_from_registry(
         ));
     }
 
-    // Find the installed skill in .claude/skills/
-    let mut installed_skill_dir = None;
-    let mut entries = tokio::fs::read_dir(&claude_skills_dir)
+    let source_dir = find_registry_installed_skill_dir(&temp_dir, &request.skills)
         .await
-        .map_err(internal_error)?;
-
-    while let Some(entry) = entries.next_entry().await.map_err(internal_error)? {
-        let path = entry.path();
-        if path.is_dir() && path.join("SKILL.md").exists() {
-            installed_skill_dir = Some(path);
-            break;
-        }
-    }
-
-    let source_dir = installed_skill_dir.ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "No skill found after installation".to_string(),
-        )
-    })?;
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "No skill found after installation in .claude/skills or .agents/skills".to_string(),
+            )
+        })?;
 
     // Determine target name
     let raw_skill_name = request.name.unwrap_or_else(|| {
@@ -2430,6 +2321,56 @@ mod tests {
         assert!(normalize_skill_name("../escape").is_err());
         assert!(normalize_skill_name("nested/name").is_err());
         assert!(normalize_skill_name(".hidden").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_find_registry_installed_skill_dir_accepts_agents_root() {
+        let dir = tempdir().unwrap();
+        let skill_dir = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("design-taste-frontend");
+        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
+        tokio::fs::write(skill_dir.join("SKILL.md"), "# Design Taste")
+            .await
+            .unwrap();
+
+        let found =
+            find_registry_installed_skill_dir(dir.path(), &["design-taste-frontend".to_string()])
+                .await
+                .unwrap();
+
+        assert_eq!(found, Some(skill_dir));
+    }
+
+    #[tokio::test]
+    async fn test_find_registry_installed_skill_dir_prefers_requested_skill() {
+        let dir = tempdir().unwrap();
+        let first_skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("first-skill");
+        let requested_skill = dir
+            .path()
+            .join(".agents")
+            .join("skills")
+            .join("requested-skill");
+        tokio::fs::create_dir_all(&first_skill).await.unwrap();
+        tokio::fs::create_dir_all(&requested_skill).await.unwrap();
+        tokio::fs::write(first_skill.join("SKILL.md"), "# First")
+            .await
+            .unwrap();
+        tokio::fs::write(requested_skill.join("SKILL.md"), "# Requested")
+            .await
+            .unwrap();
+
+        let found = find_registry_installed_skill_dir(dir.path(), &["requested-skill".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(found, Some(requested_skill));
     }
 
     #[tokio::test]

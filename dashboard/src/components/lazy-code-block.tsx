@@ -22,7 +22,8 @@ import type { CSSProperties, ReactNode } from "react";
 
 let highlighterModulePromise: Promise<{
   Highlighter: typeof import("react-syntax-highlighter").default;
-  theme: Record<string, CSSProperties>;
+  darkTheme: Record<string, CSSProperties>;
+  lightTheme: Record<string, CSSProperties>;
 }> | null = null;
 
 function getHighlighterModule() {
@@ -32,7 +33,14 @@ function getHighlighterModule() {
       import("react-syntax-highlighter/dist/esm/styles/prism").then(
         (m) => m.oneDark
       ),
-    ]).then(([Highlighter, theme]) => ({ Highlighter, theme }));
+      import("react-syntax-highlighter/dist/esm/styles/prism").then(
+        (m) => m.oneLight
+      ),
+    ]).then(([Highlighter, darkTheme, lightTheme]) => ({
+      Highlighter,
+      darkTheme,
+      lightTheme,
+    }));
   }
   return highlighterModulePromise;
 }
@@ -70,8 +78,10 @@ export const LazyCodeBlock = memo(function LazyCodeBlock({
 }: LazyCodeBlockProps) {
   const [Loaded, setLoaded] = useState<{
     Highlighter: typeof import("react-syntax-highlighter").default;
-    theme: Record<string, CSSProperties>;
+    darkTheme: Record<string, CSSProperties>;
+    lightTheme: Record<string, CSSProperties>;
   } | null>(null);
+  const [isLight, setIsLight] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,13 +93,33 @@ export const LazyCodeBlock = memo(function LazyCodeBlock({
     };
   }, []);
 
+  useEffect(() => {
+    const query = window.matchMedia("(prefers-color-scheme: light)");
+    const update = () => {
+      const theme = document.documentElement.dataset.theme;
+      setIsLight(theme ? theme === "light" : query.matches);
+    };
+    update();
+    const observer = new MutationObserver(update);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+    query.addEventListener("change", update);
+    return () => {
+      observer.disconnect();
+      query.removeEventListener("change", update);
+    };
+  }, []);
+
   const baseStyle: CSSProperties = {
     margin: 0,
     padding: "0.75rem",
     fontSize: "0.75rem",
     borderRadius: "0.5rem",
-    background: "#282c34",
-    color: "#abb2bf",
+    background: "rgb(var(--code-background))",
+    color: "rgb(var(--code-foreground))",
+    border: "1px solid rgb(var(--code-border) / 0.08)",
     fontFamily: MONO_FONT,
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
@@ -106,13 +136,13 @@ export const LazyCodeBlock = memo(function LazyCodeBlock({
     );
   }
 
-  const { Highlighter, theme } = Loaded;
+  const { Highlighter, darkTheme, lightTheme } = Loaded;
   return (
     <div className={className}>
       {header}
       <Highlighter
         language={language}
-        style={theme}
+        style={isLight ? lightTheme : darkTheme}
         customStyle={baseStyle}
         showLineNumbers={showLineNumbers}
         codeTagProps={{

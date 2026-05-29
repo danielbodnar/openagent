@@ -210,7 +210,7 @@ describe('mission-status', () => {
     it('returns status-specific color when not running', () => {
       expect(getMissionDotColor('completed', false)).toBe('bg-emerald-400');
       expect(getMissionDotColor('acknowledged', false)).toBe('bg-emerald-400');
-      expect(getMissionDotColor('awaiting_user', false)).toBe('bg-sky-400');
+      expect(getMissionDotColor('awaiting_user', false)).toBe('bg-amber-400');
       // Failure statuses share a red tone in the Finished column.
       expect(getMissionDotColor('failed', false)).toBe('bg-red-400');
       expect(getMissionDotColor('interrupted', false)).toBe('bg-red-400');
@@ -228,7 +228,7 @@ describe('mission-status', () => {
 
     it('returns status-specific color when not running', () => {
       expect(getMissionTextColor('completed', false)).toBe('text-emerald-400');
-      expect(getMissionTextColor('awaiting_user', false)).toBe('text-sky-400');
+      expect(getMissionTextColor('awaiting_user', false)).toBe('text-amber-400');
       expect(getMissionTextColor('failed', false)).toBe('text-red-400');
       expect(getMissionTextColor('interrupted', false)).toBe('text-red-400');
     });

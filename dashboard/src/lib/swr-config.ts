@@ -1,6 +1,25 @@
 import type { SWRConfiguration } from 'swr';
 
 /**
+ * JSON-stable equality used as SWR's `compare` so an unchanged poll result
+ * keeps its existing reference. Without this, every refresh tick creates a
+ * fresh array/object even when the server returned identical bytes,
+ * cascading into re-renders of downstream `useMemo`s keyed on the data.
+ *
+ * Cheap for the small payloads we poll (mission lists, running info, stats).
+ * Falls back to `Object.is` if either side fails to serialize (cyclic refs,
+ * functions) so we never throw inside SWR's compare path.
+ */
+export function stableJsonCompare(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * SWR configuration for static/infrequently changing data.
  * Use for: agent lists, backend configs, provider types, etc.
  * 

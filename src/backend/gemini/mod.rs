@@ -454,7 +454,10 @@ fn convert_gemini_event(
         GeminiEvent::Thought { content } => {
             if let Some(text) = content {
                 if !text.is_empty() {
-                    results.push(ExecutionEvent::Thinking { content: text });
+                    results.push(ExecutionEvent::Thinking {
+                        content: text,
+                        item_id: None,
+                    });
                 }
             }
         }

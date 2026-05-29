@@ -1,97 +1,92 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
-import { getCurrentMission, streamControl, type Mission, type ControlRunState } from '@/lib/api';
+import { getCurrentMission, type Mission } from '@/lib/api';
 import { BrainLogo } from '@/components/icons';
 import {
-  LayoutDashboard,
-  MessageSquare,
-  Terminal,
-  Settings,
-  Loader,
-  CheckCircle,
-  XCircle,
   ChevronDown,
-  Plug,
-  FileCode,
-  Server,
-  Search,
-  Wrench,
-  LayoutGrid,
-  Library,
-  Cog,
-  Key,
-  Archive,
-  Activity,
-  Cpu,
-  Lock,
-  GitBranch,
-  Sparkles,
-  ListTodo,
-  MessageCircle,
 } from 'lucide-react';
+import {
+  Archive,
+  ChatCircleText,
+  CheckCircle,
+  CirclesFour,
+  CircleNotch,
+  Cpu,
+  GearSix,
+  GitBranch,
+  Key,
+  Layout,
+  Lightning,
+  Lock,
+  MagnifyingGlass,
+  Plugs,
+  Pulse,
+  Robot,
+  SidebarSimple,
+  Sparkle,
+  TerminalWindow,
+  Toolbox,
+  TreeStructure,
+  XCircle,
+  type Icon,
+} from '@phosphor-icons/react';
 
 type NavItem = {
   name: string;
   href: string;
-  icon: React.ComponentType<{ className?: string }>;
-  children?: { name: string; href: string; icon: React.ComponentType<{ className?: string }> }[];
+  icon: Icon;
+  children?: { name: string; href: string; icon: Icon }[];
 };
 
 const navigation: NavItem[] = [
-  { name: 'Overview', href: '/', icon: LayoutDashboard },
-  { name: 'Mission', href: '/control', icon: MessageSquare },
-  { name: 'Tasks', href: '/tasks', icon: ListTodo },
-  { name: 'Workspaces', href: '/workspaces', icon: Server },
-  { name: 'Console', href: '/console', icon: Terminal },
+  { name: 'Overview', href: '/', icon: Layout },
+  { name: 'Mission', href: '/control', icon: ChatCircleText },
+  { name: 'Workspaces', href: '/workspaces', icon: SidebarSimple },
+  { name: 'Console', href: '/console', icon: TerminalWindow },
+  { name: 'Assistant', href: '/assistant', icon: Robot },
   { name: 'Routing', href: '/model-routing', icon: GitBranch },
   {
     name: 'Library',
     href: '/config',
-    icon: Library,
+    icon: TreeStructure,
     children: [
-      { name: 'Commands', href: '/config/commands', icon: Terminal },
-      { name: 'Skills', href: '/config/skills', icon: FileCode },
-      { name: 'Workspaces', href: '/config/workspace-templates', icon: LayoutGrid },
-      { name: 'Profiles', href: '/config/settings', icon: Cog },
+      { name: 'Commands', href: '/config/commands', icon: TerminalWindow },
+      { name: 'Skills', href: '/config/skills', icon: Lightning },
+      { name: 'Workspaces', href: '/config/workspace-templates', icon: CirclesFour },
+      { name: 'Profiles', href: '/config/settings', icon: GearSix },
     ],
   },
   {
     name: 'Inspect',
     href: '/inspect',
-    icon: Search,
+    icon: MagnifyingGlass,
     children: [
-      { name: 'System', href: '/inspect/system', icon: Activity },
-      { name: 'MCPs', href: '/inspect/mcps', icon: Plug },
-      { name: 'Tools', href: '/inspect/tools', icon: Wrench },
+      { name: 'System', href: '/inspect/system', icon: Pulse },
+      { name: 'MCPs', href: '/inspect/mcps', icon: Plugs },
+      { name: 'Tools', href: '/inspect/tools', icon: Toolbox },
     ],
   },
   {
     name: 'Settings',
     href: '/settings',
-    icon: Settings,
+    icon: GearSix,
     children: [
       { name: 'Backends', href: '/settings/backends', icon: Cpu },
       { name: 'Providers', href: '/settings/providers', icon: Key },
-      { name: 'LLM', href: '/settings/llm', icon: Sparkles },
-      { name: 'Telegram', href: '/settings/telegram', icon: MessageCircle },
+      { name: 'LLM', href: '/settings/llm', icon: Sparkle },
       { name: 'Security', href: '/settings/secrets', icon: Lock },
       { name: 'Data', href: '/settings/data', icon: Archive },
     ],
   },
 ];
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
-export function Sidebar() {
+export const Sidebar = memo(function Sidebar() {
   const pathname = usePathname();
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
-  const [controlState, setControlState] = useState<ControlRunState>('idle');
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
 
   // Auto-expand sections if we're on their subpages
@@ -110,25 +105,29 @@ export function Sidebar() {
     return () => window.clearTimeout(timer);
   }, [pathname]);
 
-  // Stream control events for real-time status
+  // Fetch current mission periodically. Activity status (the bottom-left
+  // "Working" / "Ready" pill) is derived from this; previously the Sidebar
+  // also subscribed to the global control SSE stream to flip the pill in
+  // real time, but that subscription was the single biggest source of
+  // re-renders in the app: every status frame from the backend (multiple
+  // times per second on a busy mission) caused the entire nav tree to
+  // re-commit. The 10s poll is good enough for a non-critical indicator
+  // and the cost is paid once per page rather than per-event.
   useEffect(() => {
-    const cleanup = streamControl((event) => {
-      const data: unknown = event.data;
-      if (event.type === 'status' && isRecord(data)) {
-        const st = data['state'];
-        setControlState(typeof st === 'string' ? (st as ControlRunState) : 'idle');
-      }
-    });
-    
-    return () => cleanup();
-  }, []);
-
-  // Fetch current mission periodically
-  useEffect(() => {
+    let cancelled = false;
     const fetchMission = async () => {
       try {
         const mission = await getCurrentMission();
-        setCurrentMission(mission);
+        if (!cancelled) {
+          setCurrentMission((prev) => {
+            // Bail out when nothing changed so the memoized Sidebar doesn't
+            // re-render on every successful poll for no reason.
+            if (prev?.id === mission?.id && prev?.status === mission?.status) {
+              return prev;
+            }
+            return mission;
+          });
+        }
       } catch {
         // ignore errors
       }
@@ -136,12 +135,15 @@ export function Sidebar() {
 
     fetchMission();
     const interval = setInterval(fetchMission, 10000); // Update every 10s
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, []);
 
-  const isActive = controlState !== 'idle';
-  const StatusIcon = isActive 
-    ? Loader 
+  const isActive = currentMission?.status === 'active';
+  const StatusIcon = isActive
+    ? CircleNotch
     : currentMission?.status === 'completed' 
       ? CheckCircle 
       : currentMission?.status === 'failed' 
@@ -296,4 +298,4 @@ export function Sidebar() {
       </div>
     </aside>
   );
-}
+});

@@ -31,9 +31,7 @@ use crate::mcp::McpRegistry;
 use crate::opencode::{extract_reasoning, extract_text};
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
-use crate::util::{
-    auth_entry_has_credentials, build_history_context, env_var_bool, home_dir, strip_jsonc_comments,
-};
+use crate::util::{auth_entry_has_credentials, build_history_context, env_var_bool, home_dir};
 use crate::workspace::{self, Workspace, WorkspaceType};
 use crate::workspace_exec::WorkspaceExec;
 
@@ -149,8 +147,8 @@ struct OpencodeSseParseResult {
     /// The SSE stream indicated the session entered a retry state, meaning
     /// the model API call failed and OpenCode is retrying automatically.
     session_retry: bool,
-    /// Token usage extracted from response.completed events (input, output).
-    usage: Option<(u64, u64)>,
+    /// Token usage extracted from response.completed events.
+    usage: Option<crate::cost::TokenUsage>,
 }
 
 fn tool_result_text(result: &serde_json::Value) -> Option<String> {
@@ -714,6 +712,7 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
 }
 
 const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
@@ -740,6 +739,13 @@ impl CodexCredential {
         match self {
             CodexCredential::ApiKey(k) => format!("apikey:{}", k),
             CodexCredential::OAuth(acc) => format!("oauth:{}", acc.chatgpt_account_id),
+        }
+    }
+
+    fn concurrency_limit(&self) -> usize {
+        match self {
+            CodexCredential::ApiKey(_) => CODEX_ACCOUNT_CONCURRENCY_LIMIT,
+            CodexCredential::OAuth(_) => CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT,
         }
     }
 
@@ -839,12 +845,12 @@ pub(crate) fn codex_tool_stall_should_retry_with_default_model(
     requested_model.is_some_and(is_generic_gpt_codex_model)
 }
 
-fn codex_account_semaphore_for_fingerprint(fingerprint: &str) -> Arc<Semaphore> {
+fn codex_account_semaphore_for_credential(credential: &CodexCredential) -> Arc<Semaphore> {
     let mut pool = CODEX_ACCOUNT_POOL
         .lock()
         .expect("Codex account pool mutex poisoned");
-    pool.entry(fingerprint.to_string())
-        .or_insert_with(|| Arc::new(Semaphore::new(CODEX_ACCOUNT_CONCURRENCY_LIMIT)))
+    pool.entry(credential.fingerprint())
+        .or_insert_with(|| Arc::new(Semaphore::new(credential.concurrency_limit())))
         .clone()
 }
 
@@ -1205,7 +1211,7 @@ async fn lease_codex_account(
         .into_iter()
         .filter(|cred| !tried_fingerprints.contains(&cred.fingerprint()))
         .map(|cred| {
-            let sem = codex_account_semaphore_for_fingerprint(&cred.fingerprint());
+            let sem = codex_account_semaphore_for_credential(&cred);
             let available = sem.available_permits();
             (cred, sem, available)
         })
@@ -1334,39 +1340,26 @@ fn strip_think_tags(text: &str) -> String {
     result
 }
 
-/// Prefixes that indicate a thought/reasoning line
-const THOUGHT_PREFIXES: &[&str] = &["thought:", "thoughts:", "thinking:"];
+fn normalize_stream_comparison_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
-fn extract_thought_line(text: &str) -> Option<(String, String)> {
-    let mut thought: Option<String> = None;
-    let mut remaining: Vec<&str> = Vec::new();
+fn thinking_overlaps_visible_answer(thinking: &str, assistant_message: &str) -> bool {
+    const MIN_OVERLAP_LEN: usize = 40;
 
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_lowercase();
-        let is_thought = THOUGHT_PREFIXES
-            .iter()
-            .any(|prefix| lower.starts_with(prefix));
+    let thinking = normalize_stream_comparison_text(thinking);
+    let assistant_message = normalize_stream_comparison_text(assistant_message);
 
-        if thought.is_none() && is_thought {
-            let content = trimmed
-                .split_once(':')
-                .map(|(_, rest)| rest)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !content.is_empty() {
-                thought = Some(content);
-            }
-            continue;
-        }
-        remaining.push(line);
+    if thinking.is_empty() || assistant_message.is_empty() {
+        return false;
     }
 
-    thought.map(|t| {
-        let cleaned = remaining.join("\n").trim().to_string();
-        (t, cleaned)
-    })
+    if thinking == assistant_message {
+        return true;
+    }
+
+    thinking.len() >= MIN_OVERLAP_LEN && assistant_message.starts_with(&thinking)
+        || assistant_message.len() >= MIN_OVERLAP_LEN && thinking.starts_with(&assistant_message)
 }
 
 async fn set_control_state_for_mission(
@@ -1692,7 +1685,7 @@ fn parse_opencode_sse_event(
 
     let mut message_complete = false;
     let mut model: Option<String> = None;
-    let mut sse_usage: Option<(u64, u64)> = None;
+    let mut sse_usage: Option<crate::cost::TokenUsage> = None;
     let mut extra_events: Vec<AgentEvent> = Vec::new();
     let event = match event_type {
         "response.output_text.delta" => {
@@ -1737,24 +1730,16 @@ fn parse_opencode_sse_event(
                 .and_then(|r| r.get("usage"))
                 .or_else(|| props.get("usage"));
             if let Some(usage_obj) = usage {
-                let input = usage_obj
-                    .get("input_tokens")
-                    .or_else(|| usage_obj.get("prompt_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let output = usage_obj
-                    .get("output_tokens")
-                    .or_else(|| usage_obj.get("completion_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if input > 0 || output > 0 {
+                if let Some(usage) = opencode_usage_from_value(usage_obj) {
                     tracing::info!(
                         mission_id = %mission_id,
-                        input_tokens = input,
-                        output_tokens = output,
+                        input_tokens = usage.input_tokens,
+                        output_tokens = usage.output_tokens,
+                        cache_creation_input_tokens = usage.cache_creation_input_tokens.unwrap_or(0),
+                        cache_read_input_tokens = usage.cache_read_input_tokens.unwrap_or(0),
                         "Extracted token usage from response.completed"
                     );
-                    sse_usage = Some((input, output));
+                    sse_usage = Some(usage);
                 }
             }
             None
@@ -1998,7 +1983,12 @@ fn parse_opencode_sse_event(
                 let input = tok.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
                 let output = tok.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
                 if input > 0 || output > 0 {
-                    sse_usage = Some((input, output));
+                    sse_usage = Some(crate::cost::TokenUsage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
+                    });
                 }
             }
             // Only mark complete on reason=stop. Tool-call steps (reason=tool-calls)
@@ -2068,9 +2058,7 @@ fn parse_opencode_sse_event(
         _ => None,
     };
 
-    // Detect session idle signals — oh-my-opencode emits these when the
-    // agent finishes all work.  This is critical for GLM models that may
-    // not emit response.completed.
+    // Detect session idle signals from OpenCode.
     let status_str = if event_type == "session.status" {
         props
             .get("type")
@@ -2884,8 +2872,7 @@ async fn run_mission_turn(
         && model_override.is_none()
     {
         // For OpenCode with a config profile but no explicit model override,
-        // clear the global default so the profile's oh-my-opencode agent
-        // models take precedence instead of being overridden.
+        // clear the global default so profile settings can take precedence.
         config.default_model = None;
     } else if backend_id == "codex" && model_override.is_none() {
         // Pin Codex instead of inheriting the global DEFAULT_MODEL, which is
@@ -2897,7 +2884,7 @@ async fn run_mission_turn(
         config.default_model = Some(resolve_gemini_default_model());
     } else if backend_id == "grok" && model_override.is_none() {
         // Pin Grok Build to its own default model. Without this the global
-        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-6`) flows
+        // DEFAULT_MODEL (typically `anthropic/claude-opus-4-8`) flows
         // through to `--model` and the grok CLI rejects it as "unknown
         // model id" — the mission then fails on the first turn with a
         // confusing chdir error from the rejected-CLI path. See prod
@@ -2970,7 +2957,7 @@ async fn run_mission_turn(
     convo.push('\n');
 
     // Ensure mission workspace exists and is configured for OpenCode.
-    let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -3453,22 +3440,6 @@ async fn run_mission_turn(
             result
         }
         "opencode" => {
-            // Check profile's sandboxed config for the oh-my-opencode opt-in flag.
-            if let Some(ref profile) = effective_config_profile {
-                let lib_guard = library.read().await;
-                if let Some(lib) = lib_guard.as_ref() {
-                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
-                        if profile_data.sandboxed_config.enable_oh_my_opencode {
-                            let mut obj = workspace.config.as_object().cloned().unwrap_or_default();
-                            obj.insert(
-                                "enable_oh_my_opencode".to_string(),
-                                serde_json::json!(true),
-                            );
-                            workspace.config = serde_json::Value::Object(obj);
-                        }
-                    }
-                }
-            }
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
             run_opencode_turn(
@@ -5125,7 +5096,6 @@ pub fn run_claudecode_turn<'a>(
         let mut finalized_thinking_indices: std::collections::HashSet<u32> =
             std::collections::HashSet::new(); // Blocks already sent done:true during streaming
         let mut last_text_len: usize = 0; // Track last emitted text length for streaming text deltas
-        let mut thinking_emitted = false;
 
         let mut saw_non_init_event = false;
         let startup_timeout = Duration::from_secs(
@@ -5419,7 +5389,6 @@ pub fn run_claudecode_turn<'a>(
                                                             done: false,
                                                             mission_id: Some(mission_id),
                                                         });
-                                                        thinking_emitted = true;
                                                     }
                                                 }
                                             } else if delta.delta_type == "text_delta" {
@@ -5487,26 +5456,10 @@ pub fn run_claudecode_turn<'a>(
                                         let content_idx = content_idx as u32;
                                         match block {
                                             ContentBlock::Text { text } if !text.is_empty() => {
-                                                // Text content is the final assistant response
-                                                // Don't send as Thinking - it will be in the final AssistantMessage
-                                                if !thinking_emitted {
-                                                    if let Some((thought, cleaned)) =
-                                                        extract_thought_line(&text)
-                                                    {
-                                                        let _ =
-                                                            events_tx.send(AgentEvent::Thinking {
-                                                                content: thought,
-                                                                done: true,
-                                                                mission_id: Some(mission_id),
-                                                            });
-                                                        thinking_emitted = true;
-                                                        final_result = cleaned;
-                                                    } else {
-                                                        final_result = text;
-                                                    }
-                                                } else {
-                                                    final_result = text;
-                                                }
+                                                // Text content is the final assistant response.
+                                                // Thinking must come from explicit provider
+                                                // reasoning/thinking blocks, not answer text.
+                                                final_result = text;
                                             }
                                             ContentBlock::ToolUse { id, name, input } => {
                                                 pending_tools.insert(id.clone(), name.clone());
@@ -5674,7 +5627,6 @@ pub fn run_claudecode_turn<'a>(
                                                     done: true,
                                                     mission_id: Some(mission_id),
                                                 });
-                                                thinking_emitted = true;
                                             }
                                             _ => {}
                                         }
@@ -5722,7 +5674,6 @@ pub fn run_claudecode_turn<'a>(
                                     finalized_thinking_indices.clear();
                                     last_text_len = 0;
                                     block_types.clear();
-                                    thinking_emitted = false;
                                 }
                                 ClaudeEvent::User(evt) => {
                                     for block in evt.message.content {
@@ -6315,100 +6266,6 @@ fn opencode_session_token_from_line(line: &str) -> Option<&str> {
     None
 }
 
-/// Install a lightweight `opencode` wrapper script that intercepts `opencode serve` commands
-/// and overrides the `--port` argument using the `OPENCODE_SERVER_PORT` environment variable.
-///
-/// oh-my-opencode v3 is a compiled binary that always calls `opencode serve --port=4096`.
-/// Patching the JS source files has no effect on the binary. This wrapper sits at a higher
-/// PATH priority and intercepts the `serve` call to use the allocated port instead.
-fn install_opencode_serve_port_wrapper(
-    env: &mut HashMap<String, String>,
-    workspace: &Workspace,
-    port: &str,
-) -> bool {
-    // Only needed when a non-default port override is required
-    if port == "4096" || port == "0" || port.is_empty() {
-        return false;
-    }
-
-    // Determine the wrapper directory.
-    // For containers: use /root/.sandboxed-sh-bin (NOT /tmp) because nspawn mounts
-    // a fresh tmpfs over /tmp, hiding anything we write to the container rootfs.
-    let (wrapper_dir_host, wrapper_dir_env) = if workspace.workspace_type
-        == WorkspaceType::Container
-        && workspace::use_nspawn_for_workspace(workspace)
-    {
-        (
-            workspace.path.join("root").join(".sandboxed-sh-bin"),
-            "/root/.sandboxed-sh-bin".to_string(),
-        )
-    } else {
-        (
-            std::path::PathBuf::from("/tmp/.sandboxed-sh-bin"),
-            "/tmp/.sandboxed-sh-bin".to_string(),
-        )
-    };
-
-    if let Err(e) = std::fs::create_dir_all(&wrapper_dir_host) {
-        tracing::warn!("Failed to create opencode wrapper dir: {}", e);
-        return false;
-    }
-
-    // The wrapper script: intercepts `opencode serve` and overrides --port
-    // Note: We exclude our wrapper directory from PATH when searching for the real binary
-    // to avoid finding ourselves in an infinite loop.
-    let wrapper_script = r#"#!/bin/sh
-# opencode serve port override wrapper (installed by sandboxed.sh)
-WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
-CLEAN_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^$WRAPPER_DIR$" | tr '\n' ':' | sed 's/:$//')"
-REAL_OPENCODE="$(PATH="$CLEAN_PATH" command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"
-if [ -n "$OPENCODE_SERVER_PORT" ] && [ "$1" = "serve" ]; then
-  shift
-  new_args=""
-  for arg in "$@"; do
-    case "$arg" in
-      --port=*) ;;
-      *) new_args="$new_args $arg" ;;
-    esac
-  done
-  exec "$REAL_OPENCODE" serve --port="$OPENCODE_SERVER_PORT" $new_args
-fi
-exec "$REAL_OPENCODE" "$@"
-"#;
-
-    let wrapper_path = wrapper_dir_host.join("opencode");
-    if let Err(e) = std::fs::write(&wrapper_path, wrapper_script) {
-        tracing::warn!("Failed to write opencode wrapper: {}", e);
-        return false;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    // Prepend the wrapper directory to PATH so it takes priority over the real binary
-    let current = env
-        .get("PATH")
-        .cloned()
-        .or_else(|| std::env::var("PATH").ok())
-        .unwrap_or_default();
-    let new_path = if current.is_empty() {
-        wrapper_dir_env.clone()
-    } else {
-        format!("{}:{}", wrapper_dir_env, current)
-    };
-    env.insert("PATH".to_string(), new_path);
-
-    tracing::debug!(
-        "Installed opencode serve port wrapper at {} (port={})",
-        wrapper_dir_env,
-        port
-    );
-    true
-}
-
 fn prepend_opencode_bin_to_path(env: &mut HashMap<String, String>, workspace: &Workspace) {
     let home = if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
@@ -6444,7 +6301,7 @@ fn extract_opencode_session_id(output: &str) -> Option<String> {
 
 /// Returns true if the line is an OpenCode runner/status banner (not model output).
 ///
-/// oh-my-opencode writes a fixed set of status lines to stdout. We filter these
+/// OpenCode writes a fixed set of status lines to stdout. We filter these
 /// so they don't pollute `final_result` (which should only contain model text).
 ///
 /// The patterns below are deliberately tight — each matches a known runner status
@@ -6981,55 +6838,6 @@ fn allocate_opencode_server_port() -> Option<u16> {
         .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
 }
 
-fn host_oh_my_opencode_config_candidates() -> Vec<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        let base = std::path::PathBuf::from(home)
-            .join(".config")
-            .join("opencode");
-        candidates.push(base.join("oh-my-opencode.json"));
-        candidates.push(base.join("oh-my-opencode.jsonc"));
-    }
-    candidates
-}
-
-fn omo_config_all_fallback(value: &serde_json::Value) -> bool {
-    let agents = match value.get("agents").and_then(|v| v.as_object()) {
-        Some(agents) => agents,
-        None => return false,
-    };
-    let mut saw_model = false;
-    for agent in agents.values() {
-        if let Some(model) = agent.get("model").and_then(|v| v.as_str()) {
-            saw_model = true;
-            if !model.contains("glm-4.7-free") {
-                return false;
-            }
-        }
-    }
-    saw_model
-}
-
-fn host_oh_my_opencode_config_is_fallback() -> Option<bool> {
-    for candidate in host_oh_my_opencode_config_candidates() {
-        if !candidate.exists() {
-            continue;
-        }
-        let contents = std::fs::read_to_string(&candidate).ok()?;
-        let parsed = serde_json::from_str::<serde_json::Value>(&contents)
-            .or_else(|_| {
-                let stripped = strip_jsonc_comments(&contents);
-                serde_json::from_str::<serde_json::Value>(&stripped)
-            })
-            .ok();
-        if let Some(value) = parsed {
-            return Some(omo_config_all_fallback(&value));
-        }
-        return Some(contents.contains("glm-4.7-free"));
-    }
-    None
-}
-
 struct OpenCodeAuthState {
     has_openai: bool,
     has_anthropic: bool,
@@ -7228,151 +7036,6 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
         has_zai,
         has_other,
         configured_providers,
-    }
-}
-
-fn workspace_oh_my_opencode_config_paths(
-    opencode_config_dir: &std::path::Path,
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    (
-        opencode_config_dir.join("oh-my-opencode.json"),
-        opencode_config_dir.join("oh-my-opencode.jsonc"),
-    )
-}
-
-fn try_copy_host_oh_my_opencode_config(opencode_config_dir: &std::path::Path) -> bool {
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir);
-    for candidate in host_oh_my_opencode_config_candidates() {
-        if !candidate.exists() {
-            continue;
-        }
-        if let Some(parent) = opencode_config_dir.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(
-                    "Failed to create OpenCode config dir {}: {}",
-                    parent.display(),
-                    e
-                );
-                return false;
-            }
-        }
-        if let Err(e) = std::fs::create_dir_all(opencode_config_dir) {
-            tracing::warn!(
-                "Failed to create OpenCode config dir {}: {}",
-                opencode_config_dir.display(),
-                e
-            );
-            return false;
-        }
-        let dest = if candidate.extension().and_then(|s| s.to_str()) == Some("jsonc") {
-            &omo_path_jsonc
-        } else {
-            &omo_path
-        };
-        if let Err(e) = std::fs::copy(&candidate, dest) {
-            tracing::warn!(
-                "Failed to copy oh-my-opencode config to workspace {}: {}",
-                dest.display(),
-                e
-            );
-            return false;
-        }
-        tracing::info!(
-            "Copied oh-my-opencode config to workspace {}",
-            dest.display()
-        );
-        return true;
-    }
-    false
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn ensure_oh_my_opencode_config(
-    workspace_exec: &WorkspaceExec,
-    work_dir: &std::path::Path,
-    opencode_config_dir_host: &std::path::Path,
-    opencode_config_dir_env: &std::path::Path,
-    cli_runner: &str,
-    runner_is_direct: bool,
-    has_openai: bool,
-    has_anthropic: bool,
-    has_google: bool,
-) {
-    let (omo_path, omo_path_jsonc) =
-        workspace_oh_my_opencode_config_paths(opencode_config_dir_host);
-    if omo_path.exists() || omo_path_jsonc.exists() {
-        return;
-    }
-
-    let has_any_provider = has_openai || has_anthropic || has_google;
-    let host_fallback = host_oh_my_opencode_config_is_fallback();
-    let should_regen = matches!(host_fallback, Some(true)) && has_any_provider;
-
-    if !should_regen && try_copy_host_oh_my_opencode_config(opencode_config_dir_host) {
-        return;
-    }
-
-    // No config found; run oh-my-opencode install in non-interactive mode to generate defaults.
-    let mut args: Vec<String> = Vec::new();
-    let claude_flag = if has_anthropic { "yes" } else { "no" };
-    let openai_flag = if has_openai { "yes" } else { "no" };
-    let gemini_flag = if has_google { "yes" } else { "no" };
-    if runner_is_direct {
-        args.extend([
-            "install".to_string(),
-            "--no-tui".to_string(),
-            format!("--claude={}", claude_flag),
-            format!("--openai={}", openai_flag),
-            format!("--gemini={}", gemini_flag),
-            "--copilot=no".to_string(),
-            "--skip-auth".to_string(),
-        ]);
-    } else {
-        args.extend([
-            "oh-my-opencode".to_string(),
-            "install".to_string(),
-            "--no-tui".to_string(),
-            format!("--claude={}", claude_flag),
-            format!("--openai={}", openai_flag),
-            format!("--gemini={}", gemini_flag),
-            "--copilot=no".to_string(),
-            "--skip-auth".to_string(),
-        ]);
-    }
-
-    let mut env = std::collections::HashMap::new();
-    env.insert(
-        "OPENCODE_CONFIG_DIR".to_string(),
-        opencode_config_dir_env.to_string_lossy().to_string(),
-    );
-    env.insert("NO_COLOR".to_string(), "1".to_string());
-    env.insert("FORCE_COLOR".to_string(), "0".to_string());
-
-    match workspace_exec
-        .output(work_dir, cli_runner, &args, env)
-        .await
-    {
-        Ok(output) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                tracing::warn!(
-                    "oh-my-opencode install failed: {} {}",
-                    stderr.trim(),
-                    stdout.trim()
-                );
-            } else {
-                tracing::info!("Generated oh-my-opencode config in workspace");
-                // Some oh-my-opencode versions ignore OPENCODE_CONFIG_DIR during install,
-                // so copy the generated host config into the workspace if still missing.
-                if !omo_path.exists() && !omo_path_jsonc.exists() {
-                    let _ = try_copy_host_oh_my_opencode_config(opencode_config_dir_host);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to run oh-my-opencode install: {}", e);
-        }
     }
 }
 
@@ -7617,292 +7280,79 @@ async fn ensure_opencode_plugin_installed(
     }
 }
 
-fn sync_opencode_agent_config(
-    opencode_config_dir: &std::path::Path,
-    default_model: Option<&str>,
-    has_openai: bool,
-    has_anthropic: bool,
-    has_google: bool,
-) {
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir);
-    let omo_path = if omo_path.exists() {
-        omo_path
-    } else if omo_path_jsonc.exists() {
-        omo_path_jsonc
-    } else {
-        return;
-    };
-
-    let omo_contents = match std::fs::read_to_string(&omo_path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to read oh-my-opencode config at {}: {}",
-                omo_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    let omo_json = if omo_path.extension().and_then(|s| s.to_str()) == Some("jsonc") {
-        serde_json::from_str::<serde_json::Value>(&strip_jsonc_comments(&omo_contents))
-    } else {
-        serde_json::from_str::<serde_json::Value>(&omo_contents)
-    };
-
-    let omo_json = match omo_json {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to parse oh-my-opencode config at {}: {}",
-                omo_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    let Some(omo_agents) = omo_json.get("agents").and_then(|v| v.as_object()) else {
-        return;
-    };
-
-    let (opencode_path, mut opencode_json) = load_opencode_json(opencode_config_dir);
-
-    let provider_allowed = |provider: &str| -> bool {
-        match provider {
-            "anthropic" | "claude" => has_anthropic,
-            "openai" | "codex" => has_openai,
-            "google" | "gemini" => has_google,
-            _ => true,
-        }
-    };
-
-    let mut effective_default = default_model;
-    if let Some(model) = default_model {
-        if let Some((provider, _)) = model.split_once('/') {
-            if !provider_allowed(provider) {
-                tracing::warn!(
-                    provider = %provider,
-                    "Skipping default OpenCode model override because provider is not configured"
-                );
-                effective_default = None;
-            }
-        }
-    }
-
-    let model_allowed = |model: &str| -> bool {
-        match model.split_once('/') {
-            Some((provider, _)) => provider_allowed(provider),
-            None => true,
-        }
-    };
-
-    // When oh-my-opencode is enabled, it injects fully-specified agents
-    // (including prompts/permissions) into OpenCode. If we also write
-    // per-agent overrides into opencode.json, OpenCode treats those as
-    // authoritative and overwrites the plugin-defined agents, which
-    // strips the Prometheus/Metis/Momus/etc prompts. Therefore, we avoid
-    // writing any per-agent overrides for oh-my-opencode agents and
-    // remove any stale overrides that might already exist.
-    let oh_my_opencode_enabled = opencode_json
-        .get("plugin")
-        .and_then(|v| v.as_array())
-        .map(|plugins| {
-            plugins.iter().any(|entry| {
-                entry
-                    .as_str()
-                    .map(|s| s.contains("oh-my-opencode"))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
-
-    let mut updated = false;
-    if let Some(model) = effective_default {
-        if let Some(obj) = opencode_json.as_object_mut() {
-            match obj.get("model").and_then(|v| v.as_str()) {
-                Some(existing) if existing == model => {}
-                _ => {
-                    obj.insert(
-                        "model".to_string(),
-                        serde_json::Value::String(model.to_string()),
-                    );
-                    updated = true;
-                }
-            }
-        }
-    } else if let Some(obj) = opencode_json.as_object_mut() {
-        if let Some(existing) = obj.get("model").and_then(|v| v.as_str()) {
-            if let Some((provider, _)) = existing.split_once('/') {
-                if !provider_allowed(provider) {
-                    obj.remove("model");
-                    updated = true;
-                }
-            }
-        }
-    }
-
-    if let Some(obj) = opencode_json.as_object_mut() {
-        let agent_entry = obj
-            .entry("agent".to_string())
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        let agent_entry = match agent_entry.as_object_mut() {
-            Some(entry) => entry,
-            None => return,
-        };
-
-        if oh_my_opencode_enabled {
-            for name in omo_agents.keys() {
-                if agent_entry.remove(name).is_some() {
-                    updated = true;
-                }
-            }
-        } else {
-            for (name, entry) in omo_agents {
-                // Agent-specific model from oh-my-opencode.json takes priority over fallback default
-                let desired_model = entry
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .filter(|model| model_allowed(model))
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        effective_default
-                            .filter(|model| model_allowed(model))
-                            .map(|s| s.to_string())
-                    });
-
-                if let Some(existing) = agent_entry.get_mut(name) {
-                    if let (Some(model), Some(existing_obj)) =
-                        (desired_model.as_ref(), existing.as_object_mut())
-                    {
-                        match existing_obj.get("model").and_then(|v| v.as_str()) {
-                            Some(current) if current == model => {}
-                            _ => {
-                                existing_obj.insert(
-                                    "model".to_string(),
-                                    serde_json::Value::String(model.clone()),
-                                );
-                                updated = true;
-                            }
-                        }
-                    } else if let Some(existing_obj) = existing.as_object_mut() {
-                        if let Some(current) = existing_obj.get("model").and_then(|v| v.as_str()) {
-                            if !model_allowed(current) {
-                                existing_obj.remove("model");
-                                updated = true;
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                let mut agent_config = serde_json::Map::new();
-                if let Some(model) = desired_model {
-                    agent_config.insert("model".to_string(), serde_json::Value::String(model));
-                }
-                agent_entry.insert(name.clone(), serde_json::Value::Object(agent_config));
-                updated = true;
-            }
-        }
-    }
-
-    if updated {
-        save_json_warn(&opencode_path, &opencode_json, "opencode.json agent config");
-    }
-}
-
-fn apply_model_override_to_oh_my_opencode(
-    opencode_config_dir: &std::path::Path,
-    model_override: &str,
-) {
-    let model_override = model_override.trim();
-    if model_override.is_empty() {
-        return;
-    }
-
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir);
-    let target_path = if omo_path.exists() {
-        omo_path
-    } else if omo_path_jsonc.exists() {
-        omo_path_jsonc
-    } else {
-        return;
-    };
-
-    let contents = match std::fs::read_to_string(&target_path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to read oh-my-opencode config at {}: {}",
-                target_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    let json = if target_path.extension().and_then(|s| s.to_str()) == Some("jsonc") {
-        serde_json::from_str::<serde_json::Value>(&strip_jsonc_comments(&contents))
-    } else {
-        serde_json::from_str::<serde_json::Value>(&contents)
-    };
-
-    let mut json = match json {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to parse oh-my-opencode config at {}: {}",
-                target_path.display(),
-                err
-            );
-            return;
-        }
-    };
-
-    if let Some(obj) = json.as_object_mut() {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(model_override.to_string()),
-        );
-    }
-
-    if let Some(agents) = json.get_mut("agents").and_then(|v| v.as_object_mut()) {
-        for agent in agents.values_mut() {
-            if let Some(agent_obj) = agent.as_object_mut() {
-                agent_obj.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(model_override.to_string()),
-                );
-                agent_obj.remove("variant");
-            }
-        }
-    }
-
-    if let Ok(updated) = serde_json::to_string_pretty(&json) {
-        if let Err(err) = std::fs::write(&target_path, updated) {
-            tracing::warn!(
-                "Failed to write oh-my-opencode config at {}: {}",
-                target_path.display(),
-                err
-            );
-        } else {
-            tracing::info!(
-                "Applied OpenCode model override {} to {}",
-                model_override,
-                target_path.display()
-            );
-        }
-    }
-}
-
 /// Ensure the `opencode.json` `provider` section contains a definition for the
 /// provider used by the model override.  OpenCode's built-in snapshot only knows
 /// about a subset of models per provider; if a model (e.g. `zai/glm-5`) is not
 /// in the snapshot the session silently fails.  By injecting a custom provider
 /// definition we tell the AI-SDK adapter *how* to reach the provider and declare
 /// the model as valid.
-fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, model_override: &str) {
+fn sanitize_custom_opencode_provider_id(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .collect::<String>()
+        .to_lowercase()
+        .replace('-', "_")
+}
+
+fn custom_opencode_provider_definition(
+    app_working_dir: &std::path::Path,
+    provider_id: &str,
+) -> Option<serde_json::Value> {
+    let provider_id = sanitize_custom_opencode_provider_id(provider_id);
+    let path = app_working_dir.join(crate::util::AI_PROVIDERS_PATH);
+    let contents = std::fs::read_to_string(path).ok()?;
+    let providers: Vec<crate::ai_providers::AIProvider> = serde_json::from_str(&contents).ok()?;
+
+    let provider = providers.into_iter().find(|provider| {
+        provider.enabled
+            && provider.provider_type == crate::ai_providers::ProviderType::Custom
+            && sanitize_custom_opencode_provider_id(&provider.name) == provider_id
+    })?;
+
+    let base_url = provider.base_url?;
+    let custom_models = provider.custom_models.unwrap_or_default();
+    if custom_models.is_empty() {
+        return None;
+    }
+
+    let mut models = serde_json::Map::new();
+    for model in custom_models {
+        let id = model.id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        models.insert(
+            id.to_string(),
+            serde_json::json!({
+                "name": model.name.unwrap_or_else(|| id.to_string())
+            }),
+        );
+    }
+    if models.is_empty() {
+        return None;
+    }
+
+    let mut options = serde_json::Map::new();
+    options.insert("baseURL".to_string(), serde_json::Value::String(base_url));
+    if let Some(api_key) = provider.api_key.filter(|key| !key.trim().is_empty()) {
+        options.insert("apiKey".to_string(), serde_json::Value::String(api_key));
+    }
+
+    Some(serde_json::json!({
+        "npm": provider
+            .npm_package
+            .unwrap_or_else(|| "@ai-sdk/openai-compatible".to_string()),
+        "name": provider.name,
+        "models": serde_json::Value::Object(models),
+        "options": serde_json::Value::Object(options),
+    }))
+}
+
+fn ensure_opencode_provider_for_model(
+    opencode_config_dir: &std::path::Path,
+    app_working_dir: &std::path::Path,
+    model_override: &str,
+) {
     let model_override = model_override.trim();
     if model_override.is_empty() {
         return;
@@ -7997,7 +7447,7 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
                 }
             }))
         }
-        _ => None,
+        _ => custom_opencode_provider_definition(app_working_dir, provider_id),
     };
 
     let Some(provider_def) = provider_def else {
@@ -8065,179 +7515,6 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
             opencode_path.display()
         );
     }
-}
-
-/// Scan the oh-my-opencode config for all model references (top-level, agents,
-/// categories) and ensure each provider has a definition in `opencode.json`.
-fn ensure_opencode_providers_for_omo_config(opencode_config_dir: &std::path::Path) {
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir);
-    let target_path = if omo_path.exists() {
-        omo_path
-    } else if omo_path_jsonc.exists() {
-        omo_path_jsonc
-    } else {
-        return;
-    };
-
-    let contents = match std::fs::read_to_string(&target_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let parsed = if target_path.extension().and_then(|s| s.to_str()) == Some("jsonc") {
-        serde_json::from_str::<serde_json::Value>(&strip_jsonc_comments(&contents))
-    } else {
-        serde_json::from_str::<serde_json::Value>(&contents)
-    };
-    let json = match parsed {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let mut models = std::collections::HashSet::new();
-
-    // Collect top-level model
-    if let Some(m) = json.get("model").and_then(|v| v.as_str()) {
-        models.insert(m.to_string());
-    }
-
-    // Collect agent models
-    if let Some(agents) = json.get("agents").and_then(|v| v.as_object()) {
-        for agent in agents.values() {
-            if let Some(m) = agent.get("model").and_then(|v| v.as_str()) {
-                models.insert(m.to_string());
-            }
-        }
-    }
-
-    // Collect category models
-    if let Some(categories) = json.get("categories").and_then(|v| v.as_object()) {
-        for cat in categories.values() {
-            if let Some(m) = cat.get("model").and_then(|v| v.as_str()) {
-                models.insert(m.to_string());
-            }
-        }
-    }
-
-    for model in &models {
-        ensure_opencode_provider_for_model(opencode_config_dir, model);
-    }
-}
-
-fn workspace_abs_path(workspace: &Workspace, path: &std::path::Path) -> std::path::PathBuf {
-    if workspace.workspace_type == WorkspaceType::Container
-        && workspace::use_nspawn_for_workspace(workspace)
-    {
-        if let Ok(relative) = path.strip_prefix(std::path::Path::new("/")) {
-            return workspace.path.join(relative);
-        }
-        return workspace.path.join(path);
-    }
-    path.to_path_buf()
-}
-
-fn find_oh_my_opencode_cli_js(workspace: &Workspace) -> Option<std::path::PathBuf> {
-    // Static paths for global npm installations
-    let candidates = [
-        "/usr/local/lib/node_modules/oh-my-opencode/dist/cli/index.js",
-        "/usr/lib/node_modules/oh-my-opencode/dist/cli/index.js",
-        "/opt/homebrew/lib/node_modules/oh-my-opencode/dist/cli/index.js",
-        "/usr/local/share/node_modules/oh-my-opencode/dist/cli/index.js",
-    ];
-
-    for candidate in candidates {
-        let path = workspace_abs_path(workspace, std::path::Path::new(candidate));
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    // Search bun cache for oh-my-opencode (used when installed via bunx)
-    // Pattern: ~/.cache/.bun/install/cache/oh-my-opencode@<version>@@@1/dist/cli/index.js
-    // Some bun versions use ~/.bun/install/cache instead of ~/.cache/.bun/install/cache
-    let bun_cache_bases = [
-        "/root/.cache/.bun/install/cache",
-        "/root/.bun/install/cache",
-        "/home/*/.cache/.bun/install/cache",
-        "/home/*/.bun/install/cache",
-    ];
-    for base in bun_cache_bases {
-        let base_path = workspace_abs_path(workspace, std::path::Path::new(base));
-        if let Ok(entries) = std::fs::read_dir(&base_path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("oh-my-opencode@") {
-                    let cli_js = entry.path().join("dist/cli/index.js");
-                    if cli_js.exists() {
-                        return Some(cli_js);
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn patch_oh_my_opencode_port_override(workspace: &Workspace) -> bool {
-    let Some(cli_js_path) = find_oh_my_opencode_cli_js(workspace) else {
-        return false;
-    };
-
-    let contents = match std::fs::read_to_string(&cli_js_path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            tracing::warn!(
-                "Failed to read oh-my-opencode CLI at {}: {}",
-                cli_js_path.display(),
-                err
-            );
-            return false;
-        }
-    };
-
-    if contents.contains("SANDBOXED_SH_OPENCODE_PORT_PATCH") {
-        return true;
-    }
-
-    let newline = if contents.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let needle = format!(
-        "const {{ client: client3, server: server2 }} = await createOpencode({{{nl}      signal: abortController.signal{nl}    }});",
-        nl = newline
-    );
-    if !contents.contains(&needle) {
-        tracing::warn!(
-            "Unable to patch oh-my-opencode CLI (pattern mismatch) at {}",
-            cli_js_path.display()
-        );
-        return false;
-    }
-
-    let replacement = format!(
-        "const __oaPortRaw = process.env.OPENCODE_SERVER_PORT;{nl}    const __oaPort = __oaPortRaw ? Number(__oaPortRaw) : void 0;{nl}    const __oaHost = process.env.OPENCODE_SERVER_HOSTNAME;{nl}    const {{ client: client3, server: server2 }} = await createOpencode({{{nl}      signal: abortController.signal,{nl}      ...(Number.isFinite(__oaPort) ? {{ port: __oaPort }} : {{}}),{nl}      ...(__oaHost ? {{ hostname: __oaHost }} : {{}}),{nl}      // SANDBOXED_SH_OPENCODE_PORT_PATCH{nl}    }});",
-        nl = newline
-    );
-
-    let patched = contents.replace(&needle, &replacement);
-    if let Err(err) = std::fs::write(&cli_js_path, patched) {
-        tracing::warn!(
-            "Failed to patch oh-my-opencode CLI at {}: {}",
-            cli_js_path.display(),
-            err
-        );
-        return false;
-    }
-
-    tracing::info!(
-        "Patched oh-my-opencode CLI to honor OPENCODE_SERVER_PORT at {}",
-        cli_js_path.display()
-    );
-    true
 }
 
 fn opencode_storage_roots(workspace: &Workspace) -> Vec<std::path::PathBuf> {
@@ -8824,46 +8101,7 @@ fn resolve_opencode_model_from_config(
         return Some(model.to_string());
     }
 
-    let omo_path = opencode_config_dir.join("oh-my-opencode.json");
-    let omo_jsonc_path = opencode_config_dir.join("oh-my-opencode.jsonc");
-    let omo_path = if omo_jsonc_path.exists() {
-        omo_jsonc_path
-    } else {
-        omo_path
-    };
-
-    let contents = std::fs::read_to_string(omo_path).ok()?;
-    let contents = if contents.contains("//") {
-        strip_jsonc_comments(&contents)
-    } else {
-        contents
-    };
-    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    if let Some(agent_name) = agent {
-        if let Some(model) = value
-            .get("agents")
-            .and_then(|v| v.get(agent_name))
-            .and_then(|v| v.get("model"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(model.to_string());
-        }
-        if let Some(agent_map) = value.get("agents").and_then(|v| v.as_object()) {
-            let agent_lower = agent_name.to_lowercase();
-            for (name, entry) in agent_map {
-                if name.to_lowercase() == agent_lower {
-                    if let Some(model) = entry.get("model").and_then(|v| v.as_str()) {
-                        return Some(model.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    value
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    None
 }
 
 async fn command_available(
@@ -10129,14 +9367,6 @@ fn copy_host_executable_into_container(
     Ok(format!("/usr/local/bin/{}", name))
 }
 
-fn runner_is_oh_my_opencode(path: &str) -> bool {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| name == "oh-my-opencode")
-        .unwrap_or(false)
-}
-
 async fn resolve_opencode_installer_fetcher(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
@@ -10928,8 +10158,7 @@ async fn gemini_bun_fallback_if_needed(
 /// For Host workspaces: spawns the CLI directly on the host.
 /// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
 ///
-/// This uses the `oh-my-opencode run` CLI which creates an embedded OpenCode server,
-/// enabling per-workspace isolation without network issues.
+/// This uses `opencode run` directly for per-workspace isolation.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_opencode_turn(
     workspace: &Workspace,
@@ -10951,15 +10180,11 @@ pub async fn run_opencode_turn(
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    // When no agent is requested, default to vanilla opencode's primary
-    // "build" agent. Workspaces that opt into oh-my-opencode and want a
-    // different default should set their preferred agent on the mission
-    // (or via SandboxedConfig::default_agent).
+    // When no agent is requested, default to vanilla opencode's primary "build" agent.
     let default_agent = if agent.is_none() { Some("build") } else { None };
     let agent = agent.or(default_agent);
 
-    // Determine CLI runner: prefer backend config, then env var, then try bunx/npx
-    // We use 'bunx oh-my-opencode run' or 'npx oh-my-opencode run' for per-workspace execution.
+    // Use the OpenCode CLI directly for per-workspace execution.
     let workspace_exec = WorkspaceExec::new(workspace.clone());
     if let Err(err) = ensure_opencode_cli_available(&workspace_exec, work_dir).await {
         tracing::error!("{}", err);
@@ -10974,9 +10199,6 @@ pub async fn run_opencode_turn(
     let opencode_config_dir_host = work_dir.join(".opencode");
 
     // Resolve the model: explicit override > agent config > env var defaults.
-    // Agent config (oh-my-opencode.json) is checked before env vars so that
-    // config profiles with agent-specific models take precedence over global
-    // default model env vars.
     let mut resolved_model = model
         .map(|m| m.to_string())
         .or_else(|| resolve_opencode_model_from_config(&opencode_config_dir_host, agent))
@@ -11027,10 +10249,6 @@ pub async fn run_opencode_turn(
             provider_hint = None;
         }
     }
-
-    // Capture model override AFTER provider availability check so that cleared
-    // overrides are not passed to sync_opencode_agent_config.
-    let default_model_override = resolved_model.clone();
 
     let needs_google = matches!(provider_hint.as_deref(), Some("google" | "gemini"));
 
@@ -11085,10 +10303,8 @@ pub async fn run_opencode_turn(
     let configured_runner = get_backend_string_setting("opencode", "cli_path")
         .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok());
 
-    let mut runner_is_direct = false;
     let cli_runner = if let Some(path) = configured_runner {
         if command_available(&workspace_exec, work_dir, &path).await {
-            runner_is_direct = runner_is_oh_my_opencode(&path);
             path
         } else {
             let err_msg = format!(
@@ -11098,18 +10314,14 @@ pub async fn run_opencode_turn(
             tracing::error!("{}", err_msg);
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
+    } else if command_available(&workspace_exec, work_dir, "opencode").await {
+        "opencode".to_string()
     } else {
-        // Prefer bunx for oh-my-opencode (avoids version conflicts from npm global installs)
-        if command_available(&workspace_exec, work_dir, "bunx").await {
-            "bunx".to_string()
-        } else if command_available(&workspace_exec, work_dir, "npx").await {
-            "npx".to_string()
-        } else {
-            let err_msg =
-                "No OpenCode CLI runner found in workspace (expected bunx or npx).".to_string();
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
+        let err_msg =
+            "OpenCode CLI not found in workspace. Install opencode or update OPENCODE_CLI_PATH."
+                .to_string();
+        tracing::error!("{}", err_msg);
+        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
     };
 
     // Proactive network connectivity check - fail fast if API is unreachable
@@ -11142,50 +10354,30 @@ pub async fn run_opencode_turn(
     let work_dir_env = workspace_path_for_env(workspace, work_dir);
     let work_dir_arg = work_dir_env.to_string_lossy().to_string();
     let opencode_config_dir_env = workspace_path_for_env(workspace, &opencode_config_dir_host);
-    ensure_oh_my_opencode_config(
-        &workspace_exec,
-        work_dir,
-        &opencode_config_dir_host,
-        &opencode_config_dir_env,
-        &cli_runner,
-        runner_is_direct,
-        has_openai,
-        has_anthropic,
-        needs_google,
-    )
-    .await;
-    if model.is_some() {
-        if let Some(model_override) = resolved_model.as_deref() {
-            apply_model_override_to_oh_my_opencode(&opencode_config_dir_host, model_override);
-        }
-    }
-    sync_opencode_agent_config(
-        &opencode_config_dir_host,
-        default_model_override.as_deref(),
-        has_openai,
-        has_anthropic,
-        has_google,
-    );
     let mut model_used: Option<String> = None;
     // Accumulate token usage from SSE response.completed events for cost estimation
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut total_cache_creation_input_tokens: u64 = 0;
+    let mut total_cache_read_input_tokens: u64 = 0;
     let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent);
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
     // Inject provider definitions into opencode.json for models not in
-    // OpenCode's built-in snapshot.  We do this *after* sync_opencode_agent_config
-    // so all writes to opencode.json's model/agent sections are finished first.
+    // OpenCode's built-in snapshot.
     if let Some(model_override) = resolved_model.as_deref() {
-        ensure_opencode_provider_for_model(&opencode_config_dir_host, model_override);
+        ensure_opencode_provider_for_model(
+            &opencode_config_dir_host,
+            app_working_dir,
+            model_override,
+        );
     }
     if let Some(ref am) = agent_model {
         if resolved_model.as_deref() != Some(am) {
-            ensure_opencode_provider_for_model(&opencode_config_dir_host, am);
+            ensure_opencode_provider_for_model(&opencode_config_dir_host, app_working_dir, am);
         }
     }
-    ensure_opencode_providers_for_omo_config(&opencode_config_dir_host);
     if needs_google {
         if let Some(project_id) = detect_google_project_id() {
             ensure_opencode_google_project_id(&opencode_config_dir_host, &project_id);
@@ -11213,31 +10405,6 @@ pub async fn run_opencode_turn(
         )
         .await;
     }
-    // Pre-cache oh-my-opencode via bunx/npx so the port override patch can find the CLI JS.
-    // When the runner is bunx/npx, the package isn't cached until the actual run command.
-    // Without pre-caching, the patch fails and the port falls back to 4096, which may
-    // conflict with a standalone opencode.service on the host (shared network namespace).
-    if !runner_is_direct && find_oh_my_opencode_cli_js(workspace).is_none() {
-        tracing::debug!(
-            mission_id = %mission_id,
-            cli_runner = %cli_runner,
-            "Pre-caching oh-my-opencode for port override patch"
-        );
-        let precache_args = vec!["oh-my-opencode".to_string(), "--version".to_string()];
-        let _ = workspace_exec
-            .output(work_dir, &cli_runner, &precache_args, HashMap::new())
-            .await;
-    }
-    // Patch JS source for older (pre-v3) JS-based oh-my-opencode versions.
-    // For v3+ compiled binaries, the wrapper script handles port override instead.
-    let _ = patch_oh_my_opencode_port_override(workspace);
-
-    // Build CLI arguments for oh-my-opencode run
-    // The 'run' command takes a prompt and executes it with completion detection
-    // Arguments: bunx oh-my-opencode run [--agent <agent>] [--directory <path>] <message>
-    // Note: --timeout was removed in oh-my-opencode 3.7.2; the runner handles
-    // completion detection internally so an explicit timeout is not needed.
-    //
     // The message is written to a temp file and passed via $(cat ...) to avoid
     // argument splitting issues when multi-line messages go through
     // systemd-nspawn or nsenter shell wrappers.
@@ -11250,8 +10417,8 @@ pub async fn run_opencode_turn(
     let prompt_file_env = workspace_path_for_env(workspace, &prompt_file_host);
     let prompt_file_arg = prompt_file_env.to_string_lossy().to_string();
 
-    // Build the oh-my-opencode run command as a shell string so that
-    // $(cat <file>) correctly expands the message as a single argument.
+    // Build the opencode run command as a shell string so that $(cat <file>)
+    // correctly expands the message as a single argument.
     let shell_escape = |s: &str| -> String {
         let mut escaped = String::with_capacity(s.len() + 2);
         escaped.push('\'');
@@ -11266,153 +10433,58 @@ pub async fn run_opencode_turn(
         escaped
     };
 
-    // Vanilla `opencode` is the default. oh-my-opencode wraps opencode with extra
-    // features (todo enforcement, background tasks, opinionated agent profiles)
-    // and is opt-in per workspace/profile via `enable_oh_my_opencode`.
-    let oh_my_opencode_enabled = workspace
-        .config
-        .get("enable_oh_my_opencode")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let use_plain_opencode = !oh_my_opencode_enabled;
-
-    // `sisyphus` only exists inside the oh-my-opencode wrapper. Warn loudly when
-    // it is requested without the wrapper so the failure mode is obvious.
-    if use_plain_opencode
-        && agent
-            .map(|a| a.eq_ignore_ascii_case("sisyphus"))
-            .unwrap_or(false)
-    {
-        tracing::warn!(
-            mission_id = %mission_id,
-            "Agent 'sisyphus' requires oh-my-opencode, but enable_oh_my_opencode is false; mission will likely fail"
+    let opencode_model = resolved_model.as_deref().unwrap_or("builtin/fast");
+    if opencode_model.starts_with("builtin/") {
+        ensure_opencode_provider_for_model(
+            &opencode_config_dir_host,
+            app_working_dir,
+            opencode_model,
         );
     }
 
-    tracing::info!(
-        mission_id = %mission_id,
-        use_plain_opencode = use_plain_opencode,
-        oh_my_opencode_enabled = oh_my_opencode_enabled,
-        "OpenCode mode selection"
+    let mut inner_cmd = String::new();
+    inner_cmd.push_str("#!/bin/sh\n");
+    inner_cmd.push_str(&shell_escape(&cli_runner));
+    inner_cmd.push_str(" run --format json --model ");
+    inner_cmd.push_str(&shell_escape(opencode_model));
+    if let Some(a) = agent {
+        inner_cmd.push_str(" --agent ");
+        inner_cmd.push_str(&shell_escape(a));
+    }
+    inner_cmd.push_str(" --dir ");
+    inner_cmd.push_str(&shell_escape(&work_dir_arg));
+    inner_cmd.push_str(" \"$(cat ");
+    inner_cmd.push_str(&shell_escape(&prompt_file_arg));
+    inner_cmd.push_str(")\"");
+
+    let script_host_path = format!("{}/.sandboxed-sh-opencode-cmd.sh", work_dir.display());
+    let script_env_path = format!(
+        "{}/.sandboxed-sh-opencode-cmd.sh",
+        prompt_file_arg
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or(".")
     );
-
-    // When using plain opencode, inject the builtin proxy provider for builtin
-    // models and strip MCP servers (they hang during boot and aren't needed for
-    // simple assistant-mode chat).
-    let plain_opencode_model = if use_plain_opencode {
-        let m = resolved_model.as_deref().unwrap_or("builtin/fast");
-        if m.starts_with("builtin/") {
-            ensure_opencode_provider_for_model(&opencode_config_dir_host, m);
-        }
-
-        // Replace workspace MCPs with profile-defined MCPs only.
-        // Workspace MCPs (desktop, playwright, cq) hang during boot.
-        // The profile's settings.json can define lightweight MCPs
-        // (e.g. orchestrator, automation-manager) that are useful.
-        let config_path = opencode_config_dir_host.join("opencode.json");
-        let profile_mcp_path = opencode_config_dir_host.join("oh-my-opencode.json");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(obj) = config.as_object_mut() {
-                    let profile_mcps = std::fs::read_to_string(&profile_mcp_path)
-                        .ok()
-                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                        .and_then(|v| v.get("mcp").cloned())
-                        .unwrap_or(serde_json::json!({}));
-                    let mcp_count = profile_mcps.as_object().map(|m| m.len()).unwrap_or(0);
-                    obj.insert("mcp".to_string(), profile_mcps);
-                    if let Ok(updated) = serde_json::to_string_pretty(&config) {
-                        let _ = std::fs::write(&config_path, updated);
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            mcp_count = mcp_count,
-                            "Replaced workspace MCPs with profile MCPs for plain opencode mode"
-                        );
-                    }
-                }
-            }
-        }
-
-        m.to_string()
-    } else {
-        "builtin/fast".to_string()
-    };
-
-    let mut shell_cmd = String::new();
-    if runner_is_direct {
-        shell_cmd.push_str(&shell_escape(&cli_runner));
-        shell_cmd.push_str(" run");
-    } else if use_plain_opencode {
-        // For plain opencode, write the command to a temp script file to avoid
-        // shell quoting issues. The script is run inside `script -qe` for PTY.
-        let mut inner_cmd = String::from("#!/bin/sh\nopencode run --format json");
-        inner_cmd.push_str(" --model ");
-        inner_cmd.push_str(&shell_escape(&plain_opencode_model));
-        if let Some(a) = agent {
-            inner_cmd.push_str(" --agent ");
-            inner_cmd.push_str(&shell_escape(a));
-        }
-        inner_cmd.push_str(" --dir ");
-        inner_cmd.push_str(&shell_escape(&work_dir_arg));
-        inner_cmd.push_str(" \"$(cat ");
-        inner_cmd.push_str(&shell_escape(&prompt_file_arg));
-        inner_cmd.push_str(")\"");
-
-        // Write script to host filesystem (next to the prompt file)
-        let script_host_path = format!("{}/.sandboxed-sh-opencode-cmd.sh", work_dir.display());
-        let script_env_path = format!(
-            "{}/.sandboxed-sh-opencode-cmd.sh",
-            prompt_file_arg
-                .rsplit_once('/')
-                .map(|(dir, _)| dir)
-                .unwrap_or(".")
-        );
-        if let Err(e) = std::fs::write(&script_host_path, &inner_cmd) {
-            tracing::error!(mission_id = %mission_id, "Failed to write opencode command script: {}", e);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&script_host_path, std::fs::Permissions::from_mode(0o755));
-        }
-
-        // Use script -qe to wrap in PTY, -e preserves exit code.
-        // Reference the script via its container-relative path.
-        shell_cmd.push_str("script -qe /dev/null -c ");
-        shell_cmd.push_str(&shell_escape(&script_env_path));
-        shell_cmd.push_str(" 2>/dev/null");
-    } else {
-        shell_cmd.push_str(&shell_escape(&cli_runner));
-        shell_cmd.push_str(" oh-my-opencode run");
+    if let Err(e) = std::fs::write(&script_host_path, &inner_cmd) {
+        let err_msg = format!("Failed to write OpenCode command script: {}", e);
+        tracing::error!(mission_id = %mission_id, "{}", err_msg);
+        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script_host_path, std::fs::Permissions::from_mode(0o755));
     }
 
-    if !use_plain_opencode || runner_is_direct {
-        // For non-plain opencode, add agent/dir/prompt args directly
-        if let Some(a) = agent {
-            shell_cmd.push_str(" --agent ");
-            shell_cmd.push_str(&shell_escape(a));
-        }
-
-        // oh-my-opencode uses --directory
-        if runner_is_direct {
-            shell_cmd.push_str(" --dir ");
-        } else {
-            shell_cmd.push_str(" --directory ");
-        }
-        shell_cmd.push_str(&shell_escape(&work_dir_arg));
-
-        shell_cmd.push_str(" \"$(cat ");
-        shell_cmd.push_str(&shell_escape(&prompt_file_arg));
-        shell_cmd.push_str(")\"");
-    }
+    let mut shell_cmd = String::from("script -qe /dev/null -c ");
+    shell_cmd.push_str(&shell_escape(&script_env_path));
+    shell_cmd.push_str(" 2>/dev/null");
 
     let args = vec!["-c".to_string(), shell_cmd.clone()];
     let cli_runner_shell = "/bin/sh".to_string();
 
     tracing::debug!(
         mission_id = %mission_id,
-        runner_is_direct = runner_is_direct,
         shell_cmd = %shell_cmd,
         prompt_file = %prompt_file_arg,
         "OpenCode CLI args prepared (shell wrapper)"
@@ -11461,8 +10533,7 @@ pub async fn run_opencode_turn(
         );
     }
 
-    // Ensure bun's global bin directories are in PATH so that oh-my-opencode
-    // can find the `opencode` binary installed via `bun install -g opencode-ai`.
+    // Ensure OpenCode's install directory is available in PATH.
     {
         let current_path = std::env::var("PATH").unwrap_or_default();
         let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
@@ -11495,15 +10566,10 @@ pub async fn run_opencode_turn(
         opencode_port = "4096".to_string();
     }
 
-    // Plain opencode manages its own serve process; skip the port wrapper
-    // to avoid conflicts. Oh-my-opencode needs the port override to coexist
-    // with other instances.
-    if !use_plain_opencode {
-        env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
-        if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
-            if !host.trim().is_empty() {
-                env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
-            }
+    env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
+    if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
+        if !host.trim().is_empty() {
+            env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
         }
     }
     tracing::info!(
@@ -11573,16 +10639,6 @@ pub async fn run_opencode_turn(
 
     prepend_opencode_bin_to_path(&mut env, workspace);
 
-    // Install the opencode serve wrapper AFTER prepend_opencode_bin_to_path so the
-    // wrapper dir (/tmp/.sandboxed-sh-bin) is prepended last and takes priority over
-    // the real binary at ~/.opencode/bin/opencode.
-    // oh-my-opencode v3+ is a compiled binary that spawns `opencode serve --port=4096`;
-    // the wrapper intercepts this and overrides the port.
-    // Skip for plain opencode — it manages its own serve process.
-    if !use_plain_opencode && opencode_port != "4096" {
-        install_opencode_serve_port_wrapper(&mut env, workspace, &opencode_port);
-    }
-
     cleanup_opencode_listeners(&workspace_exec, work_dir, Some(&opencode_port)).await;
 
     // Use WorkspaceExec to spawn the CLI in the correct workspace context.
@@ -11601,9 +10657,6 @@ pub async fn run_opencode_turn(
     };
 
     // Get stdout and stderr for reading output
-    // oh-my-opencode run writes:
-    // - stdout: assistant text output (the actual response)
-    // - stderr: event logs (tool calls, results, session status)
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -11633,10 +10686,6 @@ pub async fn run_opencode_turn(
     let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // Shared accumulator for token usage extracted from SSE response.completed events.
-    // Updated only by the dedicated SSE curl task; the stdout parser uses local counters
-    // and only accumulates when the SSE task is absent (to avoid double-counting).
-    let sse_usage_tokens: Arc<Mutex<(u64, u64)>> = Arc::new(Mutex::new((0, 0)));
     let latest_tool_result_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
@@ -11654,297 +10703,10 @@ pub async fn run_opencode_turn(
     // Used to skip inactivity timeouts during long tool runs (builds, tests, etc.).
     let (sse_tool_depth_tx, sse_tool_depth_rx) = tokio::sync::watch::channel(0u32);
 
-    // plain opencode with --format json outputs structured events to stdout.
-    // oh-my-opencode uses SSE from its internal server instead.
-    let use_json_stdout = use_plain_opencode;
-    let sse_handle = if !use_json_stdout
-        && command_available(&workspace_exec, work_dir, "curl").await
-    {
-        let workspace_exec = workspace_exec.clone();
-        let work_dir = work_dir.to_path_buf();
-        let work_dir_arg = work_dir_arg.clone();
-        let session_id_capture = session_id_capture.clone();
-        let sse_emitted_thinking = sse_emitted_thinking.clone();
-        let sse_emitted_text = sse_emitted_text.clone();
-        let sse_text_buffer = sse_text_buffer.clone();
-        let sse_done_sent = sse_done_sent.clone();
-        let sse_error_message = sse_error_message.clone();
-        let sse_cancel = sse_cancel.clone();
-        let sse_complete_tx = sse_complete_tx.clone();
-        let sse_session_idle_tx = sse_session_idle_tx.clone();
-        let sse_retry_tx = sse_retry_tx.clone();
-        let last_activity = last_activity.clone();
-        let text_output_tx = text_output_tx.clone();
-        let sse_tool_depth_tx = sse_tool_depth_tx.clone();
-        let sse_usage_tokens = sse_usage_tokens.clone();
-        let latest_tool_result_text = latest_tool_result_text.clone();
-        let events_tx = events_tx.clone();
-        let opencode_port = opencode_port.clone();
-        let sse_host = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-
-        Some(tokio::spawn(async move {
-            let event_url = format!(
-                "http://{}:{}/event?directory={}",
-                sse_host,
-                opencode_port,
-                urlencoding::encode(&work_dir_arg)
-            );
-
-            let mut attempts = 0u32;
-            loop {
-                if sse_cancel.is_cancelled() {
-                    break;
-                }
-                if attempts > 7 {
-                    break;
-                }
-                attempts += 1;
-
-                let args = vec![
-                    "-N".to_string(),
-                    "-s".to_string(),
-                    "-H".to_string(),
-                    "Accept: text/event-stream".to_string(),
-                    "-H".to_string(),
-                    "Cache-Control: no-cache".to_string(),
-                    event_url.clone(),
-                ];
-
-                let child = workspace_exec
-                    .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
-                    .await;
-
-                // Exponential backoff: 50ms, 100ms, 200ms, 400ms, ...
-                let backoff_ms = 50u64 * (1u64 << (attempts - 1).min(6));
-
-                let mut child = match child {
-                    Ok(child) => child,
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        continue;
-                    }
-                };
-
-                let stdout = match child.stdout.take() {
-                    Some(stdout) => stdout,
-                    None => {
-                        let _ = child.kill().await;
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        continue;
-                    }
-                };
-
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                let mut current_event: Option<String> = None;
-                let mut data_lines: Vec<String> = Vec::new();
-                let mut state = OpencodeSseState::default();
-                let mut saw_complete = false;
-                // Reset SSE state on reconnect so stale values from a lost
-                // connection don't cause incorrect behavior:
-                // - tool depth: stale counts would permanently disable the
-                //   inactivity timeout
-                // - session_idle: a stale `true` would trigger the 10s kill
-                //   timer after reconnect, prematurely terminating the mission
-                // - retry counter: stale counts from a previous connection
-                //   should not accumulate across reconnects
-                // - last_activity: reset so the 120s global and 30s text idle
-                //   timers count from the reconnect, not from the last event
-                //   on the dead connection (the depth reset to 0 disables the
-                //   tools_active guard, so last_activity is the only remaining
-                //   protection against premature timeout during reconnect)
-                sse_tool_depth_tx.send_modify(|v| *v = 0);
-                let _ = sse_session_idle_tx.send(false);
-                sse_retry_tx.send_modify(|v| *v = 0);
-                if let Ok(mut guard) = last_activity.lock() {
-                    *guard = std::time::Instant::now();
-                }
-
-                loop {
-                    if sse_cancel.is_cancelled() {
-                        let _ = child.kill().await;
-                        return;
-                    }
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let trimmed = line.trim_end();
-                            if trimmed.is_empty() {
-                                if !data_lines.is_empty() {
-                                    let data = data_lines.join("\n");
-                                    let current_session = session_id_capture
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .clone();
-                                    if let Some(parsed) = parse_opencode_sse_event(
-                                        &data,
-                                        current_event.as_deref(),
-                                        current_session.as_deref(),
-                                        &mut state,
-                                        mission_id,
-                                    ) {
-                                        if let Some(session_id) = parsed.session_id {
-                                            let mut guard = session_id_capture
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner());
-                                            if guard.is_none() {
-                                                *guard = Some(session_id);
-                                            }
-                                        }
-                                        if let Some((input, output)) = parsed.usage {
-                                            if let Ok(mut guard) = sse_usage_tokens.lock() {
-                                                guard.0 = guard.0.saturating_add(input);
-                                                guard.1 = guard.1.saturating_add(output);
-                                            }
-                                        }
-                                        if let Some(event) = parsed.event {
-                                            if let Ok(mut guard) = last_activity.lock() {
-                                                *guard = std::time::Instant::now();
-                                            }
-                                            if let AgentEvent::Error { ref message, .. } = event {
-                                                let mut guard = sse_error_message
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                if guard.is_none() {
-                                                    *guard = Some(message.clone());
-                                                }
-                                            }
-                                            if matches!(event, AgentEvent::Thinking { .. }) {
-                                                sse_emitted_thinking.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::SeqCst,
-                                                );
-                                            }
-                                            if let AgentEvent::TextDelta { ref content, .. } = event
-                                            {
-                                                let _ = text_output_tx.send(true);
-                                                sse_emitted_text.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::SeqCst,
-                                                );
-                                                // Capture the latest full-text snapshot so
-                                                // it can serve as a fallback for final_result
-                                                // when stdout JSON and storage both fail.
-                                                if let Ok(mut buf) = sse_text_buffer.lock() {
-                                                    *buf = content.clone();
-                                                }
-                                            }
-                                            // Track active tool depth for permit management.
-                                            match &event {
-                                                AgentEvent::ToolCall { .. } => {
-                                                    sse_tool_depth_tx
-                                                        .send_modify(|v| *v = v.saturating_add(1));
-                                                }
-                                                AgentEvent::ToolResult { .. } => {
-                                                    sse_tool_depth_tx
-                                                        .send_modify(|v| *v = v.saturating_sub(1));
-                                                }
-                                                _ => {}
-                                            }
-                                            remember_tool_result_text(
-                                                &event,
-                                                &latest_tool_result_text,
-                                            );
-                                            let _ = events_tx.send(event);
-                                        }
-                                        for event in parsed.extra_events {
-                                            match &event {
-                                                AgentEvent::ToolCall { .. } => {
-                                                    sse_tool_depth_tx
-                                                        .send_modify(|v| *v = v.saturating_add(1));
-                                                }
-                                                AgentEvent::ToolResult { .. } => {
-                                                    sse_tool_depth_tx
-                                                        .send_modify(|v| *v = v.saturating_sub(1));
-                                                }
-                                                _ => {}
-                                            }
-                                            remember_tool_result_text(
-                                                &event,
-                                                &latest_tool_result_text,
-                                            );
-                                            let _ = events_tx.send(event);
-                                        }
-                                        if parsed.message_complete {
-                                            saw_complete = true;
-                                            let _ = sse_complete_tx.send(true);
-                                            if sse_emitted_thinking
-                                                .load(std::sync::atomic::Ordering::SeqCst)
-                                                && !sse_done_sent
-                                                    .load(std::sync::atomic::Ordering::SeqCst)
-                                            {
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: String::new(),
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                                sse_done_sent.store(
-                                                    true,
-                                                    std::sync::atomic::Ordering::SeqCst,
-                                                );
-                                            }
-                                            let _ = child.kill().await;
-                                            break;
-                                        }
-                                        if parsed.session_idle {
-                                            let _ = sse_session_idle_tx.send(true);
-                                        }
-                                        if parsed.session_retry {
-                                            sse_retry_tx.send_modify(|v| *v += 1);
-                                        }
-                                    }
-                                }
-
-                                current_event = None;
-                                data_lines.clear();
-                                continue;
-                            }
-
-                            if let Some(rest) = trimmed.strip_prefix("event:") {
-                                current_event = Some(rest.trim_start().to_string());
-                                continue;
-                            }
-
-                            if let Some(rest) = trimmed.strip_prefix("data:") {
-                                data_lines.push(rest.trim_start().to_string());
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(mission_id = %mission_id, error = %e, "SSE reader I/O error");
-                            break;
-                        }
-                    }
-                }
-
-                let _ = child.kill().await;
-                if saw_complete {
-                    break;
-                }
-                // Exponential backoff before reconnecting
-                let backoff_ms = 50u64 * (1u64 << attempts.min(6));
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-            }
-        }))
-    } else {
-        None
-    };
-    // In SSE mode, drop the original sender so the channel closes when the SSE
-    // handler exits.  This prevents a stale `tools_active == true` from
-    // permanently disabling the inactivity timeout if the SSE handler dies
-    // mid-tool-execution.
-    // In JSON stdout mode, keep the sender alive — we use it below to track
-    // tool depth from `tool_use` / `step_finish` events on stdout.
-    let json_tool_depth_tx = if use_json_stdout {
-        Some(sse_tool_depth_tx)
-    } else {
-        drop(sse_tool_depth_tx);
-        None
-    };
+    // OpenCode's supported integration path is `run --format json`; all events
+    // are consumed from stdout, with no parallel curl/SSE side channel.
+    let sse_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let json_tool_depth_tx = Some(sse_tool_depth_tx);
 
     // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
     let mission_id_clone = mission_id;
@@ -12148,7 +10910,7 @@ pub async fn run_opencode_turn(
         })
     });
 
-    // Process stdout output from oh-my-opencode
+    // Process stdout output from OpenCode.
     // Events come via SSE (when curl is available), stdout contains the assistant's text response.
     let stdout_reader = BufReader::new(stdout);
     let mut stdout_lines = stdout_reader.lines();
@@ -12519,7 +11281,7 @@ pub async fn run_opencode_turn(
 
                             // Handle plain opencode --format json events.
                             // Plain opencode emits: step_start, text, step_finish
-                            // (different from oh-my-opencode's message.part.updated/completion)
+                            // (different from message.part.updated/completion)
                             if event_type == "text" {
                                 if let Some(part) = json.get("part") {
                                     if let Some(text) =
@@ -12585,7 +11347,7 @@ pub async fn run_opencode_turn(
                                 }
                             }
 
-                            // Handle completion and error events from oh-my-opencode
+                            // Handle completion and error events from OpenCode.
                             if event_type == "completion" {
                                 tracing::info!(mission_id = %mission_id, "OpenCode JSON completion event");
                                 let _ = sse_complete_tx.send(true);
@@ -12629,9 +11391,19 @@ pub async fn run_opencode_turn(
                                 // can see the same `response.completed` event, which would
                                 // double-count tokens (and inflate cost estimates to ~2x).
                                 if sse_handle.is_none() {
-                                    if let Some((input, output)) = parsed.usage {
-                                        total_input_tokens = total_input_tokens.saturating_add(input);
-                                        total_output_tokens = total_output_tokens.saturating_add(output);
+                                    if let Some(usage) = parsed.usage {
+                                        total_input_tokens = total_input_tokens
+                                            .saturating_add(usage.input_tokens);
+                                        total_output_tokens = total_output_tokens
+                                            .saturating_add(usage.output_tokens);
+                                        total_cache_creation_input_tokens =
+                                            total_cache_creation_input_tokens.saturating_add(
+                                                usage.cache_creation_input_tokens.unwrap_or(0),
+                                            );
+                                        total_cache_read_input_tokens = total_cache_read_input_tokens
+                                            .saturating_add(
+                                                usage.cache_read_input_tokens.unwrap_or(0),
+                                            );
                                     }
                                 }
                                 if let Some(event) = parsed.event {
@@ -12971,18 +11743,6 @@ pub async fn run_opencode_turn(
         }
     }
 
-    if !sse_emitted && !emitted_thinking {
-        if let Some((thought, cleaned)) = extract_thought_line(&final_result) {
-            let _ = events_tx.send(AgentEvent::Thinking {
-                content: thought,
-                done: false,
-                mission_id: Some(mission_id),
-            });
-            emitted_thinking = true;
-            final_result = cleaned;
-        }
-    }
-
     if emitted_thinking || (sse_emitted && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst))
     {
         let _ = events_tx.send(AgentEvent::Thinking {
@@ -13084,19 +11844,19 @@ pub async fn run_opencode_turn(
         }
     }
 
-    // Merge shared SSE usage from the curl task into local accumulators
-    if let Ok(guard) = sse_usage_tokens.lock() {
-        total_input_tokens = total_input_tokens.saturating_add(guard.0);
-        total_output_tokens = total_output_tokens.saturating_add(guard.1);
-    }
-
     // Compute cost from accumulated token usage and model (if available)
-    if total_input_tokens > 0 || total_output_tokens > 0 {
+    if total_input_tokens > 0
+        || total_output_tokens > 0
+        || total_cache_creation_input_tokens > 0
+        || total_cache_read_input_tokens > 0
+    {
         let usage = crate::cost::TokenUsage {
             input_tokens: total_input_tokens,
             output_tokens: total_output_tokens,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            cache_creation_input_tokens: (total_cache_creation_input_tokens > 0)
+                .then_some(total_cache_creation_input_tokens),
+            cache_read_input_tokens: (total_cache_read_input_tokens > 0)
+                .then_some(total_cache_read_input_tokens),
         };
         let (cost_cents, cost_source) =
             resolve_cost_cents_and_source(None, model_used.as_deref(), &usage);
@@ -13275,6 +12035,74 @@ fn usage_value_tokens(value: &serde_json::Value, keys: &[&str]) -> u64 {
         .unwrap_or(0)
 }
 
+fn nested_usage_value_tokens(value: &serde_json::Value, path: &[&str]) -> u64 {
+    let mut current = value;
+    for key in path {
+        current = match current.get(*key) {
+            Some(next) => next,
+            None => return 0,
+        };
+    }
+    current.as_u64().unwrap_or(0)
+}
+
+fn opencode_usage_from_value(usage: &serde_json::Value) -> Option<crate::cost::TokenUsage> {
+    let raw_input_tokens = usage_value_tokens(
+        usage,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+        ],
+    );
+    let output_tokens = usage_value_tokens(
+        usage,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+        ],
+    );
+    let cache_creation_tokens = usage_value_tokens(
+        usage,
+        &[
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_write_input_tokens",
+            "cacheWriteInputTokens",
+            "prompt_cache_creation_tokens",
+        ],
+    );
+    let explicit_cache_read_tokens = usage_value_tokens(
+        usage,
+        &[
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "prompt_cache_hit_tokens",
+        ],
+    );
+    let included_cached_tokens = usage_value_tokens(usage, &["cached_tokens", "cachedTokens"])
+        .saturating_add(nested_usage_value_tokens(
+            usage,
+            &["input_tokens_details", "cached_tokens"],
+        ))
+        .saturating_add(nested_usage_value_tokens(
+            usage,
+            &["prompt_tokens_details", "cached_tokens"],
+        ));
+    let cache_read_tokens = explicit_cache_read_tokens.saturating_add(included_cached_tokens);
+    let input_tokens = raw_input_tokens.saturating_sub(included_cached_tokens);
+    let token_usage = crate::cost::TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: Some(cache_creation_tokens),
+        cache_read_input_tokens: Some(cache_read_tokens),
+    };
+    token_usage.has_usage().then_some(token_usage)
+}
+
 fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage> {
     let usage = value
         .get("usage")
@@ -13283,7 +12111,7 @@ fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage
         .or_else(|| value.get("response").and_then(|r| r.get("usage")))
         .or_else(|| value.get("message").and_then(|m| m.get("usage")))?;
 
-    let input_tokens = usage_value_tokens(
+    let raw_input_tokens = usage_value_tokens(
         usage,
         &[
             "input_tokens",
@@ -13310,7 +12138,7 @@ fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage
             "cacheWriteInputTokens",
         ],
     );
-    let cache_read_tokens = usage_value_tokens(
+    let explicit_cache_read_tokens = usage_value_tokens(
         usage,
         &[
             "cache_read_input_tokens",
@@ -13319,6 +12147,19 @@ fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage
             "cachedTokens",
         ],
     );
+    let nested_cached_tokens =
+        nested_usage_value_tokens(usage, &["input_tokens_details", "cached_tokens"])
+            .saturating_add(nested_usage_value_tokens(
+                usage,
+                &["prompt_tokens_details", "cached_tokens"],
+            ));
+    let cache_read_tokens = explicit_cache_read_tokens.saturating_add(nested_cached_tokens);
+    // xAI/OpenAI-compatible usage reports usually include cached prompt
+    // tokens inside the prompt/input total. Internally we store billable
+    // non-cached input separately from discounted cache-read input, so the
+    // two buckets can be summed for display without double counting and
+    // priced at their respective rates.
+    let input_tokens = raw_input_tokens.saturating_sub(cache_read_tokens);
     let token_usage = crate::cost::TokenUsage {
         input_tokens,
         output_tokens,
@@ -13497,6 +12338,16 @@ pub async fn run_grok_turn(
                     .with_terminal_reason(TerminalReason::LlmError);
                 }
             }
+        } else if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
+            &entry.refresh_token,
+            &entry.access_token,
+            entry.expires_at,
+        ) {
+            tracing::warn!(
+                mission_id = %mission_id,
+                error = %err,
+                "Failed to materialize fresh xAI OAuth token into Grok auth file"
+            );
         }
     }
 
@@ -13976,6 +12827,15 @@ fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str
         && object_markers.iter().any(|object| user.contains(object))
 }
 
+fn codex_is_goal_request(user_message: &str) -> bool {
+    user_message.trim_start().starts_with("/goal ")
+}
+
+fn codex_missing_goal_final_response_message() -> String {
+    "Goal completed, but Codex did not emit a final assistant response. The last reasoning block was captured in the thinking panel, but it is not being promoted to the completion message."
+        .to_string()
+}
+
 /// Does the user message read as a question or request-for-explanation,
 /// rather than an imperative "go do this"? Used to suppress the
 /// `explicit_tool_markers` heuristic so advisory questions that mention
@@ -14191,19 +13051,74 @@ pub async fn run_codex_turn(
     // Best-effort: try to mint an OpenAI API key from the OAuth refresh token.
     // If this fails (e.g. no API platform org), write_codex_credentials_for_workspace
     // will fall back to auth_mode: "chatgpt" using the access_token directly.
-    if let Err(e) = crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
-    {
-        tracing::warn!(
-            "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
-            e
-        );
+    //
+    // Skip this when the rotation layer has already selected a specific
+    // ChatGPT OAuth account. Minting an API key refreshes/rotates the same
+    // refresh token, then the selected credential can become stale before it
+    // is written into Codex auth.json.
+    let should_try_mint_api_key = !matches!(
+        override_credential,
+        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(_))
+    );
+    if should_try_mint_api_key {
+        if let Err(e) =
+            crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
+        {
+            tracing::warn!(
+                "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
+                e
+            );
+        }
     }
+
+    let oauth_account_to_prepare = match override_credential {
+        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(account)) => {
+            Some((*account).clone())
+        }
+        Some(crate::api::ai_providers::CodexCredentialOverride::ApiKey(_)) => None,
+        None => {
+            if crate::api::ai_providers::get_openai_api_key_for_codex_default(app_working_dir)
+                .is_none()
+            {
+                crate::api::ai_providers::get_all_openai_oauth_accounts(app_working_dir)
+                    .into_iter()
+                    .next()
+            } else {
+                None
+            }
+        }
+    };
+    let prepared_oauth_account = match oauth_account_to_prepare.as_ref() {
+        Some(account) => {
+            match crate::api::ai_providers::prepare_codex_oauth_account_for_launch(
+                app_working_dir,
+                account,
+            )
+            .await
+            {
+                Ok(account) => Some(account),
+                Err(e) => {
+                    tracing::error!("Failed to prepare Codex OAuth credentials: {}", e);
+                    return AgentResult::failure(
+                        format!("Failed to prepare Codex OAuth credentials: {}", e),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::AuthError);
+                }
+            }
+        }
+        None => None,
+    };
+    let prepared_override = prepared_oauth_account
+        .as_ref()
+        .map(crate::api::ai_providers::CodexCredentialOverride::OAuth);
+    let workspace_override = prepared_override.as_ref().or(override_credential);
 
     // Ensure Codex auth.json is present in the workspace context (host or container).
     if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(
         workspace,
         app_working_dir,
-        override_credential,
+        workspace_override,
     ) {
         tracing::error!("Failed to write Codex credentials: {}", e);
         return AgentResult::failure(
@@ -14238,6 +13153,14 @@ pub async fn run_codex_turn(
     let codex_config = crate::backend::codex::client::CodexConfig {
         cli_path,
         model_effort: model_effort.map(|s| s.to_string()),
+        external_chatgpt_auth: prepared_oauth_account.as_ref().map(|account| {
+            crate::backend::codex::client::CodexExternalChatgptAuth {
+                access_token: account.access_token.clone(),
+                chatgpt_account_id: account.chatgpt_account_id.clone(),
+                chatgpt_plan_type: None,
+                working_dir: app_working_dir.to_path_buf(),
+            }
+        }),
         ..Default::default()
     };
 
@@ -14291,6 +13214,13 @@ pub async fn run_codex_turn(
     let mut thinking_emitted = false;
     let mut thinking_done_emitted = false;
     let mut thinking_accumulated = String::new();
+    // Tracks which codex reasoning item `thinking_accumulated` currently
+    // belongs to. When a Thinking event arrives with a different `item_id`,
+    // we finalize the existing buffer and start a fresh one — codex emits
+    // multiple reasoning items per turn (each with its own cumulative
+    // snapshots), and merging them into one buffer produced concatenated
+    // thoughts in stored history (see mission dbc8a7e9 seq 6651).
+    let mut thinking_item: Option<String> = None;
     let mut last_summary: Option<String> = None;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
@@ -14330,14 +13260,60 @@ pub async fn run_codex_turn(
                             text_delta_pending = true;
                         }
                     }
-                    ExecutionEvent::Thinking { content } => {
-                        merge_stream_fragment(&mut thinking_accumulated, &content);
-                        // Stream the canonical cumulative buffer for real-time UI.
+                    ExecutionEvent::Thinking { content, item_id } => {
+                        if thinking_overlaps_visible_answer(&content, &assistant_message) {
+                            tracing::debug!(
+                                thinking_len = content.len(),
+                                assistant_len = assistant_message.len(),
+                                "Dropping Codex thinking event that duplicates visible assistant text"
+                            );
+                            continue;
+                        }
+                        // Codex emits per-item cumulative snapshots: every
+                        // emit with the same `item_id` contains the previous
+                        // emit as a prefix. When `item_id` changes we're on a
+                        // new reasoning item — finalize the existing buffer
+                        // as `done: true` so it persists as its own thought,
+                        // and start fresh. Falling back to `merge_stream_fragment`
+                        // (the pre-fix behaviour) concatenated unrelated items
+                        // into one buffer because it only knows about byte
+                        // overlap, not item identity.
+                        let item_changed = match (&thinking_item, &item_id) {
+                            (Some(prev), Some(cur)) => prev != cur,
+                            // First event of the turn, or backend doesn't
+                            // expose item IDs: treat as continuation.
+                            _ => false,
+                        };
+                        if item_changed && !thinking_accumulated.is_empty() {
+                            let _ = events_tx.send(AgentEvent::Thinking {
+                                content: std::mem::take(&mut thinking_accumulated),
+                                done: true,
+                                mission_id: Some(mission_id),
+                            });
+                            thinking_done_emitted = true;
+                        }
+                        if item_id.is_some() {
+                            thinking_item = item_id;
+                            // Per-item cumulative: each new snapshot replaces
+                            // the buffer (longest wins; shorter echoes are
+                            // dropped to keep the buffer monotone).
+                            if content.len() >= thinking_accumulated.len() {
+                                thinking_accumulated = content;
+                            }
+                        } else {
+                            // Unknown-item backends still use overlap-based
+                            // merging so a CLI that resends a partial
+                            // snapshot doesn't double words.
+                            merge_stream_fragment(&mut thinking_accumulated, &content);
+                        }
                         let _ = events_tx.send(AgentEvent::Thinking {
                             content: thinking_accumulated.clone(),
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        if !thinking_accumulated.is_empty() {
+                            thinking_done_emitted = false;
+                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
@@ -14352,6 +13328,7 @@ pub async fn run_codex_turn(
                             });
                             thinking_done_emitted = true;
                         }
+                        thinking_item = None;
                         pending_tools.insert(id.clone(), name.clone());
                         let _ = events_tx.send(AgentEvent::ToolCall {
                             tool_call_id: id,
@@ -14485,19 +13462,6 @@ pub async fn run_codex_turn(
         });
     }
 
-    if !thinking_emitted {
-        if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
-            let _ = events_tx.send(AgentEvent::Thinking {
-                content: thought,
-                done: true,
-                mission_id: Some(mission_id),
-            });
-            thinking_emitted = true;
-            thinking_done_emitted = true;
-            assistant_message = cleaned;
-        }
-    }
-
     // Capture a copy of the accumulated reasoning before the flush below
     // moves it into the broadcast event. /goal missions frequently end with
     // the model emitting a self-audit as reasoning and then calling
@@ -14548,10 +13512,14 @@ pub async fn run_codex_turn(
     } else if let Some(summary) = last_summary {
         summary
     } else if let Some(thinking_text) = thinking_for_fallback {
-        // Surface the model's reasoning as the assistant message so the
-        // dashboard's final-message slot matches what's already visible in
-        // the thinking panel.
-        thinking_text
+        if success && codex_is_goal_request(user_message) && !cancelled {
+            codex_missing_goal_final_response_message()
+        } else {
+            // Surface the model's reasoning as the assistant message so the
+            // dashboard's final-message slot matches what's already visible in
+            // the thinking panel.
+            thinking_text
+        }
     } else if let Some(marker) = cancel_marker.as_ref() {
         // Mid-turn cancellation with nothing accumulated — preserve the
         // historical "Mission cancelled" / shutdown text for the UI.
@@ -14899,7 +13867,15 @@ pub async fn run_gemini_turn(
                             mission_id: Some(mission_id),
                         });
                     }
-                    ExecutionEvent::Thinking { content } => {
+                    ExecutionEvent::Thinking { content, item_id: _ } => {
+                        if thinking_overlaps_visible_answer(&content, &assistant_message) {
+                            tracing::debug!(
+                                thinking_len = content.len(),
+                                assistant_len = assistant_message.len(),
+                                "Dropping Gemini thinking event that duplicates visible assistant text"
+                            );
+                            continue;
+                        }
                         merge_stream_fragment(&mut thinking_accumulated, &content);
                         // Stream the canonical cumulative buffer for real-time UI.
                         let _ = events_tx.send(AgentEvent::Thinking {
@@ -14907,6 +13883,9 @@ pub async fn run_gemini_turn(
                             done: false,
                             mission_id: Some(mission_id),
                         });
+                        if !thinking_accumulated.is_empty() {
+                            thinking_done_emitted = false;
+                        }
                         thinking_emitted = true;
                     }
                     ExecutionEvent::ToolCall { id, name, args } => {
@@ -14976,19 +13955,6 @@ pub async fn run_gemini_turn(
             else => {
                 break;
             }
-        }
-    }
-
-    if !thinking_emitted {
-        if let Some((thought, cleaned)) = extract_thought_line(&assistant_message) {
-            let _ = events_tx.send(AgentEvent::Thinking {
-                content: thought,
-                done: true,
-                mission_id: Some(mission_id),
-            });
-            thinking_emitted = true;
-            thinking_done_emitted = true;
-            assistant_message = cleaned;
         }
     }
 
@@ -15442,20 +14408,21 @@ mod tests {
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
         claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
         codex_chatgpt_fallback_model, codex_error_message_to_surface,
-        codex_final_message_looks_like_progress_update, codex_key_fingerprint,
+        codex_final_message_looks_like_progress_update, codex_is_goal_request,
+        codex_key_fingerprint, codex_missing_goal_final_response_message,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
+        custom_opencode_provider_definition, ensure_opencode_provider_for_model,
         extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        extract_thought_line, is_capacity_limited_error, is_codex_chatgpt_account_model_blocked,
-        is_codex_node_wrapper, is_provider_payload_error, is_rate_limited_error,
-        is_session_corruption_error, is_success_path_auth_error,
-        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
-        is_tool_call_only_output, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, record_codex_error_message,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
+        is_success_path_auth_error, is_success_path_provider_payload_error,
+        is_success_path_rate_limited_error, is_tool_call_only_output,
+        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
+        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
+        strip_think_tags, summarize_recent_opencode_stderr, thinking_overlaps_visible_answer,
         use_thinking_only_fallback, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
         ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
         MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
@@ -15564,13 +14531,15 @@ mod tests {
                 "usage": {
                     "prompt_tokens": 1200,
                     "completion_tokens": 345,
-                    "cached_tokens": 100
+                    "prompt_tokens_details": {
+                        "cached_tokens": 100
+                    }
                 }
             }
         });
 
         let usage = grok_event_usage(&event).expect("usage");
-        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.input_tokens, 1100);
         assert_eq!(usage.output_tokens, 345);
         assert_eq!(usage.cache_read_input_tokens, Some(100));
     }
@@ -15581,6 +14550,22 @@ mod tests {
             "Create directory codex_probe, write files, run ls -la, wc -c, and cat them.",
             "ALL_STEPS_DONE"
         ));
+    }
+
+    #[test]
+    fn codex_goal_request_detection_requires_slash_goal_command() {
+        assert!(codex_is_goal_request("/goal finish the task"));
+        assert!(codex_is_goal_request("   /goal finish the task"));
+        assert!(!codex_is_goal_request("/goal"));
+        assert!(!codex_is_goal_request("please run /goal literally"));
+    }
+
+    #[test]
+    fn codex_missing_goal_final_response_message_does_not_expose_reasoning() {
+        let message = codex_missing_goal_final_response_message();
+        assert!(message.contains("did not emit a final assistant response"));
+        assert!(!message.contains("Both PRs are open"));
+        assert!(!message.contains("final sanity check"));
     }
 
     #[test]
@@ -15699,93 +14684,6 @@ mod tests {
         assert!(!codex_final_message_looks_like_progress_update(
             "I ran the smoke task for both model aliases. opus-6 succeeded and opus failed with a timeout."
         ));
-    }
-
-    #[test]
-    fn sync_opencode_agent_config_removes_overrides_when_plugin_enabled() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_dir = temp_dir.path();
-
-        fs::write(
-            config_dir.join("oh-my-opencode.json"),
-            r#"{
-  "agents": {
-    "prometheus": { "model": "openai/gpt-4o" },
-    "sisyphus": {}
-  }
-}"#,
-        )
-        .expect("write oh-my-opencode.json");
-
-        fs::write(
-            config_dir.join("opencode.json"),
-            r#"{
-  "plugin": ["oh-my-opencode@0.0.1"],
-  "agent": {
-    "prometheus": { "model": "openai/gpt-4o-mini", "foo": "bar" },
-    "sisyphus": {},
-    "custom": { "model": "openai/gpt-4o" }
-  }
-}"#,
-        )
-        .expect("write opencode.json");
-
-        sync_opencode_agent_config(config_dir, Some("openai/gpt-4o-mini"), true, false, false);
-
-        let opencode_json: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(config_dir.join("opencode.json")).expect("read opencode.json"),
-        )
-        .expect("parse opencode.json");
-        let agents = opencode_json
-            .get("agent")
-            .and_then(|v| v.as_object())
-            .expect("agent object");
-
-        assert!(agents.get("prometheus").is_none());
-        assert!(agents.get("sisyphus").is_none());
-        assert!(agents.get("custom").is_some());
-    }
-
-    #[test]
-    fn sync_opencode_agent_config_writes_overrides_when_plugin_disabled() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let config_dir = temp_dir.path();
-
-        fs::write(
-            config_dir.join("oh-my-opencode.json"),
-            r#"{
-  "agents": {
-    "prometheus": { "model": "openai/gpt-4o" },
-    "sisyphus": {}
-  }
-}"#,
-        )
-        .expect("write oh-my-opencode.json");
-
-        sync_opencode_agent_config(config_dir, Some("openai/gpt-4o-mini"), true, false, false);
-
-        let opencode_json: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(config_dir.join("opencode.json")).expect("read opencode.json"),
-        )
-        .expect("parse opencode.json");
-        let agents = opencode_json
-            .get("agent")
-            .and_then(|v| v.as_object())
-            .expect("agent object");
-
-        let prometheus_model = agents
-            .get("prometheus")
-            .and_then(|v| v.get("model"))
-            .and_then(|v| v.as_str())
-            .expect("prometheus model");
-        let sisyphus_model = agents
-            .get("sisyphus")
-            .and_then(|v| v.get("model"))
-            .and_then(|v| v.as_str())
-            .expect("sisyphus model");
-
-        assert_eq!(prometheus_model, "openai/gpt-4o");
-        assert_eq!(sisyphus_model, "openai/gpt-4o-mini");
     }
 
     #[test]
@@ -16367,6 +15265,118 @@ mod tests {
         assert_eq!(extract_model_from_message(&val).as_deref(), Some("glm-5"));
     }
 
+    #[test]
+    fn custom_provider_definition_uses_ai_provider_store_models() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join(".sandboxed-sh");
+        fs::create_dir_all(&store_dir).expect("store dir");
+
+        let mut provider = crate::ai_providers::AIProvider::new(
+            crate::ai_providers::ProviderType::Custom,
+            "Spark".to_string(),
+        );
+        provider.base_url = Some("https://spark-de79.gazella-vector.ts.net/v1".to_string());
+        provider.custom_models = Some(vec![
+            crate::ai_providers::CustomModel {
+                id: "qwen3.5-397b".to_string(),
+                name: Some("Qwen 3.5 397B".to_string()),
+                context_limit: None,
+                output_limit: None,
+            },
+            crate::ai_providers::CustomModel {
+                id: "fast".to_string(),
+                name: Some("Spark Fast".to_string()),
+                context_limit: None,
+                output_limit: None,
+            },
+        ]);
+
+        fs::write(
+            store_dir.join("ai_providers.json"),
+            serde_json::to_string_pretty(&vec![provider]).expect("serialize provider"),
+        )
+        .expect("write provider store");
+
+        let definition = custom_opencode_provider_definition(temp_dir.path(), "spark")
+            .expect("custom provider definition");
+        assert_eq!(definition["npm"], "@ai-sdk/openai-compatible");
+        assert_eq!(
+            definition["options"]["baseURL"],
+            "https://spark-de79.gazella-vector.ts.net/v1"
+        );
+        assert!(definition["models"].get("qwen3.5-397b").is_some());
+        assert!(definition["models"].get("fast").is_some());
+    }
+
+    #[test]
+    fn custom_provider_definition_normalizes_model_provider_id() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store_dir = temp_dir.path().join(".sandboxed-sh");
+        fs::create_dir_all(&store_dir).expect("store dir");
+
+        let mut provider = crate::ai_providers::AIProvider::new(
+            crate::ai_providers::ProviderType::Custom,
+            "Spark-Fast".to_string(),
+        );
+        provider.base_url = Some("https://spark-de79.gazella-vector.ts.net/v1".to_string());
+        provider.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "qwen3.5-397b".to_string(),
+            name: Some("Qwen 3.5 397B".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+
+        fs::write(
+            store_dir.join("ai_providers.json"),
+            serde_json::to_string_pretty(&vec![provider]).expect("serialize provider"),
+        )
+        .expect("write provider store");
+
+        assert!(custom_opencode_provider_definition(temp_dir.path(), "spark_fast").is_some());
+        assert!(custom_opencode_provider_definition(temp_dir.path(), "spark-fast").is_some());
+    }
+
+    #[test]
+    fn ensure_provider_for_model_injects_custom_provider() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_dir = temp_dir.path().join("app");
+        let config_dir = temp_dir.path().join("opencode");
+        fs::create_dir_all(app_dir.join(".sandboxed-sh")).expect("store dir");
+        fs::create_dir_all(&config_dir).expect("config dir");
+
+        let mut provider = crate::ai_providers::AIProvider::new(
+            crate::ai_providers::ProviderType::Custom,
+            "Spark".to_string(),
+        );
+        provider.base_url = Some("https://spark-de79.gazella-vector.ts.net/v1".to_string());
+        provider.custom_models = Some(vec![crate::ai_providers::CustomModel {
+            id: "qwen3.5-397b".to_string(),
+            name: Some("Qwen 3.5 397B".to_string()),
+            context_limit: None,
+            output_limit: None,
+        }]);
+        fs::write(
+            app_dir.join(".sandboxed-sh").join("ai_providers.json"),
+            serde_json::to_string_pretty(&vec![provider]).expect("serialize provider"),
+        )
+        .expect("write provider store");
+
+        ensure_opencode_provider_for_model(&config_dir, &app_dir, "spark/qwen3.5-397b");
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        assert_eq!(
+            opencode_json["provider"]["spark"]["models"]["qwen3.5-397b"]["name"],
+            "Qwen 3.5 397B"
+        );
+        assert_eq!(
+            opencode_json["provider"]["spark"]["options"]["baseURL"],
+            "https://spark-de79.gazella-vector.ts.net/v1"
+        );
+    }
+
     // ── extract_part_text tests ───────────────────────────────────────
 
     #[test]
@@ -16453,7 +15463,11 @@ mod tests {
         let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
             .expect("event should parse");
         assert!(parsed.message_complete);
-        assert_eq!(parsed.usage, Some((1500, 350)));
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(usage.output_tokens, 350);
+        assert_eq!(usage.cache_creation_input_tokens, Some(0));
+        assert_eq!(usage.cache_read_input_tokens, Some(0));
     }
 
     #[test]
@@ -16475,7 +15489,37 @@ mod tests {
         let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
             .expect("event should parse");
         assert!(parsed.message_complete);
-        assert_eq!(parsed.usage, Some((800, 200)));
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 800);
+        assert_eq!(usage.output_tokens, 200);
+    }
+
+    #[test]
+    fn parse_opencode_sse_event_response_completed_extracts_cache_usage() {
+        let mut state = OpencodeSseState::default();
+        let mission_id = Uuid::new_v4();
+        let data = json!({
+            "type": "response.completed",
+            "properties": {
+                "response": {
+                    "usage": {
+                        "input_tokens": 1200,
+                        "output_tokens": 300,
+                        "input_tokens_details": {
+                            "cached_tokens": 500
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
+            .expect("event should parse");
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 700);
+        assert_eq!(usage.output_tokens, 300);
+        assert_eq!(usage.cache_read_input_tokens, Some(500));
     }
 
     #[test]
@@ -16566,50 +15610,35 @@ mod tests {
         assert_eq!(result, "beforeafter");
     }
 
-    // ── extract_thought_line tests ────────────────────────────────────
-
     #[test]
-    fn extract_thought_line_extracts_thought_prefix() {
-        let input = "thought: I need to check the file\nLet me look at it.";
-        let (thought, remaining) = extract_thought_line(input).unwrap();
-        assert_eq!(thought, "I need to check the file");
-        assert_eq!(remaining, "Let me look at it.");
+    fn thinking_overlap_detects_visible_answer_echo() {
+        let answer =
+            "I checked the mission stream and the dashboard is rendering answer drafts inline.";
+        assert!(thinking_overlaps_visible_answer(answer, answer));
     }
 
     #[test]
-    fn extract_thought_line_extracts_thinking_prefix() {
-        let input = "Thinking: Analyzing the problem\nHere is my answer.";
-        let (thought, remaining) = extract_thought_line(input).unwrap();
-        assert_eq!(thought, "Analyzing the problem");
-        assert_eq!(remaining, "Here is my answer.");
+    fn thinking_overlap_detects_cumulative_visible_answer_echo() {
+        let thinking =
+            "I checked the mission stream and the dashboard is rendering answer drafts inline.";
+        let answer = format!("{thinking} The final event still lands as an assistant message.");
+        assert!(thinking_overlaps_visible_answer(thinking, &answer));
     }
 
     #[test]
-    fn extract_thought_line_extracts_thoughts_prefix() {
-        let input = "thoughts: multiple ideas\nLine 2";
-        let (thought, _) = extract_thought_line(input).unwrap();
-        assert_eq!(thought, "multiple ideas");
+    fn thinking_overlap_allows_distinct_reasoning() {
+        let thinking =
+            "Need to inspect whether the provider sent a typed reasoning item before final output.";
+        let answer = "The stream now separates typed reasoning from visible assistant text.";
+        assert!(!thinking_overlaps_visible_answer(thinking, answer));
     }
 
     #[test]
-    fn extract_thought_line_returns_none_without_thought() {
-        let input = "Just regular text\nMore text";
-        assert!(extract_thought_line(input).is_none());
-    }
-
-    #[test]
-    fn extract_thought_line_returns_none_for_empty_thought() {
-        let input = "thought: \nsome text after";
-        assert!(extract_thought_line(input).is_none());
-    }
-
-    #[test]
-    fn extract_thought_line_only_first_thought_line_extracted() {
-        let input = "thought: first\nthought: second\nregular text";
-        let (thought, remaining) = extract_thought_line(input).unwrap();
-        assert_eq!(thought, "first");
-        assert!(remaining.contains("thought: second"));
-        assert!(remaining.contains("regular text"));
+    fn thinking_overlap_allows_short_shared_prefixes() {
+        assert!(!thinking_overlaps_visible_answer(
+            "I checked",
+            "I checked the logs."
+        ));
     }
 
     // ── strip_ansi_codes tests ────────────────────────────────────────

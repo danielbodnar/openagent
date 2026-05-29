@@ -14,12 +14,14 @@ const nextConfig: NextConfig = {
   // Barrel-file aware tree-shaking. Without this Next has to pull the whole
   // package for a single named import in a handful of files — even though
   // the runtime doesn't use it, the initial JS bundle carries it. `lucide-
-  // react` is 45 MB on disk; `react-syntax-highlighter` is 9 MB and ships
-  // the full Prism language set by default. Listing them here tells Next to
-  // rewrite named imports into direct deep imports at compile time.
+  // react` and `@phosphor-icons/react` are large icon barrels; `react-
+  // syntax-highlighter` is 9 MB and ships the full Prism language set by
+  // default. Listing them here tells Next to rewrite named imports into direct
+  // deep imports at compile time.
   experimental: {
     optimizePackageImports: [
       "lucide-react",
+      "@phosphor-icons/react",
       "react-syntax-highlighter",
       "framer-motion",
     ],

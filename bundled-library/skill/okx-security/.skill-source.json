@@ -1,6 +1,0 @@
-{
-  "type": "SkillsRegistry",
-  "identifier": "okx/onchainos-skills",
-  "skill_name": "okx-security",
-  "version": "read-only-sandboxed"
-}

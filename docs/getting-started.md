@@ -92,7 +92,7 @@ When you first access the sandboxed.sh dashboard, you'll see the global monitor 
 ![Initial Dashboard](images/getting-started/01-dashboard-initial.webp)
 
 The dashboard shows:
-- **Navigation sidebar** - Access different sections (Overview, Mission, Workspaces, Library, Settings)
+- **Navigation sidebar** - Access different sections (Overview, Mission, Workspaces, Assistant, Library, Settings)
 - **Global Monitor** - Real-time view of running missions
 - **Recent Missions** - History of completed tasks
 - **Agent Status** - Current state (Ready, Busy, etc.)
@@ -126,7 +126,6 @@ The System page shows:
   - OpenCode (with update notifications)
   - Claude Code (with update notifications)
   - Codex where installed
-  - oh-my-opencode plugin
 
 ### 2.3 Change Backend URL
 
@@ -235,23 +234,14 @@ The config editor shows:
 
 For OpenCode, you'll typically edit:
 
-1. **settings.json** - Main configuration:
+1. **opencode.json** - Main configuration:
 ```json
 {
-  "agents": {
-    "Sisyphus": {
+  "agent": {
+    "reviewer": {
+      "description": "Focused code review",
+      "mode": "subagent",
       "model": "anthropic/claude-sonnet-4-20250514"
-    }
-  }
-}
-```
-
-2. **oh-my-opencode.json** - Plugin configuration:
-```json
-{
-  "providers": {
-    "anthropic": {
-      "apiKey": "<your-api-key>"
     }
   }
 }
@@ -286,9 +276,9 @@ Configure your mission:
    - **Isolated containers** - Sandboxed environments for projects
 
 2. **Agent** - Choose the AI model:
-   - **Smart Mode** - Balanced performance (recommended)
-   - **Rush Mode** - Faster responses
-   - **Custom agents** - Your configured agents (Sisyphus, Prometheus, etc.)
+   - **OpenCode build** - Default implementation agent
+   - **OpenCode plan** - Read-only planning agent
+   - **Custom agents** - Native agents configured in `.opencode/agents/`
 
 3. **Model Override (optional)** - Force a specific model for this mission:
    - **Claude Code**: use a raw model ID (e.g., `claude-opus-4-7`)

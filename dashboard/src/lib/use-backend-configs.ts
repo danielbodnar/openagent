@@ -42,11 +42,11 @@ export function useBackendConfigs(ids: readonly string[]): BackendConfigsHandle 
  * True when the backend has not been explicitly disabled, its CLI is reachable,
  * and (when reported) its authentication is configured.
  *
- * Returns true when the config is still loading (optimistic) so the UI doesn't
- * flicker the backend out on first paint.
+ * Missing config means loading/unknown, so it is not available yet. This keeps
+ * disabled backends from flashing into agent pickers before their config loads.
  */
 export function isBackendAvailable(config: BackendConfig | undefined): boolean {
-  if (!config) return true;
+  if (!config) return false;
   if (config.enabled === false) return false;
   if (config.cli_available === false) return false;
   if (config.auth_configured === false) return false;

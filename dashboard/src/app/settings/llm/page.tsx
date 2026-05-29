@@ -181,7 +181,7 @@ export default function LLMSettingsPage() {
           <div
             className={cn(
               'rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 space-y-4 transition-opacity',
-              !config.enabled && 'opacity-40 pointer-events-none'
+              !config.enabled && 'opacity-75 dark:opacity-40 pointer-events-none'
             )}
           >
             <div className="flex items-center gap-3 mb-4">

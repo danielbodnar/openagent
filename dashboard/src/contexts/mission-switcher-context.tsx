@@ -16,6 +16,7 @@ import {
   type Mission,
   type RunningMissionInfo,
 } from '@/lib/api';
+import { stableJsonCompare } from '@/lib/swr-config';
 
 interface MissionSwitcherContextValue {
   open: () => void;
@@ -41,23 +42,32 @@ export function MissionSwitcherProvider({ children }: { children: React.ReactNod
   // Control page has its own mission switcher with more context (currentMissionId, viewingMissionId)
   const isControlPage = pathname === '/control';
 
-  // SWR: fetch missions
+  // The data here only feeds the Cmd+K MissionSwitcher dialog (rendered below
+  // when `!isControlPage`) and the follow-up handler. Polling it constantly
+  // when the dialog is closed is pure waste: every page that mounts this
+  // provider was paying for two extra API requests every 3-5s. We gate the
+  // SWR keys on `isOpen` so the hooks stay inert until the user actually
+  // presses Cmd+K; SWR refetches once on key flip so the dialog opens with
+  // fresh data, then keeps polling while open.
+  const shouldPoll = isOpen && !isControlPage;
+
   const { data: missions = [], mutate: mutateMissions } = useSWR<Mission[]>(
-    'global-missions',
+    shouldPoll ? 'global-missions' : null,
     listMissions,
     {
       refreshInterval: 5000,
       revalidateOnFocus: false,
+      compare: stableJsonCompare,
     }
   );
 
-  // SWR: fetch running missions
   const { data: runningMissions = [], mutate: mutateRunningMissions } = useSWR<RunningMissionInfo[]>(
-    'global-running-missions',
+    shouldPoll ? 'global-running-missions' : null,
     getRunningMissions,
     {
       refreshInterval: 3000,
       revalidateOnFocus: false,
+      compare: stableJsonCompare,
     }
   );
 

@@ -12,6 +12,7 @@ import {
   MessageSquarePlus,
   ChevronRight,
   ChevronDown,
+  Pin,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { searchMissions, type Mission, type RunningMissionInfo } from '@/lib/api';
@@ -47,6 +48,25 @@ type MissionSwitcherItem = {
 type MissionSwitcherRow =
   | { kind: 'section'; id: string; label: string }
   | { kind: 'item'; id: string; item: MissionSwitcherItem; itemIndex: number };
+
+const PINNED_MISSIONS_STORAGE_KEY = 'mission-switcher-pinned-missions-v1';
+
+function readPinnedMissionIds(): string[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(PINNED_MISSIONS_STORAGE_KEY) ?? '[]');
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePinnedMissionIds(ids: string[]) {
+  if (typeof window === 'undefined') return;
+  window.localStorage.setItem(PINNED_MISSIONS_STORAGE_KEY, JSON.stringify(ids));
+}
 
 function getWorkspaceLabel(
   mission: Mission,
@@ -634,6 +654,7 @@ export function MissionSwitcher({
     null
   );
   const [serverSearchLoading, setServerSearchLoading] = useState(false);
+  const [pinnedMissionIds, setPinnedMissionIds] = useState<string[]>(() => readPinnedMissionIds());
   // Boss missions whose grouped worker rows are currently expanded. Default
   // empty (everything collapsed) so a boss with many workers doesn't take
   // over the list. The chevron at the left of each boss row toggles this.
@@ -644,6 +665,17 @@ export function MissionSwitcher({
     () => normalizeMetadataText(searchQuery),
     [searchQuery]
   );
+  const pinnedMissionIdSet = useMemo(() => new Set(pinnedMissionIds), [pinnedMissionIds]);
+
+  const togglePinnedMission = useCallback((missionId: string) => {
+    setPinnedMissionIds((prev) => {
+      const next = prev.includes(missionId)
+        ? prev.filter((id) => id !== missionId)
+        : [missionId, ...prev];
+      writePinnedMissionIds(next);
+      return next;
+    });
+  }, []);
   const missionById = useMemo(() => {
     const map = new Map<string, Mission>();
     for (const mission of missions) {
@@ -701,19 +733,24 @@ export function MissionSwitcher({
     const items: MissionSwitcherItem[] = [];
 
     const addedIds = new Set<string>();
+    const runningByMissionId = new Map(runningMissions.map((rm) => [rm.mission_id, rm]));
 
-    // Helper to add a running mission + its workers
-    const addRunningWithWorkers = (rm: RunningMissionInfo) => {
-      if (addedIds.has(rm.mission_id)) return;
-      addedIds.add(rm.mission_id);
-      const mission = missionById.get(rm.mission_id);
-      const workerIds = bossMissionWorkerIds.get(rm.mission_id);
+    // Helper to add a mission + its workers, regardless of whether the boss is running.
+    const addMissionWithWorkers = (
+      missionId: string,
+      fallbackType: MissionSwitcherItem['type'],
+      runningInfo?: RunningMissionInfo
+    ) => {
+      if (addedIds.has(missionId)) return;
+      addedIds.add(missionId);
+      const mission = missionById.get(missionId);
+      const workerIds = bossMissionWorkerIds.get(missionId);
       const isBoss = Boolean(workerIds && workerIds.size > 0);
       items.push({
-        type: 'running',
+        type: runningInfo ? 'running' : fallbackType,
         mission,
-        runningInfo: rm,
-        id: rm.mission_id,
+        runningInfo,
+        id: missionId,
         isBoss,
       });
       // Add workers grouped under this boss
@@ -722,13 +759,13 @@ export function MissionSwitcher({
           if (addedIds.has(workerId)) continue;
           addedIds.add(workerId);
           const workerMission = missionById.get(workerId);
-          const workerRunningInfo = runningMissions.find((r) => r.mission_id === workerId);
+          const workerRunningInfo = runningByMissionId.get(workerId);
           items.push({
             type: workerRunningInfo ? 'running' : 'recent',
             mission: workerMission,
             runningInfo: workerRunningInfo,
             id: workerId,
-            isWorkerOf: rm.mission_id,
+            isWorkerOf: missionId,
           });
         }
       }
@@ -738,14 +775,11 @@ export function MissionSwitcher({
     if (currentMissionId) {
       const currentMission = missionById.get(currentMissionId);
       if (currentMission && !runningMissionIds.has(currentMissionId)) {
-        addedIds.add(currentMissionId);
-        const workerIds = bossMissionWorkerIds.get(currentMissionId);
-        items.push({
-          type: 'current',
-          mission: currentMission,
-          id: currentMissionId,
-          isBoss: Boolean(workerIds && workerIds.size > 0),
-        });
+        const currentBossId = currentMission.parent_mission_id;
+        addMissionWithWorkers(
+          currentBossId && missionById.has(currentBossId) ? currentBossId : currentMissionId,
+          'current'
+        );
       }
     }
 
@@ -760,14 +794,15 @@ export function MissionSwitcher({
     });
 
     // Add bosses first (with their workers grouped)
-    for (const rm of bosses) addRunningWithWorkers(rm);
+    for (const rm of bosses) addMissionWithWorkers(rm.mission_id, 'running', rm);
     // Add standalone running missions
-    for (const rm of standalone) addRunningWithWorkers(rm);
-    // Add orphan worker running missions (boss not running)
+    for (const rm of standalone) addMissionWithWorkers(rm.mission_id, 'running', rm);
+    // Add orphan worker running missions (boss not present in the mission list)
     for (const rm of workerOnlyRunning) {
       if (addedIds.has(rm.mission_id)) continue;
-      addedIds.add(rm.mission_id);
       const mission = missionById.get(rm.mission_id);
+      if (mission?.parent_mission_id && missionById.has(mission.parent_mission_id)) continue;
+      addedIds.add(rm.mission_id);
       items.push({
         type: 'running',
         mission,
@@ -780,7 +815,8 @@ export function MissionSwitcher({
     // Recent missions
     recentMissions.forEach((m) => {
       if (addedIds.has(m.id)) return;
-      items.push({ type: 'recent', mission: m, id: m.id });
+      if (m.parent_mission_id && missionById.has(m.parent_mission_id)) return;
+      addMissionWithWorkers(m.id, 'recent', runningByMissionId.get(m.id));
     });
 
     return items;
@@ -891,39 +927,65 @@ export function MissionSwitcher({
     return scored.map(({ item }) => item);
   }, [visibleItems, normalizedSearchQuery, workspaceNameById, serverScoreByMissionId]);
 
+  const orderedItems = useMemo(() => {
+    if (pinnedMissionIdSet.size === 0) return filteredItems;
+    const pinned: MissionSwitcherItem[] = [];
+    const unpinned: MissionSwitcherItem[] = [];
+    for (const item of filteredItems) {
+      if (pinnedMissionIdSet.has(item.id)) {
+        pinned.push(item);
+      } else {
+        unpinned.push(item);
+      }
+    }
+    return [...pinned, ...unpinned];
+  }, [filteredItems, pinnedMissionIdSet]);
+
   const renderedRows = useMemo<MissionSwitcherRow[]>(() => {
     const rows: MissionSwitcherRow[] = [];
     let previousType: MissionSwitcherItem['type'] | null = null;
+    let previousPinned = false;
     const hasCurrent = Boolean(currentMissionId && !runningMissionIds.has(currentMissionId));
 
-    filteredItems.forEach((item, itemIndex) => {
+    orderedItems.forEach((item, itemIndex) => {
       const isWorkerItem = Boolean(item.isWorkerOf);
+      const isPinned = pinnedMissionIdSet.has(item.id);
       if (!normalizedSearchQuery) {
-        if (hasCurrent && item.type === 'current' && previousType !== 'current') {
+        if (isPinned && !previousPinned) {
+          rows.push({ kind: 'section', id: 'section-pinned', label: 'Pinned' });
+        }
+        if (!isPinned && hasCurrent && item.type === 'current' && previousType !== 'current') {
           rows.push({ kind: 'section', id: 'section-current', label: 'Current' });
         }
         if (
+          !isPinned &&
           item.type === 'running' &&
           !isWorkerItem &&
           (previousType !== 'running' || previousType === null)
         ) {
           rows.push({ kind: 'section', id: 'section-running', label: 'Running' });
         }
-        if (item.type === 'recent' && !isWorkerItem && previousType !== 'recent') {
+        if (!isPinned && item.type === 'recent' && !isWorkerItem && previousType !== 'recent') {
           rows.push({ kind: 'section', id: 'section-recent', label: 'Recent' });
         }
       }
       rows.push({ kind: 'item', id: item.id, item, itemIndex });
-      previousType = item.type;
+      previousType = isPinned ? previousType : item.type;
+      previousPinned = isPinned;
     });
 
     return rows;
-  }, [currentMissionId, filteredItems, normalizedSearchQuery, runningMissionIds]);
+  }, [currentMissionId, orderedItems, normalizedSearchQuery, pinnedMissionIdSet, runningMissionIds]);
 
   const rowVirtualizer = useVirtualizer({
     count: renderedRows.length,
     getScrollElement: () => listRef.current,
-    estimateSize: (index) => (renderedRows[index]?.kind === 'section' ? 34 : 72),
+    estimateSize: (index) => {
+      const row = renderedRows[index];
+      if (row?.kind === 'section') return 34;
+      if (row?.kind === 'item' && row.item.isWorkerOf) return 36;
+      return 72;
+    },
     overscan: 8,
   });
 
@@ -998,24 +1060,24 @@ export function MissionSwitcher({
   // happens to be at the old index.
   const selectedItemIdRef = useRef<string | null>(null);
   useEffect(() => {
-    selectedItemIdRef.current = filteredItems[selectedIndex]?.id ?? null;
-  }, [filteredItems, selectedIndex]);
+    selectedItemIdRef.current = orderedItems[selectedIndex]?.id ?? null;
+  }, [orderedItems, selectedIndex]);
 
   useEffect(() => {
-    if (filteredItems.length <= 0) {
+    if (orderedItems.length <= 0) {
       setSelectedIndex(0);
       return;
     }
     const targetId = selectedItemIdRef.current;
     if (targetId) {
-      const idx = filteredItems.findIndex((item) => item.id === targetId);
+      const idx = orderedItems.findIndex((item) => item.id === targetId);
       if (idx >= 0) {
         setSelectedIndex(idx);
         return;
       }
     }
-    setSelectedIndex((prev) => Math.min(prev, filteredItems.length - 1));
-  }, [filteredItems]);
+    setSelectedIndex((prev) => Math.min(prev, orderedItems.length - 1));
+  }, [orderedItems]);
 
   // Handle keyboard navigation
   useEffect(() => {
@@ -1041,7 +1103,7 @@ export function MissionSwitcher({
         case 'ArrowDown':
           e.preventDefault();
           setSelectedIndex((prev) =>
-            Math.min(prev + 1, filteredItems.length - 1)
+            Math.min(prev + 1, orderedItems.length - 1)
           );
           break;
         case 'ArrowUp':
@@ -1052,7 +1114,7 @@ export function MissionSwitcher({
           // Skip tree expansion when the user is editing search text — the
           // arrow key needs to move the input cursor instead.
           if (searchQuery) return;
-          const selected = filteredItems[selectedIndex];
+          const selected = orderedItems[selectedIndex];
           if (!selected) return;
           if (selected.isBoss && bossesWithGroupedWorkers.has(selected.id) && !expandedBossIds.has(selected.id)) {
             e.preventDefault();
@@ -1062,7 +1124,7 @@ export function MissionSwitcher({
         }
         case 'ArrowLeft': {
           if (searchQuery) return;
-          const selected = filteredItems[selectedIndex];
+          const selected = orderedItems[selectedIndex];
           if (!selected) return;
           if (selected.isBoss && expandedBossIds.has(selected.id)) {
             e.preventDefault();
@@ -1084,8 +1146,8 @@ export function MissionSwitcher({
         }
         case 'Enter':
           e.preventDefault();
-          if (filteredItems[selectedIndex]) {
-            handleSelect(filteredItems[selectedIndex].id);
+          if (orderedItems[selectedIndex]) {
+            handleSelect(orderedItems[selectedIndex].id);
           }
           break;
       }
@@ -1096,7 +1158,7 @@ export function MissionSwitcher({
   }, [
     open,
     onClose,
-    filteredItems,
+    orderedItems,
     selectedIndex,
     handleSelect,
     loadingMissionId,
@@ -1179,7 +1241,7 @@ export function MissionSwitcher({
 
         {/* Mission list */}
         <div ref={listRef} className="max-h-[400px] overflow-y-auto py-2">
-          {filteredItems.length === 0 ? (
+          {orderedItems.length === 0 ? (
             <div className="px-4 py-8 text-center text-sm text-white/40">
               No missions found
             </div>
@@ -1212,6 +1274,7 @@ export function MissionSwitcher({
                 const isSelected = index === selectedIndex;
                 const isViewing = item.id === viewingMissionId;
                 const isRunning = item.type === 'running' || Boolean(item.runningInfo);
+                const isPinned = pinnedMissionIdSet.has(item.id);
                 const runningInfo = item.runningInfo;
                 const missionQuickActions = mission
                   ? getMissionQuickActions(mission, isRunning)
@@ -1242,6 +1305,72 @@ export function MissionSwitcher({
                     className="absolute left-0 top-0 w-full"
                     style={{ transform: `translateY(${virtualRow.start}px)` }}
                   >
+                    {isWorkerItem ? (
+                      <a
+                        href={`/control?mission=${item.id}`}
+                        data-selected={isSelected}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          handleSelect(item.id);
+                        }}
+                        className={cn(
+                          'mission-switcher-row group ml-8 mr-2 flex items-center gap-1.5 rounded px-2 py-1.5 text-[10px] cursor-pointer transition-colors no-underline border-l border-white/[0.06]',
+                          isSelected
+                            ? 'mission-switcher-row-selected bg-indigo-500/15 text-white'
+                            : 'text-white/50 hover:bg-white/[0.04] hover:text-white/75',
+                          isSeverlyStalled && 'bg-red-500/10',
+                          isStalled && !isSeverlyStalled && 'bg-amber-500/10',
+                          isLoading && 'bg-indigo-500/20 pointer-events-none',
+                          loadingMissionId && !isLoading && 'opacity-50 pointer-events-none'
+                        )}
+                        title={
+                          mission
+                            ? getMissionDisplayName(mission)
+                            : getMissionShortName(item.id)
+                        }
+                      >
+                        {isLoading ? (
+                          <Loader2 className="h-3 w-3 shrink-0 animate-spin text-indigo-400" />
+                        ) : (
+                          <div
+                            className={cn(
+                              'h-2 w-2 rounded-full shrink-0',
+                              mission
+                                ? getMissionDotColor(mission.status, isRunning)
+                                : 'bg-gray-400',
+                              isRunning &&
+                                runningInfo?.state === 'running' &&
+                                'animate-pulse'
+                            )}
+                          />
+                        )}
+                        <span className="min-w-0 flex-1 truncate">
+                          {mission
+                            ? getMissionDisplayName(mission)
+                            : getMissionShortName(item.id)}
+                        </span>
+                        {isStalled && (
+                          <span className="text-[10px] text-amber-400 tabular-nums shrink-0">
+                            {Math.floor(stallInfo?.seconds_since_activity ?? 0)}s
+                          </span>
+                        )}
+                        <span className="rounded bg-cyan-500/10 border border-cyan-500/20 px-1 py-0.5 text-[8px] font-medium text-cyan-400 shrink-0">
+                          W
+                        </span>
+                        <span className="text-[9px] text-white/30 shrink-0">
+                          {isLoading
+                            ? 'Loading...'
+                            : isRunning
+                              ? runningInfo?.state || 'running'
+                              : mission
+                                ? getMissionStatusLabel(mission)
+                                : ''}
+                        </span>
+                        {isViewing && !isLoading && (
+                          <Check className="h-3 w-3 text-indigo-400 shrink-0" />
+                        )}
+                      </a>
+                    ) : (
                     <a
                       href={`/control?mission=${item.id}`}
                       data-selected={isSelected}
@@ -1250,10 +1379,10 @@ export function MissionSwitcher({
                         handleSelect(item.id);
                       }}
                       className={cn(
-                        'group flex items-center gap-3 py-2 mx-2 rounded-lg cursor-pointer transition-colors no-underline',
+                        'mission-switcher-row group flex items-center gap-3 py-2 mx-2 rounded-lg cursor-pointer transition-colors no-underline',
                         isWorkerItem ? 'px-3 ml-6 border-l-2 border-white/[0.06]' : 'px-3',
                         isSelected
-                          ? 'bg-indigo-500/15 text-white'
+                          ? 'mission-switcher-row-selected bg-indigo-500/15 text-white'
                           : 'text-white/70 hover:bg-white/[0.04]',
                         isSeverlyStalled && 'bg-red-500/10',
                         isStalled && !isSeverlyStalled && 'bg-amber-500/10',
@@ -1355,12 +1484,12 @@ export function MissionSwitcher({
                         {mission && (
                           <>
                             {cardTitle && (
-                              <p className="text-xs text-white/55 truncate mt-0.5">
+                              <p className="mission-switcher-description text-xs text-white/55 truncate mt-0.5">
                                 {cardTitle}
                               </p>
                             )}
                             {cardDescription && (
-                              <p className="text-[11px] text-white/40 truncate">
+                              <p className="mission-switcher-description mission-switcher-description-muted text-[11px] text-white/40 truncate">
                                 {cardDescription}
                               </p>
                             )}
@@ -1393,6 +1522,26 @@ export function MissionSwitcher({
                           ? `${getMissionStatusLabel(mission)} · ${getMissionBackendLabel(mission)}`
                           : ''}
                       </span>
+
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          togglePinnedMission(item.id);
+                        }}
+                        className={cn(
+                          "p-1 rounded transition-all shrink-0 hover:bg-white/[0.08]",
+                          isPinned
+                            ? "text-amber-300 opacity-100"
+                            : "text-white/25 opacity-0 group-hover:opacity-100 hover:text-white/60"
+                        )}
+                        title={isPinned ? "Unpin mission" : "Pin mission"}
+                        aria-label={isPinned ? "Unpin mission" : "Pin mission"}
+                        aria-pressed={isPinned}
+                      >
+                        <Pin className={cn("h-3.5 w-3.5", isPinned && "fill-current")} />
+                      </button>
 
                       {/* Viewing indicator */}
                       {isViewing && !isLoading && (
@@ -1454,6 +1603,7 @@ export function MissionSwitcher({
                           </AsyncButton>
                         ))}
                     </a>
+                    )}
                   </div>
                 );
               })}

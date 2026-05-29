@@ -49,6 +49,190 @@ test.describe('Overview Page', () => {
     await expect(page.getByText('Finished').first()).toBeVisible();
   });
 
+  test('groups worker missions under boss cards in the kanban', async ({ page }) => {
+    const now = new Date().toISOString();
+    const bossMission = {
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      title: 'Boss mission',
+      short_description: 'orchestrator-boss coordination',
+      status: 'completed',
+      workspace_name: 'ops',
+      history: [],
+      created_at: now,
+      updated_at: now,
+    };
+    const workerMission = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      parent_mission_id: bossMission.id,
+      title: 'Worker mission',
+      status: 'active',
+      workspace_name: 'ops',
+      history: [],
+      created_at: now,
+      updated_at: now,
+    };
+
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (route.request().method() === 'OPTIONS') {
+        await route.fulfill({
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+          },
+        });
+        return;
+      }
+      const json = (body: unknown) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify(body),
+        });
+
+      if (path === '/api/stats') {
+        await json({
+          total_tasks: 2,
+          active_tasks: 0,
+          completed_tasks: 1,
+          failed_tasks: 0,
+          total_cost_cents: 0,
+          actual_cost_cents: 0,
+          estimated_cost_cents: 0,
+          unknown_cost_cents: 0,
+          success_rate: 1,
+        });
+        return;
+      }
+      if (path === '/api/workspaces') {
+        await json([]);
+        return;
+      }
+      if (path === '/api/control/missions') {
+        await json([bossMission, workerMission]);
+        return;
+      }
+      if (path === '/api/control/running') {
+        await json([{ mission_id: workerMission.id, state: 'running' }]);
+        return;
+      }
+      if (path === '/api/control/automations') {
+        await json([]);
+        return;
+      }
+      if (path === '/api/tasks') {
+        await json([]);
+        return;
+      }
+      await json([]);
+    });
+
+    await page.goto('/');
+
+    await expect(page.getByText('Boss mission')).toBeVisible();
+    await expect(page.getByText('1 worker')).toBeVisible();
+    await expect(page.getByText('Worker mission')).toHaveCount(0);
+
+    await page.getByRole('button', { name: 'Expand workers' }).click();
+    await expect(page.getByText('Worker mission')).toBeVisible();
+  });
+
+  test('removes grouped workers from kanban after deleting their boss mission', async ({ page }) => {
+    const now = new Date().toISOString();
+    const bossMission = {
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      title: 'Boss mission',
+      short_description: 'orchestrator-boss coordination',
+      status: 'completed',
+      workspace_name: 'ops',
+      history: [],
+      created_at: now,
+      updated_at: now,
+    };
+    const workerMission = {
+      id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      parent_mission_id: bossMission.id,
+      title: 'Worker mission',
+      status: 'completed',
+      workspace_name: 'ops',
+      history: [],
+      created_at: now,
+      updated_at: now,
+    };
+    let missions = [bossMission, workerMission];
+
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (route.request().method() === 'OPTIONS') {
+        await route.fulfill({
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+          },
+        });
+        return;
+      }
+      const json = (body: unknown) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          headers: { 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify(body),
+        });
+
+      if (path === '/api/stats') {
+        await json({
+          total_tasks: missions.length,
+          active_tasks: 0,
+          completed_tasks: missions.length,
+          failed_tasks: 0,
+          total_cost_cents: 0,
+          actual_cost_cents: 0,
+          estimated_cost_cents: 0,
+          unknown_cost_cents: 0,
+          success_rate: 1,
+        });
+        return;
+      }
+      if (path === '/api/workspaces') {
+        await json([]);
+        return;
+      }
+      if (path === '/api/control/missions') {
+        await json(missions);
+        return;
+      }
+      if (path === `/api/control/missions/${bossMission.id}` && route.request().method() === 'DELETE') {
+        missions = [];
+        await json({
+          ok: true,
+          deleted: bossMission.id,
+          deleted_ids: [bossMission.id, workerMission.id],
+          deleted_count: 2,
+        });
+        return;
+      }
+      if (path === '/api/control/running' || path === '/api/control/automations' || path === '/api/tasks') {
+        await json([]);
+        return;
+      }
+      await json([]);
+    });
+
+    await page.goto('/');
+
+    await expect(page.getByText('Boss mission')).toBeVisible();
+    await expect(page.getByText('1 worker')).toBeVisible();
+    await page.getByTitle('Delete').click();
+    await expect(page.getByText('Boss mission')).toHaveCount(0);
+    await expect(page.getByText('Worker mission')).toHaveCount(0);
+  });
+
   test('should show recent tasks sidebar', async ({ page }) => {
     await page.goto('/');
 

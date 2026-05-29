@@ -1,5 +1,8 @@
 import type { Mission, SharedFile, StoredEvent } from "@/lib/api";
-import { isStreamContinuation } from "@/lib/stream-continuation";
+import {
+  isStreamContinuation,
+  mergeStreamFragment,
+} from "@/lib/stream-continuation";
 
 export type CostSource = "actual" | "estimated" | "unknown";
 
@@ -132,6 +135,24 @@ export function parseCostMetadata(
   };
 }
 
+function normalizeStreamComparisonText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function streamDuplicatesAssistant(stream: string, assistant: string): boolean {
+  const streamText = normalizeStreamComparisonText(stream);
+  const assistantText = normalizeStreamComparisonText(assistant);
+  if (!streamText || !assistantText) return false;
+  if (streamText === assistantText) return true;
+  const minOverlapLen = 80;
+  return (
+    (streamText.length >= minOverlapLen &&
+      assistantText.startsWith(streamText)) ||
+    (assistantText.length >= minOverlapLen &&
+      streamText.startsWith(assistantText))
+  );
+}
+
 export function eventsToItemsImpl(
   events: StoredEvent[],
   mission?: Mission | null,
@@ -146,6 +167,7 @@ export function eventsToItemsImpl(
     timestamp: number;
   } | null = null;
   let lastAssistantTimestamp = 0;
+  let lastAssistantContent = "";
   const missionActive = mission?.status === "active";
   const isGoalMode = mission?.goal_mode === true;
 
@@ -253,15 +275,19 @@ export function eventsToItemsImpl(
           resumable,
         });
         lastAssistantTimestamp = timestamp;
+        lastAssistantContent = event.content;
         break;
       }
 
       case "text_delta": {
         const content = event.content || "";
         if (content.trim().length === 0) break;
+        const mergedContent: string = lastTextDelta
+          ? mergeStreamFragment(lastTextDelta.content, content)
+          : content;
         lastTextDelta = {
           id: event.event_id ?? `text-delta-${event.id}`,
-          content,
+          content: mergedContent,
           timestamp,
         };
         break;
@@ -458,18 +484,25 @@ export function eventsToItemsImpl(
     finalizePendingThinking(Date.now());
   }
 
-  if (lastTextDelta && lastTextDelta.timestamp > lastAssistantTimestamp) {
+  if (
+    lastTextDelta &&
+    !streamDuplicatesAssistant(lastTextDelta.content, lastAssistantContent)
+  ) {
     const staleThresholdMs = 5 * 60 * 1000;
     const isStale =
       missionActive && Date.now() - lastTextDelta.timestamp > staleThresholdMs;
-    const isDone = !missionActive || isStale;
+    const assistantArrivedAfterStream =
+      lastAssistantTimestamp >= lastTextDelta.timestamp;
+    const isDone = assistantArrivedAfterStream || !missionActive || isStale;
     items.push({
       kind: "stream",
       id: lastTextDelta.id,
       content: lastTextDelta.content,
       done: isDone,
       startTime: lastTextDelta.timestamp,
-      endTime: isDone ? lastTextDelta.timestamp : undefined,
+      endTime: isDone
+        ? Math.max(lastTextDelta.timestamp, lastAssistantTimestamp)
+        : undefined,
     });
   }
 

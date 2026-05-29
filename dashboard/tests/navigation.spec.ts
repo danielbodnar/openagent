@@ -11,10 +11,6 @@ test.describe('Navigation', () => {
     await page.goto('/control');
     await expect(page).toHaveURL(/\/control/);
 
-    await page.goto('/agents');
-    await expect(page).toHaveURL(/\/agents/);
-    await expect(page.locator('button[title="New Agent"]')).toBeVisible();
-
     await page.goto('/workspaces');
     await expect(page).toHaveURL(/\/workspaces/);
     await expect(page.getByRole('heading', { name: 'Workspaces' })).toBeVisible();
@@ -22,8 +18,12 @@ test.describe('Navigation', () => {
     await page.goto('/console');
     await expect(page).toHaveURL(/\/console/);
 
+    await page.goto('/assistant');
+    await expect(page).toHaveURL(/\/assistant/);
+    await expect(page.getByRole('heading', { name: 'Assistant' })).toBeVisible();
+
     await page.goto('/settings');
-    await expect(page).toHaveURL(/\/settings/);
+    await expect(page).toHaveURL(/\/settings\/backends/);
   });
 
   test('should navigate via sidebar links', async ({ page }) => {
@@ -34,27 +34,25 @@ test.describe('Navigation', () => {
     await sidebar.getByRole('link', { name: 'Mission', exact: true }).click();
     await expect(page).toHaveURL(/\/control/);
 
-    // Navigate to Agents via sidebar
-    await sidebar.getByRole('button', { name: /Config/i }).click();
-    await sidebar.getByRole('link', { name: /Agents/i }).click();
-    await expect(page).toHaveURL(/\/agents/);
+    // Navigate to Assistant via sidebar
+    await sidebar.getByRole('link', { name: 'Assistant', exact: true }).click();
+    await expect(page).toHaveURL(/\/assistant/);
 
     // Navigate to Overview via sidebar
     await sidebar.getByRole('link', { name: /Overview/i }).click();
     await expect(page).toHaveURL('/');
   });
 
-  test('should expand Config submenu', async ({ page }) => {
+  test('should expand Library submenu', async ({ page }) => {
     await page.goto('/');
 
-    // Click Config button to expand (it's a button, not a link)
-    await page.getByRole('button', { name: /Config/i }).click();
+    // Click Library button to expand (it's a button, not a link)
+    await page.getByRole('button', { name: /Library/i }).click();
 
     // Should show submenu items
-    await expect(page.getByRole('link', { name: /Agents/i })).toBeVisible();
     await expect(page.getByRole('link', { name: /Skills/i })).toBeVisible();
     await expect(page.getByRole('link', { name: /Commands/i })).toBeVisible();
-    await expect(page.getByRole('link', { name: /Rules/i })).toBeVisible();
+    await expect(page.getByRole('link', { name: /Profiles/i })).toBeVisible();
 
     // Click on Skills to navigate
     await page.getByRole('link', { name: /Skills/i }).click();
@@ -73,7 +71,7 @@ test.describe('Navigation', () => {
   });
 
   test('sidebar should be visible on all pages', async ({ page }) => {
-    const pages = ['/', '/agents', '/workspaces', '/control', '/settings'];
+    const pages = ['/', '/assistant', '/workspaces', '/control', '/settings'];
 
     for (const pagePath of pages) {
       await page.goto(pagePath);
@@ -81,7 +79,8 @@ test.describe('Navigation', () => {
       // Sidebar should contain navigation links
       await expect(page.getByRole('link', { name: /Overview/i })).toBeVisible();
       await expect(page.getByRole('link', { name: 'Mission', exact: true })).toBeVisible();
-      await expect(page.getByRole('button', { name: /Config/i })).toBeVisible();
+      await expect(page.getByRole('link', { name: 'Assistant', exact: true })).toBeVisible();
+      await expect(page.getByRole('button', { name: /Library/i })).toBeVisible();
     }
   });
 

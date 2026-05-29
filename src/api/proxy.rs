@@ -1732,6 +1732,12 @@ fn rewrite_model(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
         .map_err(|e| format!("Failed to serialize: {}", e))
 }
 
+/// Newer Opus models reject explicit sampling params (`temperature`, `top_p`,
+/// `top_k`) when extended thinking is active, so we strip them for these IDs.
+fn anthropic_model_omits_sampling_params(model_id: &str) -> bool {
+    model_id.contains("claude-opus-4-8") || model_id.contains("claude-opus-4-7")
+}
+
 fn rewrite_model_for_anthropic_cli_proxy(
     body: &[u8],
     new_model: &str,
@@ -1739,7 +1745,7 @@ fn rewrite_model_for_anthropic_cli_proxy(
     let mut value: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
     value["model"] = serde_json::Value::String(new_model.to_string());
-    if new_model.contains("claude-opus-4-7") {
+    if anthropic_model_omits_sampling_params(new_model) {
         if let Some(obj) = value.as_object_mut() {
             for key in ["temperature", "top_p", "top_k"] {
                 obj.remove(key);
@@ -2490,7 +2496,7 @@ fn build_anthropic_upstream_request(
     if is_stream {
         out.insert("stream".to_string(), serde_json::Value::Bool(true));
     }
-    let omit_sampling_params = model_id.contains("claude-opus-4-7");
+    let omit_sampling_params = anthropic_model_omits_sampling_params(model_id);
     for key in ["temperature", "top_p", "top_k"] {
         if omit_sampling_params {
             continue;

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Copy, Check } from 'lucide-react';
+import { Check, Copy } from '@phosphor-icons/react';
 import { toast } from '@/components/toast';
 import { cn } from '@/lib/utils';
 
@@ -52,7 +52,6 @@ export function CopyButton({ text, className, label = 'Copied!', showOnHover = t
     </button>
   );
 }
-
 
 
 

@@ -44,6 +44,74 @@ final class NetworkResilienceTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(APIService.streamMaxBufferBytes, 64 * 1024)
     }
 
+    /// A missing/blank saved server URL must not silently connect to a
+    /// developer-specific backend. Unless a build explicitly supplies
+    /// `SandboxedDefaultAPIBaseURL`, first launch should show setup instead of
+    /// marking the API as configured.
+    @MainActor
+    func testBlankBaseURLRequiresConfigurationWhenNoBundleDefaultExists() {
+        let defaults = UserDefaults.standard
+        let key = "api_base_url"
+        let original = defaults.string(forKey: key)
+
+        defer {
+            if let original {
+                defaults.set(original, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        defaults.removeObject(forKey: key)
+        XCTAssertEqual(APIService.shared.baseURL, APIService.defaultBaseURL)
+        XCTAssertEqual(APIService.defaultBaseURL, "")
+        XCTAssertFalse(APIService.shared.isConfigured)
+
+        defaults.set("   ", forKey: key)
+        XCTAssertEqual(APIService.shared.baseURL, APIService.defaultBaseURL)
+        XCTAssertFalse(APIService.shared.isConfigured)
+    }
+
+    func testConnectionStateLabelsAreSpecific() {
+        XCTAssertEqual(ConnectionState.authExpired.label, "Session expired")
+        XCTAssertEqual(ConnectionState.invalidConfiguration.label, "Check server URL")
+        XCTAssertEqual(ConnectionState.degraded.label, "Slow connection · catching up")
+    }
+
+    func testStreamServiceKeepsWebSocketAndDiagnosticsAnchors() throws {
+        let source = try apiServiceSource()
+
+        XCTAssertTrue(source.contains("ControlStreamDiagnostic"))
+        XCTAssertTrue(source.contains("ControlStreamTransport"))
+        XCTAssertTrue(source.contains("runControlWebSocket"))
+        XCTAssertTrue(source.contains("webSocketTask(with: request)"))
+        XCTAssertTrue(source.contains("\"resume\""))
+        XCTAssertTrue(source.contains("\"since_seq\""))
+        XCTAssertTrue(source.contains("runControlSSE"))
+        XCTAssertTrue(source.contains("sinceSeq: sinceSeq"))
+        XCTAssertTrue(source.contains("URLQueryItem(name: \"since_seq\""))
+        XCTAssertTrue(source.contains("falling back to SSE"))
+        XCTAssertTrue(source.contains("web_socket_open_failed"))
+        XCTAssertTrue(source.contains("SandboxedDefaultAPIBaseURL"))
+        XCTAssertFalse(source.contains("nonisolated static let defaultBaseURL = \"https://agent-backend.thomas.md\""),
+                       "the iOS app must not hardcode a personal backend as its default")
+        XCTAssertFalse(source.contains("components.path = normalizedPath"),
+                       "URL construction must preserve any base URL path prefix")
+        XCTAssertFalse(source.contains("headers:"),
+                       "diagnostics should not copy request headers or auth tokens")
+    }
+
+    func testNetworkMonitorSeparatesReachabilityFromStreamState() throws {
+        let source = try networkMonitorSource()
+
+        XCTAssertTrue(source.contains("enum ReachabilityState"))
+        XCTAssertTrue(source.contains("enum StreamState"))
+        XCTAssertTrue(source.contains("reachabilityState"))
+        XCTAssertTrue(source.contains("streamState"))
+        XCTAssertTrue(source.contains("noteStreamAuthExpired"))
+        XCTAssertTrue(source.contains("noteStreamInvalidConfiguration"))
+    }
+
     // MARK: - Mission cache migration
 
     /// One-shot UserDefaults→filesystem migration: previous releases stored
@@ -82,5 +150,23 @@ final class NetworkResilienceTests: XCTestCase {
         ControlView.migrateMissionCacheIfNeeded()
         XCTAssertEqual(defaults.data(forKey: prefix + id), blob,
                        "idempotent: a fresh write after migration must not be touched again")
+    }
+
+    private func apiServiceSource() throws -> String {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let apiService = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("SandboxedDashboard/Services/APIService.swift")
+        return try String(contentsOf: apiService, encoding: .utf8)
+    }
+
+    private func networkMonitorSource() throws -> String {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let source = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("SandboxedDashboard/Services/NetworkMonitor.swift")
+        return try String(contentsOf: source, encoding: .utf8)
     }
 }

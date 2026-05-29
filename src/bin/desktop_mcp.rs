@@ -1096,7 +1096,7 @@ fn handle_request(request: JsonRpcRequest) -> Option<JsonRpcResponse> {
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
                     "name": "desktop-mcp",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
                     "tools": {

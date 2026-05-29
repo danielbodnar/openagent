@@ -10,6 +10,7 @@ import SwiftUI
 struct GlassButton: View {
     let title: String
     let icon: String?
+    let phosphorIcon: PhosphorSymbol?
     let action: () -> Void
     
     @State private var isPressed = false
@@ -17,6 +18,14 @@ struct GlassButton: View {
     init(_ title: String, icon: String? = nil, action: @escaping () -> Void) {
         self.title = title
         self.icon = icon
+        self.phosphorIcon = nil
+        self.action = action
+    }
+
+    init(_ title: String, phosphorIcon: PhosphorSymbol, action: @escaping () -> Void) {
+        self.title = title
+        self.icon = nil
+        self.phosphorIcon = phosphorIcon
         self.action = action
     }
     
@@ -26,6 +35,9 @@ struct GlassButton: View {
                 if let icon = icon {
                     Image(systemName: icon)
                         .font(.system(size: 16, weight: .semibold))
+                } else if let phosphorIcon {
+                    PhosphorIcon(symbol: phosphorIcon, weight: .bold, color: .primary)
+                        .frame(width: 16, height: 16)
                 }
                 Text(title)
                     .font(.system(size: 17, weight: .semibold))
@@ -57,6 +69,7 @@ struct GlassButton: View {
 struct GlassPrimaryButton: View {
     let title: String
     let icon: String?
+    let phosphorIcon: PhosphorSymbol?
     let action: () -> Void
     var isLoading: Bool = false
     var isDisabled: Bool = false
@@ -66,6 +79,16 @@ struct GlassPrimaryButton: View {
     init(_ title: String, icon: String? = nil, isLoading: Bool = false, isDisabled: Bool = false, action: @escaping () -> Void) {
         self.title = title
         self.icon = icon
+        self.phosphorIcon = nil
+        self.isLoading = isLoading
+        self.isDisabled = isDisabled
+        self.action = action
+    }
+
+    init(_ title: String, phosphorIcon: PhosphorSymbol, isLoading: Bool = false, isDisabled: Bool = false, action: @escaping () -> Void) {
+        self.title = title
+        self.icon = nil
+        self.phosphorIcon = phosphorIcon
         self.isLoading = isLoading
         self.isDisabled = isDisabled
         self.action = action
@@ -81,6 +104,9 @@ struct GlassPrimaryButton: View {
                     if let icon = icon {
                         Image(systemName: icon)
                             .font(.system(size: 16, weight: .semibold))
+                    } else if let phosphorIcon {
+                        PhosphorIcon(symbol: phosphorIcon, weight: .bold, color: .white)
+                            .frame(width: 16, height: 16)
                     }
                     Text(title)
                         .font(.system(size: 17, weight: .semibold))

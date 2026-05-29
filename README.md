@@ -1,44 +1,3 @@
-## Build X-Agent Hackathon: Safe Runtime for Autonomous On-chain AI Agents
-
-**sandboxed.sh is the safe runtime for autonomous on-chain AI agents.**
-
-Run OKX security skills unattended inside isolated Linux workspaces, without
-leaking wallet secrets to the model, the host, or unrelated missions. This is a
-real shipped product, not a hackathon toy: sandboxed.sh already has a web
-dashboard, iOS app, per-mission runtimes for Claude Code/OpenCode/Amp, a
-Git-backed Library, encrypted secrets, MCP integration, and production install
-docs for [Docker](docs/install-docker.md) and [native Ubuntu](docs/install-native.md).
-
-Why this matters for OKX:
-
-- **Read-only is the feature**: the bundled `okx-security` skill can inspect
-  token, DApp, transaction, signature, and approval risk without signing or
-  broadcasting anything.
-- **Isolation matches the threat model**: each autonomous run gets its own
-  workspace, so OKX risk checks can run unattended without exposing host files or
-  long-lived credentials.
-- **Skills become operational infrastructure**: the same Library item is synced
-  into Claude Code, OpenCode, and Amp mission environments instead of being a
-  one-off demo prompt.
-
-<p align="center">
-  <img src="screenshots/okx-security-report.png" alt="OKX security risk report running inside sandboxed.sh Mission Control" width="100%" />
-</p>
-
-Try it in 60 seconds:
-
-```bash
-git clone https://github.com/Th0rgal/sandboxed.sh.git
-cd sandboxed.sh
-cp .env.example .env
-docker compose up -d
-npx --yes @xagt/agent-plugin@latest setup --target all
-# In the dashboard, create a workspace from:
-# "autonomous-transaction-safety-check"
-```
-
----
-
 <p align="center">
   <img src="dashboard/public/favicon.svg" width="120" alt="sandboxed.sh" />
 </p>
@@ -103,8 +62,8 @@ literature. Local inference, isolated containers, nothing leaves your machines.
   with per-mission directories
 - **Git-backed Library**: Skills, tools, rules, agents, and MCPs versioned in a
   single repo
-- **Telegram Integration**: Connect bots to missions for chat-based AI
-  assistants with auto-mission creation per chat
+- **Assistant Gateway**: Manage Telegram gateway compatibility from the
+  top-level Assistant UI while Hermes takes over assistant runtime over MCP
 - **Automations**: Schedule recurring agent runs with cron-like triggers
 - **Model Routing**: Provider fallback chains with health checks and
   rate-limit handling
@@ -123,8 +82,7 @@ sandboxed.sh orchestrates multiple AI coding agent runtimes:
 
 - **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**: Anthropic's
   official coding agent with native skills support (`.claude/skills/`)
-- **[OpenCode](https://github.com/anomalyco/opencode)**: Open-source alternative
-  via [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode)
+- **[OpenCode](https://github.com/anomalyco/opencode)**: Open-source coding agent
 - **Codex, Gemini, and Grok**: Native CLI backends for OpenAI, Google, and xAI
   coding agents
 
@@ -227,7 +185,8 @@ deployment:
 - **[Backend API](docs/BACKEND_API.md)** - Backend configuration
 
 ### Setup Guides
-- **[Telegram Assistant](docs/TELEGRAM_ASSISTANT.md)** - Connect Telegram bots to missions
+- **[Assistant Gateway](docs/TELEGRAM_ASSISTANT.md)** - Connect Telegram bots and manage the Assistant cutover
+- **[Hermes Assistant Migration](docs/HERMES_ASSISTANT_MIGRATION.md)** - MCP bridge and runtime handoff notes
 - **[Desktop Setup](docs/DESKTOP_SETUP.md)** - X11/Xvfb configuration for GUI automation
 
 ### Reference

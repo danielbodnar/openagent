@@ -8,7 +8,7 @@
 //! - Library agents (`agent/*.md`)
 //! - Library tools (`tool/*.ts`)
 //! - Config profiles (`configs/<profile>/`) with harness-specific settings:
-//!   - `.opencode/` - OpenCode settings (settings.json, oh-my-opencode.json)
+//!   - `.opencode/` - OpenCode settings (settings.json, agents)
 //!   - `.claudecode/` - Claude Code settings (settings.json)
 //!   - `.sandboxed-sh/` - Sandboxed config (config.json)
 
@@ -73,14 +73,6 @@ const PLUGINS_FILE: &str = "plugins.json";
 const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
 const CONFIGS_DIR: &str = "configs";
 const DEFAULT_PROFILE: &str = "default";
-const OKX_SECURITY_SKILL_NAME: &str = "okx-security";
-const OKX_SECURITY_SKILL: &str = include_str!("../../bundled-library/skill/okx-security/SKILL.md");
-const OKX_SECURITY_SOURCE: &str =
-    include_str!("../../bundled-library/skill/okx-security/.skill-source.json");
-const AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE_NAME: &str = "autonomous-transaction-safety-check";
-const AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE: &str = include_str!(
-    "../../bundled-library/workspace-template/autonomous-transaction-safety-check.json"
-);
 
 /// Store for managing the configuration library.
 pub struct LibraryStore {
@@ -102,13 +94,10 @@ impl LibraryStore {
         git::clone_if_needed(&path, remote).await?;
         git::ensure_remote(&path, remote).await?;
 
-        let store = Self {
+        Ok(Self {
             path,
             remote: remote.to_string(),
-        };
-        store.seed_bundled_hackathon_items().await?;
-
-        Ok(store)
+        })
     }
 
     /// Get the library path.
@@ -119,70 +108,6 @@ impl LibraryStore {
     /// Get the remote URL.
     pub fn remote(&self) -> &str {
         &self.remote
-    }
-
-    /// Seed bundled showcase Library items without overwriting user-owned Library content.
-    async fn seed_bundled_hackathon_items(&self) -> Result<()> {
-        let mut seeded_paths = Vec::new();
-        let skill_dir = self.skills_dir().join(OKX_SECURITY_SKILL_NAME);
-        let skill_md = skill_dir.join("SKILL.md");
-        let source_path = skill_dir.join(".skill-source.json");
-        if !skill_md.exists() {
-            fs::create_dir_all(&skill_dir)
-                .await
-                .context("Failed to create bundled OKX skill directory")?;
-            fs::write(&skill_md, OKX_SECURITY_SKILL)
-                .await
-                .context("Failed to write bundled OKX security skill")?;
-
-            fs::write(&source_path, OKX_SECURITY_SOURCE)
-                .await
-                .context("Failed to write bundled OKX skill source metadata")?;
-            seeded_paths.push(skill_md);
-            seeded_paths.push(source_path);
-        } else if !source_path.exists() {
-            let existing_skill = fs::read_to_string(&skill_md)
-                .await
-                .context("Failed to read existing OKX security skill")?;
-            if existing_skill == OKX_SECURITY_SKILL {
-                fs::write(&source_path, OKX_SECURITY_SOURCE)
-                    .await
-                    .context("Failed to write bundled OKX skill source metadata")?;
-                seeded_paths.push(source_path);
-            }
-        }
-
-        let templates_dir = self.path.join(WORKSPACE_TEMPLATE_DIR);
-        let template_path = templates_dir.join(format!(
-            "{}.json",
-            AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE_NAME
-        ));
-        if !template_path.exists() {
-            fs::create_dir_all(&templates_dir)
-                .await
-                .context("Failed to create bundled workspace-template directory")?;
-            let _: WorkspaceTemplateConfig =
-                serde_json::from_str(AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE)
-                    .context("Bundled OKX workspace template is invalid JSON")?;
-            fs::write(&template_path, AUTONOMOUS_TRANSACTION_SAFETY_TEMPLATE)
-                .await
-                .context("Failed to write bundled OKX workspace template")?;
-            seeded_paths.push(template_path);
-        }
-
-        let seed_author = git::GitAuthor::new(
-            Some("sandboxed.sh".to_string()),
-            Some("agent@sandboxed.sh".to_string()),
-        );
-        git::commit_paths(
-            &self.path,
-            &seeded_paths,
-            "Seed bundled hackathon library items",
-            Some(&seed_author),
-        )
-        .await?;
-
-        Ok(())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1719,23 +1644,6 @@ impl LibraryStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // OpenCode Settings (delegates to default profile)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Get oh-my-opencode settings from the Library (default profile).
-    /// Returns an empty object if the file doesn't exist.
-    pub async fn get_opencode_settings(&self) -> Result<serde_json::Value> {
-        self.get_opencode_settings_for_profile(DEFAULT_PROFILE)
-            .await
-    }
-
-    /// Save oh-my-opencode settings to the Library (default profile).
-    pub async fn save_opencode_settings(&self, settings: &serde_json::Value) -> Result<()> {
-        self.save_opencode_settings_for_profile(DEFAULT_PROFILE, settings)
-            .await
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Sandboxed Config (delegates to default profile)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1847,25 +1755,15 @@ impl LibraryStore {
         let sandboxed_config_path = profile_dir.join(".sandboxed-sh").join("config.json");
 
         // Legacy paths for backward compatibility
-        let legacy_opencode_path = profile_dir.join("opencode").join("oh-my-opencode.json");
         let legacy_sandboxed_path = profile_dir.join("sandboxed").join("config.json");
         let legacy_claudecode_path = profile_dir.join("claudecode").join("config.json");
 
         // Collect all files in the profile for file-based editing
         let mut files = Vec::new();
 
-        // Load OpenCode settings (try new path first, then legacy)
+        // Load OpenCode settings.
         let opencode_settings = if opencode_settings_path.exists() {
             let content = fs::read_to_string(&opencode_settings_path)
-                .await
-                .context("Failed to read opencode settings")?;
-            files.push(ConfigProfileFile {
-                path: ".opencode/settings.json".to_string(),
-                content: content.clone(),
-            });
-            serde_json::from_str(&content).unwrap_or_default()
-        } else if legacy_opencode_path.exists() {
-            let content = fs::read_to_string(&legacy_opencode_path)
                 .await
                 .context("Failed to read opencode settings")?;
             files.push(ConfigProfileFile {
@@ -2067,69 +1965,6 @@ impl LibraryStore {
                 codex_config: CodexProfileConfig::default(),
             })
         }
-    }
-
-    /// Get OpenCode settings from a specific profile.
-    pub async fn get_opencode_settings_for_profile(
-        &self,
-        profile: &str,
-    ) -> Result<serde_json::Value> {
-        Self::validate_name(profile)?;
-
-        let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        // Try new path first, then legacy
-        let new_path = profile_dir.join(".opencode").join("oh-my-opencode.json");
-        let legacy_settings_path = profile_dir.join(".opencode").join("settings.json");
-        let legacy_path = profile_dir.join("opencode").join("oh-my-opencode.json");
-
-        tracing::debug!(
-            profile = %profile,
-            new_path = %new_path.display(),
-            new_path_exists = new_path.exists(),
-            legacy_settings_path = %legacy_settings_path.display(),
-            legacy_settings_path_exists = legacy_settings_path.exists(),
-            legacy_path = %legacy_path.display(),
-            legacy_path_exists = legacy_path.exists(),
-            "Checking OpenCode settings paths"
-        );
-
-        let path = if new_path.exists() {
-            new_path
-        } else if legacy_settings_path.exists() {
-            legacy_settings_path
-        } else if legacy_path.exists() {
-            legacy_path
-        } else {
-            tracing::debug!(profile = %profile, "No OpenCode settings found for profile");
-            return Ok(serde_json::json!({}));
-        };
-
-        let content = fs::read_to_string(&path)
-            .await
-            .context("Failed to read opencode settings")?;
-
-        serde_json::from_str(&content).context("Failed to parse opencode settings")
-    }
-
-    /// Save OpenCode settings to a specific profile.
-    pub async fn save_opencode_settings_for_profile(
-        &self,
-        profile: &str,
-        settings: &serde_json::Value,
-    ) -> Result<()> {
-        Self::validate_name(profile)?;
-
-        let profile_dir = self.path.join(CONFIGS_DIR).join(profile);
-        let opencode_dir = profile_dir.join(".opencode");
-
-        fs::create_dir_all(&opencode_dir).await?;
-
-        let content = serde_json::to_string_pretty(settings)?;
-        fs::write(opencode_dir.join("oh-my-opencode.json"), content)
-            .await
-            .context("Failed to write opencode settings")?;
-
-        Ok(())
     }
 
     /// Get Sandboxed config from a specific profile.
@@ -2384,7 +2219,6 @@ impl LibraryStore {
 
     /// Get a harness default file from the library.
     /// Harness defaults are stored at the library root in directories like:
-    /// - opencode/oh-my-opencode.json
     /// - opencode/settings.json
     /// - claudecode/config.json
     /// - sandboxed/config.json
@@ -2494,75 +2328,6 @@ impl LibraryStore {
 }
 
 #[cfg(test)]
-mod opencode_settings_tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore = "System config merging not implemented for config profiles yet"]
-    async fn merges_missing_agents_from_system_config() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let library_path = temp.path().join("library");
-        let system_path = temp.path().join("system");
-
-        // Use new config profile structure
-        tokio::fs::create_dir_all(library_path.join("configs/default/.opencode"))
-            .await
-            .expect("create library dir");
-        tokio::fs::create_dir_all(&system_path)
-            .await
-            .expect("create system dir");
-
-        let library_settings = serde_json::json!({
-            "agents": {
-                "sisyphus": { "model": "openai/gpt-4o-mini" }
-            }
-        });
-        tokio::fs::write(
-            library_path.join("configs/default/.opencode/settings.json"),
-            serde_json::to_string_pretty(&library_settings).unwrap(),
-        )
-        .await
-        .expect("write library settings");
-
-        let system_settings = serde_json::json!({
-            "agents": {
-                "sisyphus": { "model": "openai/gpt-4o-mini" },
-                "prometheus": { "model": "openai/gpt-4o" }
-            }
-        });
-        tokio::fs::write(
-            system_path.join("oh-my-opencode.json"),
-            serde_json::to_string_pretty(&system_settings).unwrap(),
-        )
-        .await
-        .expect("write system settings");
-
-        std::env::set_var("OPENCODE_CONFIG_DIR", &system_path);
-
-        let store = LibraryStore::with_test_store(library_path).await;
-        let merged = store.get_opencode_settings().await.expect("get settings");
-
-        let agents = merged.get("agents").and_then(|v| v.as_object()).unwrap();
-        assert!(agents.contains_key("sisyphus"));
-        assert!(agents.contains_key("prometheus"));
-
-        // Library file should be updated with prometheus.
-        let updated_path = temp
-            .path()
-            .join("library/configs/default/.opencode/settings.json");
-        let updated = tokio::fs::read_to_string(updated_path)
-            .await
-            .expect("read updated library");
-        let updated_value: serde_json::Value = serde_json::from_str(&updated).unwrap();
-        let updated_agents = updated_value
-            .get("agents")
-            .and_then(|v| v.as_object())
-            .unwrap();
-        assert!(updated_agents.contains_key("prometheus"));
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2613,82 +2378,6 @@ This is the body."#;
         assert!(LibraryStore::validate_name("skill/../etc").is_err());
         assert!(LibraryStore::validate_name("skill/subdir").is_err());
         assert!(LibraryStore::validate_name("skill\\subdir").is_err());
-    }
-
-    #[tokio::test]
-    async fn bundled_hackathon_items_seed_without_overwriting_user_content() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
-
-        store.seed_bundled_hackathon_items().await.unwrap();
-
-        let skill = store.get_skill("okx-security").await.unwrap();
-        assert_eq!(skill.name, "okx-security");
-        assert!(skill.content.contains("read-only by design"));
-        assert!(skill.content.contains("must never request private keys"));
-
-        let template = store
-            .get_workspace_template("autonomous-transaction-safety-check")
-            .await
-            .unwrap();
-        assert_eq!(template.skills, vec!["okx-security"]);
-        assert_eq!(template.distro.as_deref(), Some("ubuntu-noble"));
-
-        let custom = "---\nname: okx-security\n---\n\n# Custom local copy\n";
-        let skill_path = temp.path().join("skill/okx-security/SKILL.md");
-        let source_path = skill_path.parent().unwrap().join(".skill-source.json");
-        tokio::fs::write(&skill_path, custom).await.unwrap();
-        tokio::fs::remove_file(&source_path).await.unwrap();
-
-        store.seed_bundled_hackathon_items().await.unwrap();
-
-        let preserved = tokio::fs::read_to_string(&skill_path).await.unwrap();
-        assert_eq!(preserved, custom);
-        assert!(!source_path.exists());
-    }
-
-    #[tokio::test]
-    async fn bundled_hackathon_items_seed_commits_created_files_in_git_library() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = tokio::process::Command::new("git")
-            .current_dir(temp.path())
-            .args(["init"])
-            .output()
-            .await
-            .unwrap();
-        assert!(output.status.success());
-
-        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
-        store.seed_bundled_hackathon_items().await.unwrap();
-
-        let output = tokio::process::Command::new("git")
-            .current_dir(temp.path())
-            .args(["status", "--porcelain"])
-            .output()
-            .await
-            .unwrap();
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    }
-
-    #[tokio::test]
-    async fn bundled_hackathon_items_seed_repairs_missing_source_for_bundled_skill() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
-
-        let skill_dir = temp.path().join("skill/okx-security");
-        tokio::fs::create_dir_all(&skill_dir).await.unwrap();
-        let skill_path = skill_dir.join("SKILL.md");
-        let source_path = skill_dir.join(".skill-source.json");
-        tokio::fs::write(&skill_path, OKX_SECURITY_SKILL)
-            .await
-            .unwrap();
-
-        store.seed_bundled_hackathon_items().await.unwrap();
-
-        assert!(source_path.exists());
-        let source = tokio::fs::read_to_string(source_path).await.unwrap();
-        assert_eq!(source, OKX_SECURITY_SOURCE);
     }
 
     #[test]

@@ -14,6 +14,7 @@ struct HistoryView: View {
     @State private var isLoading = true
     @State private var searchText = ""
     @State private var selectedFilter: StatusFilter = .all
+    @State private var filteredMissions: [Mission] = []
     @State private var errorMessage: String?
     @State private var isCleaningUp = false
     @State private var showCleanupResult: String?
@@ -39,8 +40,8 @@ struct HistoryView: View {
         }
     }
     
-    private var filteredMissions: [Mission] {
-        missions.filter { mission in
+    private func recomputeFilteredMissions() {
+        filteredMissions = missions.filter { mission in
             // Filter by status
             if let statuses = selectedFilter.missionStatuses, !statuses.contains(mission.status) {
                 return false
@@ -93,6 +94,7 @@ struct HistoryView: View {
                                 ) {
                                     withAnimation(.easeInOut(duration: 0.2)) {
                                         selectedFilter = filter
+                                        recomputeFilteredMissions()
                                     }
                                     HapticService.selectionChanged()
                                 }
@@ -202,6 +204,9 @@ struct HistoryView: View {
         .refreshable {
             await loadData()
         }
+        .onChange(of: searchText) { _, _ in
+            recomputeFilteredMissions()
+        }
     }
     
     private var missionsList: some View {
@@ -281,6 +286,7 @@ struct HistoryView: View {
             missions = missionsResult
             tasks = tasksResult
             runs = runsResult
+            recomputeFilteredMissions()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -296,6 +302,7 @@ struct HistoryView: View {
         let removalIndex = missions.firstIndex(where: { $0.id == mission.id })
         withAnimation {
             missions.removeAll { $0.id == mission.id }
+            recomputeFilteredMissions()
         }
         do {
             _ = try await api.deleteMission(id: mission.id)
@@ -306,6 +313,7 @@ struct HistoryView: View {
             if let idx = removalIndex {
                 withAnimation {
                     missions.insert(mission, at: min(idx, missions.count))
+                    recomputeFilteredMissions()
                 }
             }
         }
@@ -321,6 +329,7 @@ struct HistoryView: View {
                 let newMissions = try await api.listMissions()
                 withAnimation {
                     missions = newMissions
+                    recomputeFilteredMissions()
                     showCleanupResult = "Cleaned up \(count) empty mission\(count == 1 ? "" : "s")"
                 }
                 HapticService.success()

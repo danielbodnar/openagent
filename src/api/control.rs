@@ -287,76 +287,6 @@ fn assistant_reply_is_successful(content: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_terminal_mission_status(status: &MissionStatus) -> bool {
-    matches!(
-        status,
-        MissionStatus::Completed
-            | MissionStatus::Acknowledged
-            | MissionStatus::Failed
-            | MissionStatus::Interrupted
-            | MissionStatus::Blocked
-            | MissionStatus::NotFeasible
-            | MissionStatus::AwaitingUser
-    )
-}
-
-fn should_persist_synthetic_thought(candidate: &str, assistant_content: &str) -> bool {
-    let candidate = candidate.trim();
-    if candidate.is_empty() {
-        return false;
-    }
-
-    let assistant_content = assistant_content.trim();
-    if assistant_content.is_empty() {
-        return true;
-    }
-
-    assistant_content != candidate && !assistant_content.starts_with(candidate)
-}
-
-fn merge_pending_text_delta(existing: &mut String, content: &str) {
-    if content.starts_with(existing.as_str()) {
-        existing.clear();
-        existing.push_str(content);
-    } else {
-        existing.push_str(content);
-    }
-}
-
-fn synthetic_thought_from_text_delta(
-    pending_text_deltas: &mut HashMap<Uuid, String>,
-    mission_id: Uuid,
-    event: &AgentEvent,
-) -> Option<String> {
-    match event {
-        AgentEvent::TextDelta { content, .. } => {
-            if content.trim().is_empty() {
-                pending_text_deltas.remove(&mission_id);
-            } else {
-                pending_text_deltas
-                    .entry(mission_id)
-                    .and_modify(|existing| merge_pending_text_delta(existing, content))
-                    .or_insert_with(|| content.clone());
-            }
-            None
-        }
-        AgentEvent::Thinking { .. } => {
-            pending_text_deltas.remove(&mission_id);
-            None
-        }
-        AgentEvent::ToolCall { .. } | AgentEvent::UserMessage { .. } | AgentEvent::Error { .. } => {
-            pending_text_deltas.remove(&mission_id)
-        }
-        AgentEvent::AssistantMessage { content, .. } => pending_text_deltas
-            .remove(&mission_id)
-            .filter(|candidate| should_persist_synthetic_thought(candidate, content)),
-        AgentEvent::MissionStatusChanged { status, .. } if is_terminal_mission_status(status) => {
-            pending_text_deltas.remove(&mission_id)
-        }
-        _ => None,
-    }
-}
-
 fn extract_short_description_from_content(content: &str, max_len: usize) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
     let mut inside_fenced_block: Option<char> = None;
@@ -2258,7 +2188,7 @@ pub(crate) async fn resolve_claudecode_default_model(
 ) -> Option<String> {
     // Keep this fallback aligned with Anthropic's model catalog:
     // https://docs.anthropic.com/en/docs/about-claude/models/overview
-    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-7";
+    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-8";
 
     let lib = {
         let guard = library.read().await;
@@ -3624,14 +3554,27 @@ pub async fn clear_queue(
 // ==================== Mission Endpoints ====================
 
 /// List all missions.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListMissionsQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+}
+
 pub async fn list_missions(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<ListMissionsQuery>,
 ) -> Result<Json<Vec<Mission>>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
+    // Default to the most recent 50; honor an explicit limit so callers (e.g.
+    // the assistant MCP) can request more, capped to keep the response bounded.
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
     let mut missions = control
         .mission_store
-        .list_missions(50, 0)
+        .list_missions(limit, offset)
         .await
         .map_err(internal_error)?;
     populate_workspace_names(&state, &mut missions).await;
@@ -4639,6 +4582,14 @@ pub struct GetEventsQuery {
     /// when provided.
     #[serde(default)]
     pub before_seq: Option<i64>,
+    /// Whether to include total/count headers. Delta polling only needs
+    /// `X-Max-Sequence`; skipping counts avoids an extra indexed DB scan.
+    #[serde(default = "default_include_event_counts")]
+    pub include_counts: bool,
+}
+
+fn default_include_event_counts() -> bool {
+    true
 }
 
 const INACTIVE_EVENT_SUMMARY_AFTER: chrono::Duration = chrono::Duration::minutes(5);
@@ -4775,11 +4726,15 @@ pub async fn get_mission_events(
     // Metadata headers let the client decide whether it's caught up
     // without a second round-trip. Failures here are non-fatal — we just
     // skip the header rather than breaking the whole response.
-    let total = control
-        .mission_store
-        .count_events(mission_id, types.as_deref())
-        .await
-        .ok();
+    let total = if query.include_counts {
+        control
+            .mission_store
+            .count_events(mission_id, types.as_deref())
+            .await
+            .ok()
+    } else {
+        None
+    };
     let max_seq = control
         .mission_store
         .max_event_sequence(mission_id)
@@ -5124,28 +5079,183 @@ pub async fn delete_mission(
     let control = control_for_user(&state, &user).await;
     let running = get_running_missions(&control).await?;
 
-    if running.iter().any(|m| m.mission_id == mission_id) {
+    let deleted_workspace_dirs = cleanup_mission_workspace_dirs_for_delete(
+        &control.mission_store,
+        &state.workspaces,
+        mission_id,
+        &running,
+    )
+    .await?;
+
+    let deleted_ids =
+        delete_mission_with_children(&control.mission_store, mission_id, &running).await?;
+
+    for id in &deleted_ids {
+        clear_mission_metadata_refresh_state(*id);
+    }
+
+    let deleted_workspace_dir_count = deleted_workspace_dirs.len();
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "deleted": mission_id,
+        "deleted_ids": deleted_ids,
+        "deleted_count": deleted_ids.len(),
+        "deleted_workspace_dirs": deleted_workspace_dirs,
+        "deleted_workspace_dir_count": deleted_workspace_dir_count
+    })))
+}
+
+async fn collect_child_mission_ids(
+    mission_store: &Arc<dyn MissionStore>,
+    parent_id: Uuid,
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    let mut visited = HashSet::new();
+    let mut stack = vec![parent_id];
+    let mut child_ids = Vec::new();
+
+    while let Some(id) = stack.pop() {
+        let children = mission_store
+            .get_child_missions(id)
+            .await
+            .map_err(internal_error)?;
+
+        for child in children {
+            if visited.insert(child.id) {
+                child_ids.push(child.id);
+                stack.push(child.id);
+            }
+        }
+    }
+
+    Ok(child_ids)
+}
+
+async fn delete_mission_with_children(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    running: &[super::mission_runner::RunningMissionInfo],
+) -> Result<Vec<Uuid>, (StatusCode, String)> {
+    let Some(_) = mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    };
+
+    let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
+    let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
+    ids_to_delete.push(mission_id);
+    ids_to_delete.extend(child_ids.iter().copied());
+
+    if let Some(running_mission) = running
+        .iter()
+        .find(|m| ids_to_delete.contains(&m.mission_id))
+    {
         return Err((
             StatusCode::CONFLICT,
-            "Cannot delete a running mission. Cancel it first.".to_string(),
+            format!(
+                "Cannot delete a running mission or worker ({}). Cancel it first.",
+                running_mission.mission_id
+            ),
         ));
     }
 
-    let deleted = control
-        .mission_store
+    for child_id in child_ids.iter().rev() {
+        mission_store
+            .delete_mission(*child_id)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    let deleted = mission_store
         .delete_mission(mission_id)
         .await
         .map_err(internal_error)?;
-
-    if deleted {
-        clear_mission_metadata_refresh_state(mission_id);
-        Ok(Json(serde_json::json!({
-            "ok": true,
-            "deleted": mission_id
-        })))
-    } else {
-        Err((StatusCode::NOT_FOUND, "Mission not found".to_string()))
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
     }
+
+    Ok(ids_to_delete)
+}
+
+async fn cleanup_mission_workspace_dirs_for_delete(
+    mission_store: &Arc<dyn MissionStore>,
+    workspaces: &workspace::SharedWorkspaceStore,
+    mission_id: Uuid,
+    running: &[super::mission_runner::RunningMissionInfo],
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let Some(root_mission) = mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    };
+
+    let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
+    let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
+    ids_to_delete.push(mission_id);
+    ids_to_delete.extend(child_ids.iter().copied());
+
+    if let Some(running_mission) = running
+        .iter()
+        .find(|m| ids_to_delete.contains(&m.mission_id))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot delete a running mission or worker ({}). Cancel it first.",
+                running_mission.mission_id
+            ),
+        ));
+    }
+
+    let mut missions = Vec::with_capacity(ids_to_delete.len());
+    missions.push(root_mission);
+    for child_id in child_ids {
+        if let Some(child) = mission_store
+            .get_mission(child_id)
+            .await
+            .map_err(internal_error)?
+        {
+            missions.push(child);
+        }
+    }
+
+    let mut deleted_dirs = Vec::new();
+    for mission in missions {
+        let Some(ws) = workspaces.get(mission.workspace_id).await else {
+            continue;
+        };
+        let dir = workspace::mission_workspace_dir_for_root(&ws.path, mission.id);
+        if !dir.exists() {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Failed to delete mission workspace directory {}: {}",
+                        dir.display(),
+                        err
+                    ),
+                ));
+            }
+        }
+        tracing::info!(
+            mission_id = %mission.id,
+            workspace_id = %mission.workspace_id,
+            path = %dir.display(),
+            "removed mission workspace directory during explicit delete",
+        );
+        deleted_dirs.push(dir.to_string_lossy().to_string());
+    }
+
+    Ok(deleted_dirs)
 }
 
 /// Delete all empty "Untitled" missions.
@@ -5198,6 +5308,42 @@ struct ControlWsHeartbeat {
     seq: i64,
 }
 
+fn suffix_prefix_overlap_len(existing: &str, incoming: &str) -> usize {
+    let max_overlap = existing.chars().count().min(incoming.chars().count());
+    for overlap_chars in (1..=max_overlap).rev() {
+        let existing_start = existing
+            .char_indices()
+            .nth(existing.chars().count() - overlap_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let incoming_end = incoming
+            .char_indices()
+            .nth(overlap_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(incoming.len());
+        if existing[existing_start..] == incoming[..incoming_end] {
+            return incoming_end;
+        }
+    }
+    0
+}
+
+fn merge_text_stream_fragment(buffer: &mut String, fragment: &str) {
+    if fragment.is_empty() {
+        return;
+    }
+    if buffer.is_empty() || fragment.starts_with(buffer.as_str()) {
+        *buffer = fragment.to_string();
+        return;
+    }
+    if buffer.starts_with(fragment) {
+        return;
+    }
+
+    let overlap = suffix_prefix_overlap_len(buffer, fragment);
+    buffer.push_str(&fragment[overlap..]);
+}
+
 fn text_op_events_for_stream(
     ev: AgentEvent,
     text_buffers: &mut HashMap<Uuid, String>,
@@ -5209,18 +5355,20 @@ fn text_op_events_for_stream(
         } => {
             let previous = text_buffers.entry(mission_id).or_default();
             let previous_len = previous.chars().count();
+            let mut next = previous.clone();
+            merge_text_stream_fragment(&mut next, &content);
             let ops = if previous.is_empty() {
                 vec![TextOp::Insert {
                     pos: 0,
-                    text: content.clone(),
+                    text: next.clone(),
                 }]
             } else {
                 vec![TextOp::Replace {
                     range: (0, previous_len),
-                    text: content.clone(),
+                    text: next.clone(),
                 }]
             };
-            *previous = content;
+            *previous = next;
             vec![AgentEvent::TextOp {
                 mission_id,
                 bubble_id: "text_delta_latest".to_string(),
@@ -6078,26 +6226,11 @@ fn spawn_control_session(
         let store = Arc::clone(&state.mission_store);
         let mut event_rx = events_tx.subscribe();
         tokio::spawn(async move {
-            let mut pending_text_deltas: HashMap<Uuid, String> = HashMap::new();
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
                         // Extract mission_id from event
                         if let Some(mid) = event.mission_id() {
-                            if let Some(content) = synthetic_thought_from_text_delta(
-                                &mut pending_text_deltas,
-                                mid,
-                                &event,
-                            ) {
-                                let synthetic = AgentEvent::Thinking {
-                                    content,
-                                    done: true,
-                                    mission_id: Some(mid),
-                                };
-                                if let Err(e) = store.log_event(mid, &synthetic).await {
-                                    tracing::warn!("Failed to log synthetic thinking event: {}", e);
-                                }
-                            }
                             if let Err(e) = store.log_event(mid, &event).await {
                                 tracing::warn!("Failed to log event: {}", e);
                             }
@@ -11800,36 +11933,8 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
-            // Check profile's sandboxed config for the oh-my-opencode opt-in flag.
-            // Vanilla opencode is the default; oh-my-opencode is only used when the
-            // profile (or workspace config) explicitly enables it.
-            let mut opencode_workspace = exec_workspace.clone();
-            if let Some(ref profile) = effective_config_profile {
-                let lib_guard = library.read().await;
-                if let Some(lib) = lib_guard.as_ref() {
-                    if let Ok(profile_data) = lib.get_config_profile(profile).await {
-                        if profile_data.sandboxed_config.enable_oh_my_opencode {
-                            tracing::info!(
-                                mission_id = ?mission_id,
-                                profile = %profile,
-                                "Enabling oh-my-opencode wrapper from config profile"
-                            );
-                            let mut obj = opencode_workspace
-                                .config
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default();
-                            obj.insert(
-                                "enable_oh_my_opencode".to_string(),
-                                serde_json::json!(true),
-                            );
-                            opencode_workspace.config = serde_json::Value::Object(obj);
-                        }
-                    }
-                }
-            }
             Box::pin(super::mission_runner::run_opencode_turn(
-                &opencode_workspace,
+                exec_workspace,
                 &ctx.working_dir,
                 &user_message,
                 config.default_model.as_deref(),
@@ -14659,33 +14764,6 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_thought_from_text_delta_flushes_before_tool_call() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "Now let me run the build to see how many errors remain.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta),
-            None
-        );
-
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "lake build" }),
-            mission_id: Some(mission_id),
-        };
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build to see how many errors remain.".to_string())
-        );
-        assert!(pending.is_empty());
-    }
-
-    #[test]
     fn text_op_stream_transform_converts_cumulative_delta_to_insert_then_replace() {
         let mission_id = Uuid::new_v4();
         let mut buffers = HashMap::new();
@@ -14746,6 +14824,76 @@ mod tests {
     }
 
     #[test]
+    fn text_op_stream_transform_merges_incremental_delta_fragments() {
+        let mission_id = Uuid::new_v4();
+        let mut buffers = HashMap::new();
+
+        let _ = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "No, it is not actually enforced yet.".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        let second = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "\n\nCurrent state:".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        match &second[0] {
+            AgentEvent::TextOp { ops, .. } => {
+                assert_eq!(
+                    ops,
+                    &vec![TextOp::Replace {
+                        range: (0, 36),
+                        text: "No, it is not actually enforced yet.\n\nCurrent state:".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected text_op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_op_stream_transform_ignores_replayed_shorter_prefixes() {
+        let mission_id = Uuid::new_v4();
+        let mut buffers = HashMap::new();
+
+        let _ = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "The docs are accurate about this current state.".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        let second = text_op_events_for_stream(
+            AgentEvent::TextDelta {
+                content: "The docs are accurate".to_string(),
+                mission_id: Some(mission_id),
+            },
+            &mut buffers,
+        );
+
+        match &second[0] {
+            AgentEvent::TextOp { ops, .. } => {
+                assert_eq!(
+                    ops,
+                    &vec![TextOp::Replace {
+                        range: (0, 47),
+                        text: "The docs are accurate about this current state.".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected text_op, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn text_op_stream_transform_finalizes_before_assistant_message() {
         let mission_id = Uuid::new_v4();
         let mut buffers = HashMap::new();
@@ -14793,122 +14941,97 @@ mod tests {
         assert!(buffers.is_empty());
     }
 
-    #[test]
-    fn synthetic_thought_from_text_delta_accumulates_incremental_fragments() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
+    #[tokio::test]
+    async fn delete_mission_with_children_removes_worker_missions() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = store
+            .create_mission(Some("Boss mission"), None, None, None, None, None, None)
+            .await
+            .expect("boss mission should be created");
+        let worker = store
+            .create_mission_with_parent(
+                Some("Worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("worker mission should be created");
+        let nested_worker = store
+            .create_mission_with_parent(
+                Some("Nested worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(worker.id),
+                None,
+            )
+            .await
+            .expect("nested worker mission should be created");
 
-        let first = AgentEvent::TextDelta {
-            content: "Now let me run ".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let second = AgentEvent::TextDelta {
-            content: "the build.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "cargo test" }),
-            mission_id: Some(mission_id),
-        };
+        let deleted_ids = delete_mission_with_children(&store, boss.id, &[])
+            .await
+            .expect("delete should cascade to workers");
 
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build.".to_string())
-        );
+        assert_eq!(deleted_ids[0], boss.id);
+        assert!(deleted_ids.contains(&worker.id));
+        assert!(deleted_ids.contains(&nested_worker.id));
+        assert!(store.get_mission(boss.id).await.unwrap().is_none());
+        assert!(store.get_mission(worker.id).await.unwrap().is_none());
+        assert!(store.get_mission(nested_worker.id).await.unwrap().is_none());
     }
 
-    #[test]
-    fn synthetic_thought_from_text_delta_replaces_accumulated_fragments() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
+    #[tokio::test]
+    async fn cleanup_mission_workspace_dirs_for_delete_removes_worker_dirs() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let workspaces = Arc::new(workspace::WorkspaceStore::new(temp.path().to_path_buf()).await);
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = store
+            .create_mission(Some("Boss mission"), None, None, None, None, None, None)
+            .await
+            .expect("boss mission should be created");
+        let worker = store
+            .create_mission_with_parent(
+                Some("Worker mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(boss.id),
+                None,
+            )
+            .await
+            .expect("worker mission should be created");
 
-        let first = AgentEvent::TextDelta {
-            content: "Now let me run".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let second = AgentEvent::TextDelta {
-            content: "Now let me run the build".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let tool_call = AgentEvent::ToolCall {
-            tool_call_id: "tool-1".to_string(),
-            name: "Bash".to_string(),
-            args: serde_json::json!({ "command": "cargo test" }),
-            mission_id: Some(mission_id),
-        };
+        let boss_dir = workspace::mission_workspace_dir_for_root(temp.path(), boss.id);
+        let worker_dir = workspace::mission_workspace_dir_for_root(temp.path(), worker.id);
+        tokio::fs::create_dir_all(&boss_dir)
+            .await
+            .expect("boss workspace dir should be created");
+        tokio::fs::create_dir_all(&worker_dir)
+            .await
+            .expect("worker workspace dir should be created");
 
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &first);
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &second);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &tool_call),
-            Some("Now let me run the build".to_string())
-        );
-    }
+        let deleted_dirs =
+            cleanup_mission_workspace_dirs_for_delete(&store, &workspaces, boss.id, &[])
+                .await
+                .expect("workspace cleanup should succeed");
 
-    #[test]
-    fn synthetic_thought_from_text_delta_skips_assistant_echoes() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "Here is the final answer".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let assistant = AgentEvent::AssistantMessage {
-            id: Uuid::new_v4(),
-            content: "Here is the final answer with more detail".to_string(),
-            success: true,
-            cost_cents: 0,
-            cost_source: crate::agents::CostSource::Unknown,
-            usage: None,
-            model: None,
-            model_normalized: None,
-            mission_id: Some(mission_id),
-            shared_files: None,
-            resumable: false,
-            completion_evidence: None,
-        };
-
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &assistant),
-            None
-        );
-    }
-
-    #[test]
-    fn synthetic_thought_from_text_delta_keeps_tool_narration_before_assistant() {
-        let mission_id = Uuid::new_v4();
-        let mut pending = HashMap::new();
-
-        let text_delta = AgentEvent::TextDelta {
-            content: "I'll inspect the failing theorem before I answer.".to_string(),
-            mission_id: Some(mission_id),
-        };
-        let assistant = AgentEvent::AssistantMessage {
-            id: Uuid::new_v4(),
-            content: "I found the issue in the induction step.".to_string(),
-            success: true,
-            cost_cents: 0,
-            cost_source: crate::agents::CostSource::Unknown,
-            usage: None,
-            model: None,
-            model_normalized: None,
-            mission_id: Some(mission_id),
-            shared_files: None,
-            resumable: false,
-            completion_evidence: None,
-        };
-
-        let _ = synthetic_thought_from_text_delta(&mut pending, mission_id, &text_delta);
-        assert_eq!(
-            synthetic_thought_from_text_delta(&mut pending, mission_id, &assistant),
-            Some("I'll inspect the failing theorem before I answer.".to_string())
-        );
+        assert_eq!(deleted_dirs.len(), 2);
+        assert!(!boss_dir.exists());
+        assert!(!worker_dir.exists());
+        assert!(store.get_mission(boss.id).await.unwrap().is_some());
+        assert!(store.get_mission(worker.id).await.unwrap().is_some());
     }
 
     #[tokio::test]

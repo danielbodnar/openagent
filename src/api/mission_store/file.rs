@@ -1,7 +1,8 @@
 //! JSON file-based mission store (legacy).
 
 use super::{
-    now_string, sanitize_filename, Mission, MissionHistoryEntry, MissionStatus, MissionStore,
+    now_string, sanitize_filename, Mission, MissionHistoryEntry, MissionStatus,
+    MissionStatusCounts, MissionStore,
 };
 use crate::api::control::{AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -92,6 +93,23 @@ impl MissionStore for FileMissionStore {
         missions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         let missions = missions.into_iter().skip(offset).take(limit).collect();
         Ok(missions)
+    }
+
+    async fn count_missions_by_status(&self) -> Result<MissionStatusCounts, String> {
+        let missions = self.missions.read().await;
+        let mut counts = MissionStatusCounts {
+            total: missions.len(),
+            ..MissionStatusCounts::default()
+        };
+        for mission in missions.values() {
+            match mission.status {
+                MissionStatus::Active => counts.active += 1,
+                MissionStatus::Completed => counts.completed += 1,
+                MissionStatus::Failed => counts.failed += 1,
+                _ => {}
+            }
+        }
+        Ok(counts)
     }
 
     async fn get_mission(&self, id: Uuid) -> Result<Option<Mission>, String> {

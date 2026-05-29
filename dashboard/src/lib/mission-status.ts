@@ -104,7 +104,7 @@ export function categorizeMissions<T extends { id: string; status: MissionStatus
 export const STATUS_DOT_COLORS: Record<MissionStatus, string> = {
   pending: 'bg-amber-400',
   active: 'bg-indigo-400',
-  awaiting_user: 'bg-sky-400',
+  awaiting_user: 'bg-amber-400',
   acknowledged: 'bg-emerald-400',
   completed: 'bg-emerald-400',
   failed: 'bg-red-400',
@@ -116,7 +116,7 @@ export const STATUS_DOT_COLORS: Record<MissionStatus, string> = {
 export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
   pending: 'text-amber-400',
   active: 'text-indigo-400',
-  awaiting_user: 'text-sky-400',
+  awaiting_user: 'text-amber-400',
   acknowledged: 'text-emerald-400',
   completed: 'text-emerald-400',
   failed: 'text-red-400',

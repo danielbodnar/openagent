@@ -1,18 +1,14 @@
 import { Suspense } from 'react';
-import { Loader } from 'lucide-react';
 import ControlClient from './control-client';
 
 export default function ControlPage() {
+  // No visible Suspense fallback: AuthGate's full-screen ring covers the cold
+  // load, and ControlClient renders its own skeleton inside the chat area
+  // while mission data fetches. A centered icon here only flashes for a few
+  // hundred ms between the two and reads as an extra unrelated spinner.
   return (
-    <Suspense
-      fallback={
-        <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
-          <Loader className="h-8 w-8 animate-spin text-white/40" />
-        </div>
-      }
-    >
+    <Suspense fallback={null}>
       <ControlClient />
     </Suspense>
   );
 }
-

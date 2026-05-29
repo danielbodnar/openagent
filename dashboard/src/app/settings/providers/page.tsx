@@ -648,7 +648,7 @@ export default function ProvidersPage() {
                   : 'bg-red-400';
                 const statusTitle = usageIndicatesDisconnected
                   ? String(cachedUsage?.error || cachedUsage?.status || 'Provider usage check failed')
-                  : provider.status.message || provider.status.type;
+                  : provider.status.message || provider.status.reason || provider.status.type;
                 const isExpanded = expandedProvider === provider.id;
 
                 return (
@@ -806,19 +806,21 @@ export default function ProvidersPage() {
                                 )}
                               </button>
                             )}
-                            {(effectiveStatus === 'needs_auth' || effectiveStatus === 'error') && (
+                            {(effectiveStatus === 'needs_auth' || effectiveStatus === 'needs_reauth' || effectiveStatus === 'error') && (
                               <button
                                 onClick={() => handleAuthenticate(provider)}
                                 disabled={authenticatingProviderId === provider.id}
                                 className={cn(
                                   'p-1.5 rounded-md hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50',
-                                  effectiveStatus === 'needs_auth'
+                                  effectiveStatus === 'needs_auth' || effectiveStatus === 'needs_reauth'
                                     ? 'text-amber-400'
                                     : 'text-red-400 hover:text-red-300'
                                 )}
                                 title={
                                   effectiveStatus === 'needs_auth'
                                     ? 'Connect'
+                                    : effectiveStatus === 'needs_reauth'
+                                    ? 'Reconnect'
                                     : `Reconnect (${
                                         provider.has_oauth
                                           ? 'OAuth'

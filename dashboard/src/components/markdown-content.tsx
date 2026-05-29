@@ -147,6 +147,15 @@ function isFilePath(str: string): boolean {
   return looksLikePath || isSimpleFilename;
 }
 
+function isRichFileLinkHref(href: string): boolean {
+  if (!href || href.startsWith("#")) return false;
+  if (href.startsWith("sandboxed-file://")) return true;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) {
+    return /^[a-zA-Z]:/.test(href);
+  }
+  return isFilePath(href.split(/[?#]/, 1)[0]);
+}
+
 function getFileIcon(path: string) {
   if (isImageFile(path)) return ImageIcon;
   if (isCodeFile(path)) return FileCode;
@@ -154,6 +163,50 @@ function getFileIcon(path: string) {
   if (path.toLowerCase().endsWith(".txt") || path.toLowerCase().endsWith(".md") || path.toLowerCase().endsWith(".log")) return FileText;
   return File;
 }
+
+// Sentinel class applied by `rehypeMarkStandaloneLinks` to links that are the
+// sole content of their paragraph/list-item. Only such "standalone" file links
+// render as the full download card; file links mentioned mid-prose render as a
+// compact inline chip so they don't break the surrounding text flow.
+const STANDALONE_LINK_CLASS = "__standalone-link";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function rehypeMarkStandaloneLinks() {
+  return (tree: any) => {
+    const walk = (node: any) => {
+      if (!node || !Array.isArray(node.children)) return;
+      for (const child of node.children) {
+        if (
+          child.type === "element" &&
+          (child.tagName === "p" || child.tagName === "li")
+        ) {
+          const meaningful = (child.children ?? []).filter(
+            (c: any) => !(c.type === "text" && String(c.value ?? "").trim() === "")
+          );
+          if (
+            meaningful.length === 1 &&
+            meaningful[0].type === "element" &&
+            meaningful[0].tagName === "a"
+          ) {
+            const link = meaningful[0];
+            link.properties = link.properties ?? {};
+            const existing = link.properties.className;
+            const classes = Array.isArray(existing)
+              ? existing.slice()
+              : typeof existing === "string"
+                ? [existing]
+                : [];
+            classes.push(STANDALONE_LINK_CLASS);
+            link.properties.className = classes;
+          }
+        }
+        walk(child);
+      }
+    };
+    walk(tree);
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 function resolvePath(path: string, basePath?: string): string {
   if (path.startsWith("/") || /^[a-zA-Z]:/.test(path)) {
@@ -548,7 +601,7 @@ function FilePreviewModalContent({
                                     customStyle={{
                                       padding: "1rem",
                                       borderRadius: "0.5rem",
-                                      background: "rgba(0, 0, 0, 0.3)",
+                                      background: "rgb(var(--code-background))",
                                     }}
                                   >
                                     {codeString}
@@ -894,7 +947,7 @@ function InlineFileCard({
   }
 
   return (
-    <div
+    <span
       className={cn(
         "my-2 inline-flex items-center gap-3 px-4 py-3 rounded-xl",
         "bg-white/[0.04] border border-white/[0.06] hover:bg-white/[0.06] hover:border-white/[0.1]",
@@ -902,16 +955,18 @@ function InlineFileCard({
       )}
       onClick={() => showFilePreviewModal(path, resolvedPath, workspaceId, missionId)}
     >
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10">
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10">
         <FileIcon className="h-4 w-4 text-indigo-400" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="text-sm font-medium text-white/80 truncate">{displayName}</div>
-        <div className="text-xs text-white/40">
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-medium text-white/80 truncate">
+          {displayName}
+        </span>
+        <span className="block text-xs text-white/40">
           {ext && <span className="mr-2">{ext}</span>}
           {metadata?.size != null && <span>{formatFileSize(metadata.size)}</span>}
-        </div>
-      </div>
+        </span>
+      </span>
       <button
         onClick={handleDownload}
         disabled={downloading}
@@ -920,7 +975,50 @@ function InlineFileCard({
       >
         <Download className={cn("h-4 w-4", downloading && "animate-pulse")} />
       </button>
-    </div>
+    </span>
+  );
+}
+
+// Compact, text-flowing reference for a file linked mid-prose. Unlike
+// InlineFileCard this stays on the baseline and does no metadata fetch — it is
+// just a clickable filename that opens the preview modal.
+function InlineFileChip({
+  path,
+  displayName,
+  basePath,
+  workspaceId,
+  missionId,
+}: {
+  path: string;
+  displayName: string;
+  basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
+}) {
+  const isAbsolute = path.startsWith("/") || /^[a-zA-Z]:/.test(path);
+  const canResolve = isAbsolute || !!basePath;
+  const resolvedPath = canResolve ? resolvePath(path, basePath) : path;
+  const FileIcon = getFileIcon(path);
+  return (
+    <button
+      type="button"
+      title="Click to preview"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showFilePreviewModal(path, resolvedPath, workspaceId, missionId);
+      }}
+      className={cn(
+        "inline-flex items-center gap-1 align-middle rounded px-1.5 py-0.5",
+        "bg-indigo-500/[0.12] text-indigo-300 hover:bg-indigo-500/20 hover:text-indigo-200",
+        "font-mono text-[0.85em] leading-none cursor-pointer transition-colors"
+      )}
+    >
+      {/* getFileIcon returns a stable module-level lucide component, not a new one. */}
+      {/* eslint-disable-next-line react-hooks/static-components */}
+      <FileIcon className="h-3 w-3 shrink-0 opacity-70" />
+      <span className="truncate max-w-[16rem]">{displayName}</span>
+    </button>
   );
 }
 
@@ -970,14 +1068,27 @@ export const MarkdownContent = memo(function MarkdownContent({
       // eslint-disable-next-line @next/next/no-img-element
       return <img src={srcStr} alt={alt} {...props} className="max-w-full rounded" />;
     },
-    a({ href, children, ...props }) {
-      // Handle sandboxed-file:// protocol for rich file tags
-      if (href?.startsWith("sandboxed-file://")) {
-        const path = decodeURIComponent(href.replace("sandboxed-file://", ""));
+    a({ href, children, className, ...props }) {
+      if (href && isRichFileLinkHref(href)) {
+        const path = href.startsWith("sandboxed-file://")
+          ? decodeURIComponent(href.replace("sandboxed-file://", ""))
+          : decodeURIComponent(href.split(/[?#]/, 1)[0]);
         const childText = Array.isArray(children) ? children.join("") : String(children || "");
         const displayName = childText || path.split("/").pop() || "file";
-        return (
+        const standalone =
+          typeof className === "string" && className.includes(STANDALONE_LINK_CLASS);
+        // Standalone (own paragraph/list-item) → full download card; a file
+        // mentioned mid-prose → compact inline chip so text keeps flowing.
+        return standalone ? (
           <InlineFileCard
+            path={path}
+            displayName={displayName}
+            basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
+          />
+        ) : (
+          <InlineFileChip
             path={path}
             displayName={displayName}
             basePath={basePath}
@@ -1008,8 +1119,8 @@ export const MarkdownContent = memo(function MarkdownContent({
           return (
             <code
               className={cn(
-                "px-1.5 py-0.5 rounded bg-white/[0.06] text-indigo-300 text-xs font-mono",
-                "cursor-pointer hover:bg-white/[0.1] hover:text-indigo-200 transition-colors"
+                "code-inline text-xs font-mono",
+                "cursor-pointer transition-colors"
               )}
               onClick={(e) => {
                 e.preventDefault();
@@ -1028,7 +1139,7 @@ export const MarkdownContent = memo(function MarkdownContent({
           );
         }
         return (
-          <code className="px-1.5 py-0.5 rounded bg-white/[0.06] text-indigo-300 text-xs font-mono" {...props}>
+          <code className="code-inline text-xs font-mono" {...props}>
             {children}
           </code>
         );
@@ -1043,18 +1154,18 @@ export const MarkdownContent = memo(function MarkdownContent({
               customStyle={{
                 padding: "1rem",
                 borderRadius: "0.5rem",
-                background: "rgba(0, 0, 0, 0.3)",
+                background: "rgb(var(--code-background))",
               }}
             >
               {codeString}
             </LazyCodeBlock>
           ) : (
-            <pre className="p-4 bg-black/30 rounded-lg overflow-x-auto">
-              <code className="text-xs font-mono text-white/80">{codeString}</code>
+            <pre className="code-block p-4 overflow-x-auto">
+              <code className="text-xs font-mono">{codeString}</code>
             </pre>
           )}
           {match && (
-            <div className="absolute left-3 top-2 text-[10px] text-white/30 uppercase tracking-wider">{match[1]}</div>
+            <div className="absolute left-3 top-2 text-[10px] muted-text uppercase tracking-wider">{match[1]}</div>
           )}
         </div>
       );
@@ -1066,6 +1177,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 
   // Memoize remarkPlugins array to prevent recreation
   const plugins = useMemo(() => [remarkGfm], []);
+  const rehypePlugins = useMemo(() => [rehypeMarkStandaloneLinks], []);
 
   // Allow our placeholder protocols through react-markdown's URL sanitizer.
   // Everything else should continue to use the default sanitizer behavior.
@@ -1093,7 +1205,7 @@ export const MarkdownContent = memo(function MarkdownContent({
             Render markdown
           </button>
         </div>
-        <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded bg-white/5 p-3 text-xs leading-relaxed">
+        <pre className="code-block max-h-[60vh] overflow-auto whitespace-pre-wrap break-words p-3 text-xs leading-relaxed">
           {content}
         </pre>
       </div>
@@ -1102,7 +1214,7 @@ export const MarkdownContent = memo(function MarkdownContent({
 
   return (
     <div className={cn("prose-glass text-sm [&_p]:my-2", className)}>
-      <Markdown remarkPlugins={plugins} components={components} urlTransform={urlTransform}>
+      <Markdown remarkPlugins={plugins} rehypePlugins={rehypePlugins} components={components} urlTransform={urlTransform}>
         {processedContent}
       </Markdown>
     </div>
@@ -1178,7 +1290,7 @@ export function LazyMarkdownContent(props: MarkdownContentProps) {
       ref={ref}
       className={cn("prose-glass text-sm [&_p]:my-2", props.className)}
     >
-      <pre className="whitespace-pre-wrap break-words text-sm leading-relaxed text-white/80">
+      <pre className="code-block whitespace-pre-wrap break-words text-sm leading-relaxed">
         {props.content}
       </pre>
     </div>

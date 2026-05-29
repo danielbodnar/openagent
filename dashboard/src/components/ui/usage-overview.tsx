@@ -645,14 +645,18 @@ function ModelTable({
         <div className="grid grid-cols-[1.5rem_minmax(0,1fr)_5rem_5.5rem_5rem_3.5rem] gap-x-3 border-b border-white/[0.05] bg-white/[0.02] px-3 py-1.5 text-[10px] uppercase tracking-[0.08em] text-white/40">
           <span>#</span>
           <span>Model</span>
-          <span className="text-right">Calls</span>
-          <span className="text-right">Tokens</span>
+          <span className="text-right" title="Stored assistant turns, not raw provider API requests.">
+            Turns
+          </span>
+          <span className="text-right" title="Direct input + output tokens. Cached tokens are shown in the tooltip for each row.">
+            Tokens
+          </span>
           <span className="text-right">Spend</span>
           <span className="text-right">Share</span>
         </div>
         {sorted.map((m, idx) => {
-          const totalTokens =
-            m.input_tokens + m.output_tokens + m.cache_read_tokens + m.cache_creation_tokens;
+          const directTokens = m.input_tokens + m.output_tokens;
+          const cacheTokens = m.cache_read_tokens + m.cache_creation_tokens;
           const pctOfRequests =
             totalRequests > 0 ? (m.requests / totalRequests) * 100 : 0;
           const barWidth = Math.max(2, (m.requests / maxRequests) * 100);
@@ -681,8 +685,15 @@ function ModelTable({
               <span className="relative text-right font-mono text-[11px] text-white/70 tabular-nums">
                 {fmtCompact(m.requests)}
               </span>
-              <span className="relative text-right font-mono text-[11px] text-white/55 tabular-nums">
-                {fmtCompact(totalTokens)}
+              <span
+                className="relative text-right font-mono text-[11px] text-white/55 tabular-nums"
+                title={
+                  cacheTokens > 0
+                    ? `${fmtCompact(directTokens)} direct tokens, ${fmtCompact(cacheTokens)} cached tokens`
+                    : `${fmtCompact(directTokens)} direct tokens`
+                }
+              >
+                {fmtCompact(directTokens)}
               </span>
               <span className="relative text-right font-mono text-[11px] text-white/85 tabular-nums">
                 {formatCents(m.cost_cents)}
@@ -850,7 +861,7 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
               icon={<DollarSign className="h-3.5 w-3.5 text-emerald-400" />}
               label="Total spend"
               value={formatCents(totals!.cost_cents)}
-              sub={`${fmtCompact(totals!.requests)} calls`}
+              sub={`${fmtCompact(totals!.requests)} turns`}
             />
             <MetricTile
               icon={<ArrowDownToLine className="h-3.5 w-3.5 text-indigo-400" />}
@@ -864,7 +875,7 @@ export function UsageOverview({ window, onWindowChange }: UsageOverviewProps) {
               value={fmtCompact(totals!.output_tokens)}
               sub={
                 totals!.requests > 0
-                  ? `${fmtCompact(Math.round(totals!.output_tokens / totals!.requests))} avg per call`
+                  ? `${fmtCompact(Math.round(totals!.output_tokens / totals!.requests))} avg per turn`
                   : 'N/A'
               }
             />

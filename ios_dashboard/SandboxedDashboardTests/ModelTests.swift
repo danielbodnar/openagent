@@ -159,6 +159,26 @@ final class ModelTests: XCTestCase {
         XCTAssertTrue(source.contains("runningMissions.removeAll { $0.missionId == missionId }"))
     }
 
+    func testControlViewKeepsMobileReliabilityAnchors() throws {
+        let source = try controlViewSource()
+
+        XCTAssertTrue(source.contains("streamGeneration"))
+        XCTAssertTrue(source.contains("latestStreamSeq"))
+        XCTAssertTrue(source.contains("shouldSkipForegroundReload"))
+        XCTAssertTrue(source.contains("recordStreamDiagnostic"))
+        XCTAssertTrue(source.contains("noteStreamAuthExpired"))
+        XCTAssertTrue(source.contains("noteStreamInvalidConfiguration"))
+        XCTAssertTrue(source.contains("rememberPendingSend"))
+        XCTAssertTrue(source.contains("restorePendingSends"))
+        XCTAssertTrue(source.contains("preferWebSocket: true"))
+        XCTAssertTrue(source.contains("let currentSinceSeq = await MainActor.run"))
+        XCTAssertFalse(source.contains("let sinceSeq = missionFilter.flatMap"))
+        XCTAssertTrue(source.contains("streamIsTerminalBadState"))
+        XCTAssertTrue(source.contains("event.type != \"connected\""))
+        XCTAssertTrue(source.contains("if !shouldSkipForegroundReload(missionId: missionId)"))
+        XCTAssertTrue(source.contains("generation == self.streamGeneration"))
+    }
+
     func testSharedControlReducerFixturesReplayOnIOS() throws {
         let fixtures = try sharedControlReducerFixtures()
 
@@ -171,6 +191,53 @@ final class ModelTests: XCTestCase {
                 "Fixture failed: \(fixtureCase.name)"
             )
         }
+    }
+
+    func testChatHistoryReducerSkipsTextOpFallbackWhenRealThinkingIsActive() throws {
+        let mission = try JSONDecoder().decode(Mission.self, from: """
+        {
+            "id": "mission-id",
+            "status": "active",
+            "title": "Thinking mission",
+            "history": [],
+            "resumable": false,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }
+        """.data(using: .utf8)!)
+        let events = [
+            StoredEvent(
+                id: 1,
+                missionId: mission.id,
+                sequence: 1,
+                eventType: "thinking",
+                timestamp: "2024-01-01T00:00:00Z",
+                eventId: "real-thinking",
+                toolCallId: nil,
+                toolName: nil,
+                content: "Analyzing the task",
+                metadata: ["done": AnyCodable(false)]
+            ),
+            StoredEvent(
+                id: 2,
+                missionId: mission.id,
+                sequence: 2,
+                eventType: "text_op",
+                timestamp: "2024-01-01T00:00:01Z",
+                eventId: nil,
+                toolCallId: nil,
+                toolName: nil,
+                content: #"{"ops":[{"type":"insert","pos":0,"text":"fallback text"}]}"#,
+                metadata: ["bubble_id": AnyCodable("latest")]
+            )
+        ]
+
+        let messages = ChatHistoryReducer.reduce(events: events, mission: mission)
+
+        XCTAssertEqual(messages.filter(\.isThinking).count, 1)
+        XCTAssertEqual(messages.first?.id, "real-thinking")
+        XCTAssertEqual(messages.first?.content, "Analyzing the task")
+        XCTAssertFalse(messages.contains { $0.id.hasPrefix("stream-thinking-") })
     }
 
     private func controlViewSource() throws -> String {
@@ -194,119 +261,7 @@ final class ModelTests: XCTestCase {
     }
 
     private func replayFixtureEvents(_ events: [StoredEvent], mission: Mission) -> [ChatMessage] {
-        var messages: [ChatMessage] = []
-        var textOpBuffers: [String: String] = [:]
-        let orderedEvents = events.sorted { lhs, rhs in
-            if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
-            return lhs.id < rhs.id
-        }
-
-        for event in orderedEvents {
-            var data = event.metadata.mapValues(\.value)
-            data["mission_id"] = event.missionId
-            data["content"] = event.content
-            if let eventId = event.eventId { data["id"] = eventId }
-            if event.eventType == "text_op",
-               let jsonData = event.content.data(using: .utf8),
-               let ops = try? JSONSerialization.jsonObject(with: jsonData) {
-                data["ops"] = ops
-            }
-
-            switch event.eventType {
-            case "assistant_message", "assistant_message_canonical":
-                guard let id = data["id"] as? String,
-                      !messages.contains(where: { $0.id == id }) else { continue }
-                messages.append(
-                    ChatMessage(
-                        id: id,
-                        type: .assistant(success: data["success"] as? Bool ?? true, costCents: 0, costSource: .unknown, model: nil, sharedFiles: nil),
-                        content: data["content"] as? String ?? ""
-                    )
-                )
-            case "thinking":
-                let content = data["content"] as? String ?? ""
-                let done = data["done"] as? Bool ?? false
-                if done, data["goal_role"] as? String == "deliverable", mission.goalMode {
-                    let baseId = data["id"] as? String ?? String(event.id)
-                    let id = "goal-deliverable-\(baseId)"
-                    guard !messages.contains(where: { $0.id == id }) else { continue }
-                    messages.append(
-                        ChatMessage(
-                            id: id,
-                            type: .assistant(success: true, costCents: 0, costSource: .unknown, model: nil, sharedFiles: nil),
-                            content: content
-                        )
-                    )
-                    continue
-                }
-                if let id = data["id"] as? String,
-                   messages.contains(where: { $0.id == id }) {
-                    continue
-                }
-                if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone }) {
-                    let existing = messages[index]
-                    messages[index] = ChatMessage(
-                        id: existing.id,
-                        type: .thinking(done: done, startTime: existing.thinkingStartTime ?? existing.timestamp),
-                        content: content,
-                        timestamp: existing.timestamp
-                    )
-                } else {
-                    messages.append(
-                        ChatMessage(
-                            id: data["id"] as? String ?? "thinking-\(event.id)",
-                            type: .thinking(done: done, startTime: Date()),
-                            content: content
-                        )
-                    )
-                }
-            case "text_op":
-                let bubbleId = data["bubble_id"] as? String ?? "text-op-latest"
-                let ops = data["ops"] as? [[String: Any]] ?? []
-                var content = textOpBuffers[bubbleId] ?? ""
-                var finalized = false
-                for op in ops {
-                    switch op["type"] as? String {
-                    case "insert":
-                        let pos = min(max(op["pos"] as? Int ?? content.count, 0), content.count)
-                        let index = content.index(content.startIndex, offsetBy: pos)
-                        content.insert(contentsOf: op["text"] as? String ?? "", at: index)
-                    case "replace":
-                        let range = op["range"] as? [Int] ?? []
-                        let start = min(max(range.first ?? 0, 0), content.count)
-                        let end = min(max(range.dropFirst().first ?? content.count, start), content.count)
-                        let startIndex = content.index(content.startIndex, offsetBy: start)
-                        let endIndex = content.index(content.startIndex, offsetBy: end)
-                        content.replaceSubrange(startIndex..<endIndex, with: op["text"] as? String ?? "")
-                    case "finalize":
-                        finalized = true
-                    default:
-                        continue
-                    }
-                }
-                textOpBuffers[bubbleId] = finalized ? nil : content
-                if let index = messages.lastIndex(where: { $0.isThinking && !$0.thinkingDone && $0.id.hasPrefix("stream-thinking-") }) {
-                    messages[index] = ChatMessage(
-                        id: messages[index].id,
-                        type: .thinking(done: finalized, startTime: messages[index].thinkingStartTime ?? messages[index].timestamp),
-                        content: content,
-                        timestamp: messages[index].timestamp
-                    )
-                } else {
-                    messages.append(
-                        ChatMessage(
-                            id: "stream-thinking-\(bubbleId)",
-                            type: .thinking(done: finalized, startTime: Date()),
-                            content: content
-                        )
-                    )
-                }
-            default:
-                continue
-            }
-        }
-
-        return messages
+        ChatHistoryReducer.reduce(events: events, mission: mission)
     }
 
     // MARK: - FileEntry Tests

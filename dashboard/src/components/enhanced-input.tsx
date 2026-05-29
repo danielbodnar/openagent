@@ -5,10 +5,7 @@ import { listLibraryCommands, getBuiltinCommands as fetchBuiltinCommands, getVis
 import { cn } from '@/lib/utils';
 
 // Fallback builtin commands (used if API fails)
-const FALLBACK_OPENCODE_COMMANDS: CommandSummary[] = [
-  { name: 'ralph-loop', description: 'Start self-referential development loop until completion', path: 'builtin' },
-  { name: 'cancel-ralph', description: 'Cancel active Ralph Loop', path: 'builtin' },
-];
+const FALLBACK_OPENCODE_COMMANDS: CommandSummary[] = [];
 
 const FALLBACK_CLAUDECODE_COMMANDS: CommandSummary[] = [
   { name: 'plan', description: 'Enter plan mode to design an implementation approach', path: 'builtin-claude' },
@@ -93,11 +90,10 @@ const parseAgentNames = (payload: unknown): string[] => {
 
 const getAgentDescription = (name: string): string => {
   const descriptions: Record<string, string> = {
-    'Sisyphus': 'Main orchestrator with parallel execution',
     'oracle': 'Architecture, code review, strategy (GPT)',
     'explore': 'Fast codebase exploration and search',
     'librarian': 'Documentation lookup and research',
-    'plan': 'Prometheus planner for structured work',
+    'plan': 'Read-only planning agent',
     'frontend-ui-ux-engineer': 'UI/UX development specialist',
     'document-writer': 'Technical documentation expert',
     'multimodal-looker': 'Visual content analysis',
@@ -330,7 +326,7 @@ export const EnhancedInput = memo(forwardRef<EnhancedInputHandle, EnhancedInputP
         type: 'command',
         name: cmd.name,
         description: cmd.description,
-        source: cmd.path === 'builtin' ? 'oh-my-opencode' : cmd.path === 'builtin-claude' ? 'claude-code' : 'library',
+        source: cmd.path === 'builtin' ? 'opencode' : cmd.path === 'builtin-claude' ? 'claude-code' : 'library',
         params: cmd.params,
       })));
       setTriggerPosition(0);

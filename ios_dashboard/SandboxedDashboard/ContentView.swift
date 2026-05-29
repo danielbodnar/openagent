@@ -20,8 +20,13 @@ struct ContentView: View {
             if isCheckingAuth {
                 LoadingView(message: "Connecting...")
                     .background(Theme.backgroundPrimary.ignoresSafeArea())
-            } else if authRequired && !isAuthenticated {
-                LoginView(onLogin: { isAuthenticated = true })
+            } else if authRequired && (!isAuthenticated || api.authSessionExpired) {
+                LoginView(
+                    sessionExpired: api.authSessionExpired,
+                    onLogin: {
+                        isAuthenticated = true
+                    }
+                )
             } else {
                 MainTabView()
             }
@@ -39,6 +44,12 @@ struct ContentView: View {
             // Re-check auth when server URL is configured
             if isConfigured {
                 Task { await checkAuth() }
+            }
+        }
+        .onChange(of: api.authSessionExpired) { _, expired in
+            if expired {
+                authRequired = true
+                isAuthenticated = false
             }
         }
     }
@@ -89,9 +100,8 @@ struct SetupSheet: View {
 
                     // Welcome icon
                     VStack(spacing: 16) {
-                        Image(systemName: "server.rack")
-                            .font(.system(size: 64, weight: .light))
-                            .foregroundStyle(Theme.accent)
+                        PhosphorIcon(symbol: .hardDrives, weight: .light, color: Theme.accent)
+                            .frame(width: 64, height: 64)
 
                         VStack(spacing: 8) {
                             Text("Welcome to sandboxed.sh")
@@ -129,8 +139,8 @@ struct SetupSheet: View {
 
                             if let error = errorMessage {
                                 HStack {
-                                    Image(systemName: "exclamationmark.triangle.fill")
-                                        .foregroundStyle(Theme.error)
+                                    PhosphorIcon(symbol: .warning, weight: .fill, color: Theme.error)
+                                        .frame(width: 14, height: 14)
                                     Text(error)
                                         .font(.caption)
                                         .foregroundStyle(Theme.error)
@@ -140,8 +150,8 @@ struct SetupSheet: View {
 
                             if connectionSuccess {
                                 HStack {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(Theme.success)
+                                    PhosphorIcon(symbol: .checkCircle, weight: .fill, color: Theme.success)
+                                        .frame(width: 14, height: 14)
                                     Text("Connection successful!")
                                         .font(.caption)
                                         .foregroundStyle(Theme.success)
@@ -214,6 +224,7 @@ struct SetupSheet: View {
 // MARK: - Login View
 
 struct LoginView: View {
+    let sessionExpired: Bool
     let onLogin: () -> Void
     
     @State private var username = ""
@@ -227,7 +238,8 @@ struct LoginView: View {
     
     private let api = APIService.shared
     
-    init(onLogin: @escaping () -> Void) {
+    init(sessionExpired: Bool = false, onLogin: @escaping () -> Void) {
+        self.sessionExpired = sessionExpired
         self.onLogin = onLogin
         _serverURL = State(initialValue: APIService.shared.baseURL)
         _username = State(initialValue: UserDefaults.standard.string(forKey: "last_username") ?? "")
@@ -262,9 +274,8 @@ struct LoginView: View {
                     
                     // Logo
                     VStack(spacing: 16) {
-                        Image(systemName: "brain")
-                            .font(.system(size: 72, weight: .light))
-                            .foregroundStyle(Theme.accent)
+                        PhosphorIcon(symbol: .brain, weight: .light, color: Theme.accent)
+                            .frame(width: 72, height: 72)
                             .symbolEffect(.pulse, options: .repeating)
                         
                         VStack(spacing: 4) {
@@ -276,6 +287,20 @@ struct LoginView: View {
                                 .font(.title3)
                                 .foregroundStyle(Theme.textSecondary)
                         }
+                    }
+
+                    if sessionExpired {
+                        GlassCard(padding: 16, cornerRadius: 18) {
+                            HStack(spacing: 10) {
+                                PhosphorIcon(symbol: .warning, weight: .fill, color: Theme.warning)
+                                    .frame(width: 18, height: 18)
+                                Text("Session expired. Sign in again to continue.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(Theme.textPrimary)
+                                Spacer()
+                            }
+                        }
+                        .padding(.horizontal, 24)
                     }
                     
                     // Login form
@@ -349,8 +374,8 @@ struct LoginView: View {
                             // Error message
                             if let error = errorMessage {
                                 HStack(spacing: 8) {
-                                    Image(systemName: "exclamationmark.circle.fill")
-                                        .foregroundStyle(Theme.error)
+                                    PhosphorIcon(symbol: .xCircle, weight: .fill, color: Theme.error)
+                                        .frame(width: 14, height: 14)
                                     Text(error)
                                         .font(.caption)
                                         .foregroundStyle(Theme.error)
@@ -361,7 +386,7 @@ struct LoginView: View {
                             // Login button
                             GlassPrimaryButton(
                                 "Sign In",
-                                icon: "arrow.right",
+                                phosphorIcon: .signIn,
                                 isLoading: isLoading,
                                 isDisabled: password.isEmpty || (api.authMode == .multiUser && username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             ) {

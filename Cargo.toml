@@ -1,6 +1,6 @@
 [package]
 name = "sandboxed_sh"
-version = "0.12.0"
+version = "1.3.0"
 edition = "2021"
 rust-version = "1.91"
 description = "Self-hosted orchestrator for AI coding agents (formerly Open Agent)"
@@ -105,6 +105,10 @@ path = "src/bin/automation_manager_mcp.rs"
 [[bin]]
 name = "orchestrator-mcp"
 path = "src/bin/orchestrator_mcp.rs"
+
+[[bin]]
+name = "assistant-mcp"
+path = "src/bin/assistant_mcp.rs"
 
 [[bin]]
 name = "fido-agent-proxy"

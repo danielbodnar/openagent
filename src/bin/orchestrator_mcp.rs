@@ -242,6 +242,10 @@ fn default_poll_interval() -> u64 {
 
 #[derive(Deserialize, Default)]
 struct DeploySandboxedShParams {
+    /// Optional explicit Sandboxed.sh environment to deploy. When omitted, the
+    /// tool deploys the API environment this mission is connected to.
+    #[serde(default)]
+    target_environment: Option<String>,
     /// Bypass self-protection + debounce safety rails.
     #[serde(default)]
     force: bool,
@@ -313,6 +317,32 @@ struct OrchestratorMcp {
     // Cached lookup of the boss mission's workspace_id, so workers default to the
     // same workspace instead of silently falling back to the host (Uuid::nil).
     boss_workspace_id: OnceCell<Option<String>>,
+}
+
+struct DeployTarget {
+    api_url: &'static str,
+    expected_service: Option<&'static str>,
+}
+
+fn resolve_deploy_target(target_environment: Option<&str>) -> Result<DeployTarget, String> {
+    match target_environment {
+        None => Ok(DeployTarget {
+            api_url: "",
+            expected_service: None,
+        }),
+        Some("dev") => Ok(DeployTarget {
+            api_url: "http://127.0.0.1:3002",
+            expected_service: Some("sandboxed-sh-dev.service"),
+        }),
+        Some("prod") => Ok(DeployTarget {
+            api_url: "http://127.0.0.1:3000",
+            expected_service: Some("sandboxed-sh-prod.service"),
+        }),
+        Some(other) => Err(format!(
+            "Invalid target_environment {:?}; expected \"dev\" or \"prod\"",
+            other
+        )),
+    }
 }
 
 impl OrchestratorMcp {
@@ -705,8 +735,13 @@ impl OrchestratorMcp {
             ToolDefinition {
                 name: "deploy_sandboxed_sh".to_string(),
                 description:
-                    "Build and hot-swap the sandboxed.sh binary on the host this mission's API \
-                     runs on, with safety rails:\n\
+                    "Build and hot-swap one Sandboxed.sh backend with safety rails.\n\
+                     Targeting is explicit:\n\
+                     • Omit target_environment to deploy the backend API this mission is connected to.\n\
+                     • Set target_environment=\"dev\" to deploy sandboxed-sh-dev via localhost:3002.\n\
+                     • Set target_environment=\"prod\" to deploy sandboxed-sh-prod via localhost:3000.\n\
+                     The backend refuses if the request reaches a service different from the \
+                     requested target.\n\
                      • Self-protection: refuses by default if your own mission lives on the \
                        service being restarted (passing force=true acknowledges that your turn \
                        will be SIGTERM'd).\n\
@@ -722,6 +757,11 @@ impl OrchestratorMcp {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
+                        "target_environment": {
+                            "type": "string",
+                            "enum": ["dev", "prod"],
+                            "description": "Explicit environment to deploy. Omit to deploy the backend API this mission is connected to. Use dev for sandboxed-sh-dev on localhost:3002 and prod for sandboxed-sh-prod on localhost:3000."
+                        },
                         "force": {
                             "type": "boolean",
                             "description": "Bypass self-protection AND debounce. Only set this when you've explicitly decided the restart is worth killing your own turn / breaking the cooldown.",
@@ -758,7 +798,16 @@ impl OrchestratorMcp {
     }
 
     async fn api_post(&self, path: &str, body: Value) -> Result<reqwest::Response, String> {
-        let url = format!("{}{}", self.api_url, path);
+        self.api_post_to(&self.api_url, path, body).await
+    }
+
+    async fn api_post_to(
+        &self,
+        api_url: &str,
+        path: &str,
+        body: Value,
+    ) -> Result<reqwest::Response, String> {
+        let url = format!("{}{}", api_url, path);
         let mut req = self.client.post(&url).json(&body);
         if let Some((k, v)) = self.auth_header() {
             req = req.header(k, v);
@@ -1546,15 +1595,24 @@ impl OrchestratorMcp {
     /// consumed eagerly until we see a `deployed` event or the stream
     /// closes (the new binary takes over and our connection drops).
     async fn deploy_sandboxed_sh(&self, params: DeploySandboxedShParams) -> Result<Value, String> {
+        let target = resolve_deploy_target(params.target_environment.as_deref())?;
+        let api_url = if target.api_url.is_empty() {
+            self.api_url.as_str()
+        } else {
+            target.api_url
+        };
         let body = json!({
             "calling_mission_id": self.mission_id,
             "force": params.force,
             "git_ref": params.git_ref,
             "skip_build": params.skip_build,
             "repo_path": params.repo_path,
+            "expected_service": target.expected_service,
         });
 
-        let response = self.api_post("/api/system/deploy", body).await?;
+        let response = self
+            .api_post_to(api_url, "/api/system/deploy", body)
+            .await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();

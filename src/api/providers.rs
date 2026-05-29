@@ -20,9 +20,9 @@ use super::routes::AppState;
 use crate::ai_providers::{AIProvider, AIProviderStore, ProviderType};
 use crate::util::{auth_entry_has_credentials, home_dir, AI_PROVIDERS_PATH};
 
-/// Cached model lists fetched from provider APIs at startup.
-/// Maps provider ID (e.g. "anthropic") -> Vec<ProviderModel>
-pub type ModelCatalog = Arc<RwLock<HashMap<String, Vec<ProviderModel>>>>;
+/// Cached model catalog fetched from provider APIs and public catalogs at startup.
+/// Maps provider ID (e.g. "anthropic") -> Vec<CatalogEntry>.
+pub type ModelCatalog = Arc<RwLock<HashMap<String, Vec<CatalogEntry>>>>;
 
 #[derive(Debug, Clone)]
 struct CodexProbeCacheEntry {
@@ -46,6 +46,76 @@ pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "zai",
     "minimax",
 ];
+
+/// Where a catalog entry came from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogSource {
+    ProviderApi,
+    ModelsDev,
+    Docs,
+    HardcodedFallback,
+    SmokeTest,
+}
+
+/// How confidently a model can be selected for the configured account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogAvailability {
+    /// Returned by the provider API or otherwise verified for this account.
+    Available,
+    /// Known from a public catalog, not confirmed for this account.
+    Known,
+    /// Discovered from docs or other weak signals and needs validation.
+    Candidate,
+    /// Previously tested and failed.
+    Failed,
+}
+
+/// Internal merged catalog entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub provider_id: String,
+    pub sources: Vec<CatalogSource>,
+    pub availability: CatalogAvailability,
+    pub last_checked_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl CatalogEntry {
+    fn from_provider_model(
+        provider_id: impl Into<String>,
+        model: ProviderModel,
+        source: CatalogSource,
+        availability: CatalogAvailability,
+        last_checked_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            id: model.id,
+            name: model.name,
+            provider_id: provider_id.into(),
+            sources: vec![source],
+            availability,
+            last_checked_at,
+            description: model.description,
+        }
+    }
+
+    fn to_provider_model(&self) -> ProviderModel {
+        ProviderModel {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+
+    fn is_selectable_by_default(&self) -> bool {
+        self.availability == CatalogAvailability::Available
+    }
+}
 
 /// A model available from a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +150,9 @@ pub struct ProvidersQuery {
     /// Include providers even if they are not configured/authenticated.
     #[serde(default)]
     pub include_all: bool,
+    /// Include public-catalog models that have not been verified for this account.
+    #[serde(default)]
+    pub include_unverified: bool,
 }
 
 /// Response for the providers endpoint.
@@ -115,6 +188,9 @@ pub struct BackendModelsQuery {
     /// Include providers even if they are not configured/authenticated.
     #[serde(default)]
     pub include_all: bool,
+    /// Include public-catalog models that have not been verified for this account.
+    #[serde(default)]
+    pub include_unverified: bool,
 }
 
 /// Configuration file structure for providers.
@@ -176,13 +252,58 @@ fn merge_provider_models(
     }
 }
 
+fn normalize_model_id(id: &str) -> String {
+    id.trim().to_ascii_lowercase()
+}
+
+fn merge_catalog_entries(
+    catalog: &mut HashMap<String, Vec<CatalogEntry>>,
+    provider_id: &str,
+    incoming: impl IntoIterator<Item = CatalogEntry>,
+) {
+    let entries = catalog.entry(provider_id.to_string()).or_default();
+    for entry in incoming {
+        let normalized = normalize_model_id(&entry.id);
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|model| normalize_model_id(&model.id) == normalized)
+        {
+            if existing.availability != CatalogAvailability::Available
+                && entry.availability == CatalogAvailability::Available
+            {
+                existing.availability = CatalogAvailability::Available;
+                existing.last_checked_at = entry.last_checked_at;
+            }
+            if existing.description.is_none() {
+                existing.description = entry.description.clone();
+            }
+            if existing.name == existing.id && entry.name != entry.id {
+                existing.name = entry.name.clone();
+            }
+            for source in entry.sources {
+                if !existing.sources.contains(&source) {
+                    existing.sources.push(source);
+                }
+            }
+            continue;
+        }
+
+        entries.push(entry);
+    }
+}
+
 fn merge_cached_provider_models(
     config: &mut ProvidersConfig,
-    cached: &HashMap<String, Vec<ProviderModel>>,
+    cached: &HashMap<String, Vec<CatalogEntry>>,
+    include_unverified: bool,
 ) {
     for provider in &mut config.providers {
-        if let Some(models) = cached.get(&provider.id) {
-            merge_provider_models(&mut provider.models, models.iter().cloned());
+        if let Some(entries) = cached.get(&provider.id) {
+            let models = entries
+                .iter()
+                .filter(|entry| include_unverified || entry.is_selectable_by_default())
+                .map(CatalogEntry::to_provider_model);
+            merge_provider_models(&mut provider.models, models);
         }
     }
 }
@@ -414,11 +535,18 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check Anthropic's current model IDs here:
                     // https://docs.anthropic.com/en/docs/about-claude/models/overview
                     ProviderModel {
-                        id: "claude-opus-4-7".to_string(),
-                        name: "Claude Opus 4.7".to_string(),
+                        id: "claude-opus-4-8".to_string(),
+                        name: "Claude Opus 4.8".to_string(),
                         description: Some(
                             "Latest Opus model, recommended for hard coding and agentic tasks"
                                 .to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "claude-opus-4-7".to_string(),
+                        name: "Claude Opus 4.7".to_string(),
+                        description: Some(
+                            "Most capable, recommended for complex tasks".to_string(),
                         ),
                     },
                     ProviderModel {
@@ -577,6 +705,11 @@ fn default_providers_config() -> ProvidersConfig {
                 models: vec![
                     // Check xAI model IDs here:
                     // https://docs.x.ai/docs/models
+                    ProviderModel {
+                        id: "grok-build".to_string(),
+                        name: "Grok Build".to_string(),
+                        description: Some("Default Grok Build CLI coding model".to_string()),
+                    },
                     ProviderModel {
                         id: "grok-4.3".to_string(),
                         name: "Grok 4.3".to_string(),
@@ -817,6 +950,63 @@ pub async fn fetch_anthropic_models(api_key: &str) -> Result<Vec<ProviderModel>,
     Ok(models)
 }
 
+/// Fetch public model metadata from models.dev, which is the catalog used by
+/// OpenCode. These entries are useful for discovery, but are not account-
+/// verified, so they are marked as `known` rather than selectable by default.
+pub async fn fetch_models_dev_catalog() -> Result<HashMap<String, Vec<CatalogEntry>>, String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://models.dev/api.json")
+        .header("User-Agent", "Sandboxed.sh model catalog")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("API returned status {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+    let providers = body
+        .as_object()
+        .ok_or_else(|| "models.dev response was not an object".to_string())?;
+    let now = chrono::Utc::now();
+    let mut catalog: HashMap<String, Vec<CatalogEntry>> = HashMap::new();
+
+    for provider_id in DEFAULT_CATALOG_PROVIDER_IDS {
+        let Some(provider) = providers.get(*provider_id) else {
+            continue;
+        };
+        let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
+            continue;
+        };
+
+        let entries = models.iter().map(|(model_id, value)| {
+            let name = value
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or(model_id)
+                .to_string();
+            CatalogEntry {
+                id: model_id.clone(),
+                name,
+                provider_id: (*provider_id).to_string(),
+                sources: vec![CatalogSource::ModelsDev],
+                availability: CatalogAvailability::Known,
+                last_checked_at: now,
+                description: None,
+            }
+        });
+        merge_catalog_entries(&mut catalog, provider_id, entries);
+    }
+
+    Ok(catalog)
+}
+
 /// Resolve an API key for a given provider type.
 ///
 /// Checks three sources in order:
@@ -919,7 +1109,7 @@ pub fn get_api_key_for_provider(
 pub async fn fetch_model_catalog(
     ai_providers: &AIProviderStore,
     _working_dir: &Path,
-) -> HashMap<String, Vec<ProviderModel>> {
+) -> HashMap<String, Vec<CatalogEntry>> {
     let providers_list = ai_providers.list().await;
     let mut result = HashMap::new();
 
@@ -973,6 +1163,26 @@ pub async fn fetch_model_catalog(
             (t, key)
         })
         .collect();
+
+    // Fetch public catalog in parallel with provider APIs. These entries are
+    // not account-verified and are hidden unless include_unverified=true.
+    let models_dev_handle = tokio::spawn(async move {
+        match fetch_models_dev_catalog().await {
+            Ok(catalog) => {
+                let model_count: usize = catalog.values().map(Vec::len).sum();
+                tracing::info!(
+                    providers = catalog.len(),
+                    models = model_count,
+                    "Fetched public model metadata from models.dev"
+                );
+                Some(catalog)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch models.dev catalog: {}", e);
+                None
+            }
+        }
+    });
 
     // Fetch Anthropic (special format)
     let anthropic_handle = tokio::spawn(async move {
@@ -1032,11 +1242,28 @@ pub async fn fetch_model_catalog(
         }));
     }
 
-    // Collect results
+    if let Ok(Some(public_catalog)) = models_dev_handle.await {
+        for (provider_id, entries) in public_catalog {
+            merge_catalog_entries(&mut result, &provider_id, entries);
+        }
+    }
+
+    // Collect provider API results. These are account-verified and selectable
+    // by default.
+    let now = chrono::Utc::now();
     for handle in handles {
         if let Ok(Some((provider_id, models))) = handle.await {
             if !models.is_empty() {
-                result.insert(provider_id, models);
+                let entries = models.into_iter().map(|model| {
+                    CatalogEntry::from_provider_model(
+                        provider_id.clone(),
+                        model,
+                        CatalogSource::ProviderApi,
+                        CatalogAvailability::Available,
+                        now,
+                    )
+                });
+                merge_catalog_entries(&mut result, &provider_id, entries);
             }
         }
     }
@@ -1142,7 +1369,7 @@ pub async fn list_providers(
     // catalog probes can return only a currently-selected model, so replacing
     // the defaults would hide valid choices such as newly released Claude Opus.
     let cached = state.model_catalog.read().await;
-    merge_cached_provider_models(&mut config, &cached);
+    merge_cached_provider_models(&mut config, &cached, query.include_unverified);
     drop(cached);
 
     // Get the set of configured provider IDs
@@ -1177,7 +1404,7 @@ pub async fn list_backend_model_options(
 
     // Extend hardcoded defaults with the dynamic catalog.
     let cached = state.model_catalog.read().await;
-    merge_cached_provider_models(&mut config, &cached);
+    merge_cached_provider_models(&mut config, &cached, query.include_unverified);
     drop(cached);
 
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
@@ -1319,7 +1546,7 @@ pub async fn validate_model_override(
 
     // Extend hardcoded defaults with the dynamic catalog.
     let cached = state.model_catalog.read().await;
-    merge_cached_provider_models(&mut config, &cached);
+    merge_cached_provider_models(&mut config, &cached, true);
     drop(cached);
 
     // Load all providers (including configured and non-default)
@@ -1547,6 +1774,17 @@ mod tests {
     }
 
     #[test]
+    fn default_xai_catalog_includes_grok_build_for_model_routing() {
+        let defaults = default_providers_config();
+        let xai = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "xai")
+            .expect("xai provider");
+        assert!(xai.models.iter().any(|model| model.id == "grok-build"));
+    }
+
+    #[test]
     fn merge_default_provider_models_adds_new_builtin_models_to_stale_config() {
         let mut config = ProvidersConfig {
             providers: vec![Provider {
@@ -1581,14 +1819,20 @@ mod tests {
         let mut cached = HashMap::new();
         cached.insert(
             "anthropic".to_string(),
-            vec![ProviderModel {
-                id: "claude-opus-4-6".to_string(),
-                name: "Claude Opus 4.6".to_string(),
-                description: None,
-            }],
+            vec![CatalogEntry::from_provider_model(
+                "anthropic",
+                ProviderModel {
+                    id: "claude-opus-4-6".to_string(),
+                    name: "Claude Opus 4.6".to_string(),
+                    description: None,
+                },
+                CatalogSource::ProviderApi,
+                CatalogAvailability::Available,
+                chrono::Utc::now(),
+            )],
         );
 
-        merge_cached_provider_models(&mut config, &cached);
+        merge_cached_provider_models(&mut config, &cached, false);
 
         let anthropic = config
             .providers
@@ -1607,6 +1851,40 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn merge_cached_provider_models_hides_unverified_public_models_by_default() {
+        let mut config = ProvidersConfig {
+            providers: vec![Provider {
+                id: "zai".to_string(),
+                name: "Z.AI".to_string(),
+                billing: "pay-per-token".to_string(),
+                description: "GLM models".to_string(),
+                models: vec![],
+            }],
+        };
+        let mut cached = HashMap::new();
+        cached.insert(
+            "zai".to_string(),
+            vec![CatalogEntry::from_provider_model(
+                "zai",
+                ProviderModel {
+                    id: "glm-4.7-flash".to_string(),
+                    name: "GLM 4.7 Flash".to_string(),
+                    description: None,
+                },
+                CatalogSource::ModelsDev,
+                CatalogAvailability::Known,
+                chrono::Utc::now(),
+            )],
+        );
+
+        merge_cached_provider_models(&mut config, &cached, false);
+        assert!(config.providers[0].models.is_empty());
+
+        merge_cached_provider_models(&mut config, &cached, true);
+        assert_eq!(config.providers[0].models[0].id, "glm-4.7-flash");
     }
 
     /// Fetch models from all provider APIs that have credentials available,

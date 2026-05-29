@@ -293,7 +293,7 @@ source keys/release-secrets.env
 To publish an APK that was already built by GitHub Actions:
 
 ```bash
-TAG=v0.12.3
+TAG=v1.3.0
 rm -rf "/tmp/sandboxed-zapstore-${TAG}"
 mkdir -p "/tmp/sandboxed-zapstore-${TAG}"
 gh release download "${TAG}" \

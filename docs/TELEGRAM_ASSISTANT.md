@@ -1,31 +1,48 @@
-# Telegram Assistant
+# Assistant Gateway
 
-Connect a Telegram bot to sandboxed.sh so users can chat with an AI assistant
-directly from Telegram.
+Connect a messaging gateway to sandboxed.sh while the assistant runtime moves
+to Hermes. The current built-in compatibility bridge still uses Telegram
+webhooks, and the dashboard manages it from the top-level **Assistant** page.
 
 ## Overview
 
-A **Telegram Assistant** is a persistent mission (mode: `assistant`) that
-receives messages from a Telegram bot via webhooks and streams responses back.
-The assistant has full access to the workspace's tools and library — just like
-any other mission.
+An **Assistant Gateway** is the operator-facing bridge between chat transports
+and sandboxed.sh mission control. During the Hermes cutover there are two
+important pieces:
 
-There are two ways to create a Telegram assistant:
+- **Hermes runtime**: the target assistant runtime and memory owner. It is an
+  external service and is not shipped by this repository.
+- **Telegram compatibility bridge**: the existing sandboxed.sh webhook path used
+  until Hermes owns the bot webhook.
 
-1. **Standalone bot** (recommended) — auto-creates a new mission per Telegram
-   chat. Configured from **Settings → Telegram** in the dashboard.
+The current compatibility bridge creates assistant-mode missions and routes
+Telegram messages to them. Hermes should replace that runtime by calling
+`assistant-mcp` for sandboxed.sh mission and workspace control. See
+[Hermes Assistant Migration](HERMES_ASSISTANT_MIGRATION.md) for the full
+handoff contract.
+
+There are two supported compatibility setups:
+
+1. **Standalone gateway** (recommended during cutover) — auto-creates a new
+   mission per Telegram chat. Configured from **Assistant** in the dashboard.
 2. **Per-mission channel** — attaches a bot to an existing mission via the API.
    All chats share one mission context.
 
-## Dashboard Setup (Standalone Bot)
+The legacy `/settings/telegram` dashboard route redirects to the top-level
+Assistant page. New operator docs and links should use `/assistant`.
 
-1. Open **Settings → Telegram** in the dashboard.
-2. Click **Create Bot**.
-3. Paste your bot token (from [@BotFather](https://t.me/BotFather)).
-4. Choose a backend, model, workspace, and trigger mode.
-5. Click **Create**.
+## Dashboard Setup (Standalone Gateway)
 
-The bot is now live. Each Telegram chat automatically gets its own mission.
+1. Open **Assistant** in the dashboard.
+2. Check the **MCP** and **Runtime** readiness cards.
+3. Click **Add Gateway**.
+4. Paste your bot token from [@BotFather](https://t.me/BotFather).
+5. Choose a backend, model, workspace, and trigger mode.
+6. Click **Add Gateway**.
+
+If the compatibility bridge remains active, each Telegram chat automatically
+gets its own mission. Once Hermes owns the bot webhook, configure the gateway in
+Hermes instead and use sandboxed.sh through `assistant-mcp`.
 
 ## API Setup (Per-Mission Channel)
 
@@ -44,7 +61,7 @@ POST /api/control/missions
 Authorization: Bearer <token>
 
 {
-  "title": "My Telegram Assistant"
+  "title": "My Assistant Gateway"
 }
 ```
 
@@ -70,7 +87,7 @@ This will:
 - Register a Telegram webhook so the bot receives messages
 - Start routing messages to the mission
 
-### 4. Create a Standalone Bot (Auto-Create Missions)
+### 4. Create a Standalone Gateway (Auto-Create Missions)
 
 ```
 POST /api/control/telegram/bots
@@ -103,7 +120,7 @@ specified defaults.
 | `trigger_mode` | No | See [Trigger Modes](#trigger-modes). Default: `mention_or_dm` |
 | `instructions` | No | System instructions prepended to every message |
 
-### Standalone Bot Additional Fields
+### Standalone Gateway Additional Fields
 
 | Field | Required | Description |
 |---|---|---|
@@ -147,13 +164,13 @@ message to [@userinfobot](https://t.me/userinfobot).
 
 ## API Reference
 
-### Standalone Bots
+### Standalone Gateways
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/control/telegram/bots` | List all standalone bots |
-| `POST` | `/api/control/telegram/bots` | Create a standalone bot |
-| `GET` | `/api/control/telegram/bots/:id/chats` | List chats for a bot |
+| `GET` | `/api/control/telegram/bots` | List all standalone gateways |
+| `POST` | `/api/control/telegram/bots` | Create a standalone gateway |
+| `GET` | `/api/control/telegram/bots/:id/chats` | List chats for a gateway |
 
 ### Per-Mission Channels
 
@@ -180,13 +197,24 @@ message to [@userinfobot](https://t.me/userinfobot).
 
 ## Architecture
 
+### Compatibility Bridge
+
+```text
+Telegram -> webhook -> /api/telegram/webhook/:channel_id
+         -> TelegramBridge routes to ChannelContext
+         -> ControlCommand::UserMessage { target_mission_id }
+         -> MissionRunner (parallel execution)
+         -> AgentEvent stream
+         -> TelegramBridge sends response via editMessageText
 ```
-Telegram → webhook → /api/telegram/webhook/:channel_id
-         → TelegramBridge routes to ChannelContext
-         → ControlCommand::UserMessage { target_mission_id }
-         → MissionRunner (parallel execution)
-         → AgentEvent stream
-         → TelegramBridge sends response via editMessageText
+
+### Hermes Target
+
+```text
+Telegram / other chat
+  -> Hermes gateway + memory
+  -> assistant-mcp
+  -> sandboxed.sh mission/workspace/model APIs
 ```
 
 Key design decisions:
@@ -204,8 +232,11 @@ Key design decisions:
   token is rejected (409 Conflict) to prevent webhook conflicts.
 - **Webhook rollback**: If webhook registration fails during channel creation,
   the channel is deleted from the database to avoid inconsistent state.
-- **Assistant persistence**: Assistant-mode missions are not auto-completed
-  after replies — they stay active for future messages.
+- **Assistant persistence**: Compatibility assistant-mode missions are not
+  auto-completed after replies; they stay active for future messages.
+- **Single webhook owner**: Telegram only supports one active webhook per bot.
+  Do not keep the compatibility bridge and Hermes gateway active for the same
+  bot token at the same time.
 
 ## Security
 
@@ -220,8 +251,8 @@ Key design decisions:
 ## Troubleshooting
 
 **Bot not responding?**
-1. Check the channel is active: `GET /api/control/telegram/bots`
-2. Toggle the channel off and on to re-register the webhook
+1. Check the gateway is active: `GET /api/control/telegram/bots`
+2. Toggle the gateway off and on to re-register the webhook
 3. Check server logs for `boot_from_store` or webhook registration errors
 4. Ensure `SANDBOXED_PUBLIC_URL` is set and publicly accessible
 

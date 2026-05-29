@@ -46,6 +46,38 @@ fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").to_string()
 }
 
+fn parse_registry_skill_line(line: &str) -> Option<RegistrySkillListing> {
+    let line = line.trim();
+    if line.is_empty()
+        || line.starts_with("Search")
+        || line.starts_with("─")
+        || line.starts_with("Install with")
+        || line.starts_with("└")
+        || line.starts_with("http")
+        || !line.contains('/')
+        || !line.contains('@')
+    {
+        return None;
+    }
+
+    let parts: Vec<&str> = line.splitn(2, '@').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let repo = parts[0].trim();
+    let skill_name = parts[1].split_whitespace().next().unwrap_or("").trim();
+    if repo.is_empty() || skill_name.is_empty() {
+        return None;
+    }
+
+    Some(RegistrySkillListing {
+        identifier: repo.to_string(),
+        name: skill_name.to_string(),
+        description: None,
+    })
+}
+
 /// Search for skills in the registry.
 ///
 /// Uses `bunx skills find <query>` to search for skills.
@@ -74,40 +106,13 @@ pub async fn search_skills(query: &str) -> Result<Vec<RegistrySkillListing>> {
     // Parse lines looking for skill identifiers like "owner/repo@skill"
     for line in stdout.lines() {
         let line = line.trim();
-        // Skip empty lines, headers, and URLs
-        if line.is_empty()
-            || line.starts_with("Search")
-            || line.starts_with("─")
-            || line.starts_with("Install with")
-            || line.starts_with("└")
-            || line.starts_with("http")
-        {
-            continue;
-        }
-
-        // Look for lines with owner/repo@skill format
-        if line.contains('/') && line.contains('@') {
-            // Parse "owner/repo@skill-name"
-            let parts: Vec<&str> = line.splitn(2, '@').collect();
-            if parts.len() == 2 {
-                let repo = parts[0].trim();
-                let skill_name = parts[1].trim();
-
-                // Create identifier
-                let identifier = format!("{}/{}", repo, skill_name);
-
-                // Skip duplicates
-                if seen.contains(&identifier) {
-                    continue;
-                }
-                seen.insert(identifier.clone());
-
-                skills.push(RegistrySkillListing {
-                    identifier: repo.to_string(),
-                    name: skill_name.to_string(),
-                    description: None,
-                });
+        if let Some(skill) = parse_registry_skill_line(line) {
+            let identifier = format!("{}/{}", skill.identifier, skill.name);
+            if seen.contains(&identifier) {
+                continue;
             }
+            seen.insert(identifier);
+            skills.push(skill);
         }
     }
 
@@ -174,14 +179,16 @@ pub async fn install_skill(
     // Set the working directory
     cmd.current_dir(target_dir);
     cmd.env("NO_COLOR", "1");
+    cmd.env("TERM", "dumb");
+    cmd.env("CI", "1");
 
     let output = cmd
         .output()
         .await
         .context("Failed to run bunx skills add")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
 
     // Parse installed skills from output
     let mut installed = Vec::new();
@@ -207,7 +214,20 @@ pub async fn install_skill(
             }
         }
     } else {
-        errors.push(format!("Installation failed: {}", stderr));
+        let detail = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = if detail.is_empty() {
+            format!(
+                "bunx skills add exited with status {} and did not print output",
+                output.status
+            )
+        } else {
+            detail
+        };
+        errors.push(format!("Installation failed: {}", detail));
     }
 
     Ok(InstallResult { installed, errors })
@@ -266,6 +286,16 @@ pub async fn update_all(working_dir: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_registry_skill_line_strips_install_counts() {
+        let listing =
+            parse_registry_skill_line("leonxlnx/taste-skill@design-taste-frontend 78.6K installs")
+                .unwrap();
+
+        assert_eq!(listing.identifier, "leonxlnx/taste-skill");
+        assert_eq!(listing.name, "design-taste-frontend");
+    }
 
     #[tokio::test]
     async fn test_bun_available() {

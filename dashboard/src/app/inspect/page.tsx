@@ -32,6 +32,10 @@ interface SystemMetrics {
   timestamp_ms: number;
 }
 
+function metricNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
 function SystemHealthCard() {
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [connected, setConnected] = useState(false);
@@ -91,6 +95,15 @@ function SystemHealthCard() {
     }
   }, [connected, connect]);
 
+  const displayMetrics = metrics
+    ? {
+        cpuPercent: metricNumber(metrics.cpu_percent),
+        memoryPercent: metricNumber(metrics.memory_percent),
+        memoryUsed: metricNumber(metrics.memory_used),
+        memoryTotal: metricNumber(metrics.memory_total),
+      }
+    : null;
+
   return (
     <Link
       href="/inspect/system"
@@ -104,7 +117,7 @@ function SystemHealthCard() {
         <ArrowRight className="h-3.5 w-3.5 text-white/20 group-hover:text-white/40 transition-colors" />
       </div>
 
-      {!metrics ? (
+      {!displayMetrics ? (
         <div className="flex items-center justify-center py-4">
           <Loader className="h-4 w-4 animate-spin text-white/30" />
         </div>
@@ -117,9 +130,9 @@ function SystemHealthCard() {
             </div>
             <span className={cn(
               'text-xs font-medium tabular-nums',
-              metrics.cpu_percent > 80 ? 'text-amber-400' : 'text-white/80'
+              displayMetrics.cpuPercent > 80 ? 'text-amber-400' : 'text-white/80'
             )}>
-              {metrics.cpu_percent.toFixed(0)}%
+              {displayMetrics.cpuPercent.toFixed(0)}%
             </span>
           </div>
 
@@ -130,9 +143,9 @@ function SystemHealthCard() {
             </div>
             <span className={cn(
               'text-xs font-medium tabular-nums',
-              metrics.memory_percent > 80 ? 'text-amber-400' : 'text-white/80'
+              displayMetrics.memoryPercent > 80 ? 'text-amber-400' : 'text-white/80'
             )}>
-              {formatBytes(metrics.memory_used)} / {formatBytes(metrics.memory_total)}
+              {formatBytes(displayMetrics.memoryUsed)} / {formatBytes(displayMetrics.memoryTotal)}
             </span>
           </div>
         </div>

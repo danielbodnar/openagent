@@ -48,11 +48,13 @@ fn main() -> io::Result<()> {
     }
 
     let listener = UnixListener::bind(&socket_path)?;
-    // Make socket world-accessible (containers run as root)
+    // Restrict to owner + root. Container workspaces bind-mount the socket and
+    // run as root on the host, so root bypasses the mode check; unprivileged
+    // local users on the host are now denied.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o777))?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))?;
     }
 
     eprintln!("[fido-agent-proxy] Listening on {}", socket_path);

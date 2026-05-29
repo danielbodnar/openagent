@@ -24,6 +24,8 @@
    ========================================================================= */
 
 :root {
+  color-scheme: dark;
+
   /* Backgrounds (dark mode) - No pure black */
   --background: 18 18 20; /* #121214 - primary surface */
   --background-elevated: 28 28 30; /* #1C1C1E - cards, panels */
@@ -47,6 +49,77 @@
   /* Borders - subtle */
   --border: 255 255 255; /* Used with /0.06 */
   --border-elevated: 255 255 255; /* Used with /0.08 */
+
+  /* Code surfaces */
+  --code-background: 30 32 38;
+  --code-border: 255 255 255;
+  --code-foreground: 220 224 232;
+  --code-inline-background: 38 41 58;
+  --code-inline-foreground: 199 210 254;
+
+  /* Brand mark */
+  --brand-logo-background: 18 18 20;
+  --brand-logo-mark: 129 140 248;
+
+  /* Semantic aliases for themeable components */
+  --surface: var(--background);
+  --surface-raised: var(--background-elevated);
+  --surface-muted: var(--background-tertiary);
+  --text: var(--foreground);
+  --text-muted: var(--foreground-secondary);
+  --border-subtle: var(--border);
+  --accent-soft: 99 102 241;
+  --code-block-bg: var(--code-background);
+  --code-inline-bg: var(--code-inline-background);
+  --code-inline-text: var(--code-inline-foreground);
+  --message-user-bg: var(--accent);
+  --message-user-text: 255 255 255;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* Backgrounds (light mode) */
+  --background: 247 248 251; /* #F7F8FB - primary surface */
+  --background-elevated: 255 255 255; /* cards, panels */
+  --background-tertiary: 235 238 244; /* nested elements */
+
+  /* Text Hierarchy */
+  --foreground: 17 24 39; /* #111827 */
+  --foreground-secondary: 75 85 99; /* #4B5563 */
+  --foreground-tertiary: 107 114 128; /* #6B7280 */
+  --foreground-muted: 156 163 175; /* #9CA3AF */
+
+  /* Borders */
+  --border: 17 24 39;
+  --border-elevated: 17 24 39;
+
+  /* Code surfaces */
+  --code-background: 244 246 250;
+  --code-border: 17 24 39;
+  --code-foreground: 31 41 55;
+  --code-inline-background: 224 231 255;
+  --code-inline-foreground: 49 46 129;
+
+  /* Semantic aliases */
+  --surface: var(--background);
+  --surface-raised: var(--background-elevated);
+  --surface-muted: var(--background-tertiary);
+  --text: var(--foreground);
+  --text-muted: var(--foreground-secondary);
+  --border-subtle: var(--border);
+  --accent-soft: 224 231 255;
+  --code-block-bg: var(--code-background);
+  --code-inline-bg: var(--code-inline-background);
+  --code-inline-text: var(--code-inline-foreground);
+  --message-user-bg: 224 231 255;
+  --message-user-text: 49 46 129;
+  --brand-logo-background: 238 242 255;
+  --brand-logo-mark: 30 64 175;
 }
 
 @theme inline {
@@ -105,6 +178,18 @@ body {
   min-height: 100vh;
 }
 
+:root[data-theme="light"] {
+  button:focus-visible,
+  a:focus-visible {
+    background-color: rgba(17, 24, 39, 0.06) !important;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: rgb(var(--foreground-tertiary) / 0.75) !important;
+  }
+}
+
 /* =========================================================================
    Focus States - subtle background changes, no outlines
    ========================================================================= */
@@ -156,6 +241,488 @@ select:focus-visible {
 
 ::-webkit-scrollbar-thumb:hover {
   background: rgb(var(--foreground-tertiary));
+}
+
+:root[data-theme="light"] {
+  /*
+   * The dashboard was originally authored with dark-mode utility classes
+   * such as text-white/60, bg-white/[0.04], and border-white/[0.06].
+   * Remap those neutral utilities in light mode so the existing dark theme
+   * stays intact while system light mode gets readable surfaces and text.
+   */
+  [class~="text-white"],
+  .text-white {
+    color: rgb(var(--foreground) / 0.88);
+  }
+
+  [class~="text-white/90"],
+  [class~="text-white/85"],
+  [class~="text-white/80"],
+  [class~="text-white/75"],
+  [class~="text-white/70"],
+  .text-white\/90,
+  .text-white\/85,
+  .text-white\/80,
+  .text-white\/75,
+  .text-white\/70 {
+    color: rgb(var(--foreground) / 0.78);
+  }
+
+  [class~="text-white/65"],
+  [class~="text-white/60"],
+  [class~="text-white/55"],
+  [class~="text-white/50"],
+  .text-white\/65,
+  .text-white\/60,
+  .text-white\/55,
+  .text-white\/50 {
+    color: rgb(var(--foreground-secondary) / 0.9);
+  }
+
+  [class~="text-white/45"],
+  [class~="text-white/40"],
+  [class~="text-white/35"],
+  [class~="text-white/30"],
+  [class~="text-white/25"],
+  [class~="text-white/20"],
+  [class~="text-white/15"],
+  [class~="text-white/10"],
+  .text-white\/45,
+  .text-white\/40,
+  .text-white\/35,
+  .text-white\/30,
+  .text-white\/25,
+  .text-white\/20,
+  .text-white\/15,
+  .text-white\/10 {
+    color: rgb(var(--foreground-tertiary) / 0.92);
+  }
+
+  [class~="hover:text-white"]:hover,
+  [class~="hover:text-white/90"]:hover,
+  [class~="hover:text-white/80"]:hover,
+  [class~="hover:text-white/75"]:hover,
+  [class~="hover:text-white/70"]:hover {
+    color: rgb(var(--foreground) / 0.82);
+  }
+
+  [class~="hover:text-white/60"]:hover,
+  [class~="hover:text-white/50"]:hover {
+    color: rgb(var(--foreground-secondary) / 0.95);
+  }
+
+  [class~="hover:text-white/40"]:hover {
+    color: rgb(var(--foreground-tertiary) / 0.95);
+  }
+
+  [class~="placeholder-white/30"]::placeholder,
+  [class~="placeholder:text-white/30"]::placeholder,
+  [class~="placeholder:text-white/25"]::placeholder,
+  [class~="placeholder:text-white/20"]::placeholder {
+    color: rgb(var(--foreground-tertiary) / 0.72) !important;
+  }
+
+  [class~="text-indigo-300"] {
+    color: rgb(67 56 202);
+  }
+
+  [class~="text-indigo-400"] {
+    color: rgb(79 70 229);
+  }
+
+  [class~="text-indigo-400/70"],
+  [class~="text-indigo-400/60"],
+  [class~="text-indigo-400/50"],
+  [class~="text-indigo-300/60"] {
+    color: rgb(79 70 229 / 0.86);
+  }
+
+  [class~="text-emerald-400"] {
+    color: rgb(4 120 87);
+  }
+
+  [class~="text-emerald-300"],
+  [class~="text-emerald-300/80"],
+  [class~="text-emerald-300/70"],
+  [class~="text-emerald-300/60"] {
+    color: rgb(6 95 70 / 0.95);
+  }
+
+  [class~="text-emerald-400/70"] {
+    color: rgb(4 120 87 / 0.9);
+  }
+
+  [class~="text-emerald-400/80"],
+  [class~="text-emerald-400/60"] {
+    color: rgb(4 120 87 / 0.88);
+  }
+
+  [class~="text-amber-400"],
+  [class~="text-amber-300"],
+  [class~="text-amber-200"] {
+    color: rgb(180 83 9);
+  }
+
+  [class~="text-orange-400"],
+  [class~="text-orange-300"] {
+    color: rgb(194 65 12);
+  }
+
+  [class~="text-red-400"] {
+    color: rgb(185 28 28);
+  }
+
+  [class~="text-red-400/70"] {
+    color: rgb(185 28 28 / 0.85);
+  }
+
+  [class~="text-red-300"],
+  [class~="text-red-200"],
+  [class~="text-red-300/80"] {
+    color: rgb(185 28 28 / 0.9);
+  }
+
+  [class~="text-rose-300"],
+  [class~="text-rose-400"] {
+    color: rgb(190 18 60);
+  }
+
+  [class~="text-cyan-300"],
+  [class~="text-cyan-400"] {
+    color: rgb(14 116 144);
+  }
+
+  [class~="text-violet-300"],
+  [class~="text-violet-400"] {
+    color: rgb(109 40 217);
+  }
+
+  /* Tinted surfaces beyond indigo — let the soft fills render with light-theme
+     friendly tones so the small status pills (queue badge, stop button, etc.)
+     stay legible without re-skinning every component. */
+  [class~="bg-amber-500/10"],
+  [class~="bg-amber-500/15"] {
+    background-color: rgb(254 243 199 / 0.7);
+  }
+  [class~="bg-amber-500/20"],
+  [class~="bg-amber-500/25"],
+  [class~="bg-amber-500/30"] {
+    background-color: rgb(252 211 77 / 0.55);
+  }
+  [class~="hover:bg-amber-500/15"]:hover,
+  [class~="hover:bg-amber-500/25"]:hover,
+  [class~="hover:bg-amber-500/30"]:hover {
+    background-color: rgb(252 211 77 / 0.75);
+  }
+  [class~="border-amber-500/20"],
+  [class~="border-amber-500/25"],
+  [class~="border-amber-500/30"] {
+    border-color: rgb(217 119 6 / 0.5);
+  }
+
+  [class~="bg-red-500/10"],
+  [class~="bg-red-500/15"] {
+    background-color: rgb(254 226 226 / 0.7);
+  }
+  [class~="bg-red-500/20"],
+  [class~="bg-red-500/25"],
+  [class~="bg-red-500/30"] {
+    background-color: rgb(252 165 165 / 0.5);
+  }
+  [class~="hover:bg-red-500/15"]:hover,
+  [class~="hover:bg-red-500/25"]:hover,
+  [class~="hover:bg-red-500/30"]:hover {
+    background-color: rgb(252 165 165 / 0.7);
+  }
+  [class~="border-red-500/20"],
+  [class~="border-red-500/25"],
+  [class~="border-red-500/30"] {
+    border-color: rgb(220 38 38 / 0.45);
+  }
+
+  [class~="bg-emerald-500/10"],
+  [class~="bg-emerald-500/15"] {
+    background-color: rgb(209 250 229 / 0.7);
+  }
+  [class~="bg-emerald-500/20"],
+  [class~="bg-emerald-500/25"],
+  [class~="bg-emerald-500/30"] {
+    background-color: rgb(110 231 183 / 0.45);
+  }
+  [class~="hover:bg-emerald-500/15"]:hover,
+  [class~="hover:bg-emerald-500/25"]:hover {
+    background-color: rgb(110 231 183 / 0.7);
+  }
+  [class~="border-emerald-500/20"],
+  [class~="border-emerald-500/25"],
+  [class~="border-emerald-500/30"] {
+    border-color: rgb(4 120 87 / 0.45);
+  }
+
+  [class~="hover:text-indigo-300"]:hover {
+    color: rgb(67 56 202);
+  }
+
+  [class~="hover:text-red-300"]:hover {
+    color: rgb(153 27 27);
+  }
+
+  [class~="bg-white/[0.01]"],
+  [class~="bg-white/[0.02]"],
+  [class~="bg-white/[0.025]"],
+  [class~="bg-white/[0.03]"],
+  [class~="bg-white/[0.04]"],
+  [class~="bg-white/[0.045]"],
+  [class~="bg-white/[0.05]"],
+  [class~="bg-white/[0.06]"],
+  [class~="bg-white/[0.08]"],
+  [class~="bg-white/5"],
+  [class~="bg-white/10"],
+  .bg-white\/\[0\.01\],
+  .bg-white\/\[0\.02\],
+  .bg-white\/\[0\.025\],
+  .bg-white\/\[0\.03\],
+  .bg-white\/\[0\.04\],
+  .bg-white\/\[0\.045\],
+  .bg-white\/\[0\.05\],
+  .bg-white\/\[0\.06\],
+  .bg-white\/\[0\.08\],
+  .bg-white\/5,
+  .bg-white\/10 {
+    background-color: rgb(17 24 39 / 0.04);
+  }
+
+  [class~="bg-indigo-500/10"] {
+    background-color: rgb(224 231 255 / 0.82);
+  }
+
+  [class~="bg-indigo-500/15"] {
+    background-color: rgb(224 231 255 / 0.9);
+  }
+
+  [class~="bg-indigo-500/20"],
+  [class~="bg-indigo-500/25"],
+  [class~="bg-indigo-500/30"],
+  [class~="bg-indigo-500/40"] {
+    background-color: rgb(199 210 254 / 0.72);
+  }
+
+  [class~="hover:bg-indigo-500/25"]:hover,
+  [class~="hover:bg-indigo-500/30"]:hover {
+    background-color: rgb(165 180 252 / 0.6);
+  }
+
+  [class*="hover:bg-white"]:hover {
+    background-color: rgb(17 24 39 / 0.07);
+  }
+
+  [class~="border-white/[0.04]"],
+  [class~="border-white/[0.05]"],
+  [class~="border-white/[0.06]"],
+  [class~="border-white/[0.08]"],
+  [class~="border-white/[0.12]"],
+  [class~="border-white/10"],
+  [class~="border-white/20"],
+  .border-white\/\[0\.04\],
+  .border-white\/\[0\.05\],
+  .border-white\/\[0\.06\],
+  .border-white\/\[0\.08\],
+  .border-white\/\[0\.12\],
+  .border-white\/10,
+  .border-white\/20 {
+    border-color: rgb(17 24 39 / 0.09);
+  }
+
+  [class*="hover:border-white"]:hover {
+    border-color: rgb(17 24 39 / 0.16);
+  }
+
+  [class~="bg-black/20"],
+  [class~="bg-black/40"],
+  [class~="bg-black/50"],
+  [class~="bg-black/60"],
+  [class~="bg-black/80"] {
+    background-color: rgb(255 255 255 / 0.82);
+  }
+
+  [class~="bg-[#1a1a1c]"],
+  [class~="bg-[#1a1a1a]"],
+  [class~="bg-[#1a1a1f]"],
+  [class~="bg-[#1a1a2e]"],
+  [class~="bg-[#1c1c1e]/95"],
+  [class~="bg-[#121214]"],
+  [class~="bg-[#111113]"],
+  [class~="bg-[#0f0f11]"] {
+    background-color: rgb(255 255 255);
+  }
+
+  [class~="bg-slate-800"],
+  [class~="[&>option]:bg-slate-800"] > option,
+  [class~="[&>optgroup]:bg-slate-900"] > optgroup {
+    background-color: rgb(255 255 255);
+  }
+
+  [class~="[&>option]:text-white"] > option,
+  [class~="[&>optgroup]:text-white/70"] > optgroup {
+    color: rgb(var(--foreground));
+  }
+
+  [class*="bg-indigo-"][class*="text-white"],
+  [class*="bg-violet-"][class*="text-white"],
+  [class*="bg-red-"][class*="text-white"],
+  [class*="bg-emerald-"][class*="text-white"],
+  [class*="bg-green-"][class*="text-white"],
+  [class*="bg-blue-"][class*="text-white"],
+  [class*="bg-cyan-"][class*="text-white"],
+  [class*="bg-amber-"][class*="text-white"],
+  [class*="bg-orange-"][class*="text-white"] {
+    color: #ffffff;
+  }
+
+  [class~="bg-indigo-500/10"][class*="text-white"],
+  [class~="bg-indigo-500/15"][class*="text-white"],
+  [class~="bg-indigo-500/20"][class*="text-white"],
+  [class~="bg-indigo-500/30"][class*="text-white"] {
+    color: rgb(var(--foreground) / 0.88);
+  }
+
+  /* Soft-tinted warning/error/accent backgrounds keep dark foreground in light
+     mode — the broad bg-X + text-white rule above is intended for solid color
+     buttons, not 10-15% alpha tints used as row highlights. */
+  [class~="bg-amber-500/10"][class*="text-white"],
+  [class~="bg-amber-500/15"][class*="text-white"],
+  [class~="bg-amber-500/20"][class*="text-white"],
+  [class~="bg-amber-500/25"][class*="text-white"],
+  [class~="bg-amber-500/30"][class*="text-white"],
+  [class~="bg-red-500/10"][class*="text-white"],
+  [class~="bg-red-500/15"][class*="text-white"],
+  [class~="bg-red-500/20"][class*="text-white"],
+  [class~="bg-red-500/25"][class*="text-white"],
+  [class~="bg-red-500/30"][class*="text-white"],
+  [class~="bg-orange-500/10"][class*="text-white"],
+  [class~="bg-orange-500/15"][class*="text-white"],
+  [class~="bg-orange-500/20"][class*="text-white"],
+  [class~="bg-emerald-500/10"][class*="text-white"],
+  [class~="bg-emerald-500/15"][class*="text-white"],
+  [class~="bg-emerald-500/20"][class*="text-white"],
+  [class~="bg-cyan-500/10"][class*="text-white"],
+  [class~="bg-cyan-500/15"][class*="text-white"],
+  [class~="bg-cyan-500/20"][class*="text-white"],
+  [class~="bg-violet-500/10"][class*="text-white"],
+  [class~="bg-violet-500/15"][class*="text-white"],
+  [class~="bg-violet-500/20"][class*="text-white"] {
+    color: rgb(var(--foreground) / 0.88);
+  }
+}
+
+.mission-selector-trigger {
+  background-color: rgb(var(--background-elevated) / 0.62);
+  border: 1px solid rgb(var(--border) / 0.08);
+  color: rgb(var(--foreground-secondary));
+}
+
+.mission-selector-trigger:hover {
+  background-color: rgb(var(--background-tertiary) / 0.45);
+}
+
+.mission-selector-title {
+  color: rgb(var(--foreground-secondary));
+}
+
+.mission-selector-action {
+  color: rgb(var(--foreground-tertiary));
+}
+
+.mission-selector-action:hover,
+.mission-selector-action:focus-visible {
+  background-color: rgb(var(--border) / 0.06);
+  color: rgb(var(--foreground));
+}
+
+.mission-title-input {
+  background-color: rgb(var(--background) / 0.58);
+  border-color: rgb(var(--border) / 0.12);
+  color: rgb(var(--foreground) / 0.86);
+}
+
+:root[data-theme="light"] {
+  .mission-selector-trigger {
+    background-color: rgb(var(--background-elevated) / 0.9);
+    border-color: rgb(var(--border) / 0.1);
+    color: rgb(var(--foreground-secondary));
+  }
+
+  .mission-selector-trigger:hover {
+    background-color: rgb(var(--background-tertiary) / 0.65);
+  }
+}
+
+.user-message-bubble {
+  color: rgb(var(--message-user-text));
+}
+
+.user-message-bubble * {
+  color: inherit;
+}
+
+.user-message-bubble-solid {
+  background-color: rgb(var(--message-user-bg));
+  border: 1px solid rgb(var(--accent) / 0.24);
+}
+
+.user-message-bubble-queued {
+  background-color: rgb(var(--message-user-bg) / 0.2);
+  border-color: rgb(var(--accent) / 0.58);
+}
+
+:root[data-theme="light"] {
+  .user-message-bubble-solid {
+    background-color: rgb(var(--message-user-bg));
+    border-color: rgb(var(--accent) / 0.34);
+  }
+
+  .user-message-bubble-queued {
+    background-color: rgb(238 242 255);
+    border-color: rgb(var(--accent) / 0.58);
+  }
+}
+
+.mission-switcher-row-selected {
+  color: rgb(var(--message-user-text) / 0.92);
+}
+
+.mission-switcher-row-selected * {
+  color: inherit;
+}
+
+:root[data-theme="light"] {
+  .mission-switcher-description {
+    color: rgb(var(--foreground-secondary) / 0.92) !important;
+  }
+
+  .mission-switcher-description-muted {
+    color: rgb(var(--foreground-tertiary) / 0.96) !important;
+  }
+
+  .mission-switcher-row-selected [class*="text-white"],
+  .mission-switcher-row-selected [class*="text-indigo"],
+  .mission-switcher-row-selected [class*="text-violet"],
+  .mission-switcher-row-selected [class*="text-cyan"] {
+    color: inherit !important;
+  }
+
+  .mission-switcher-row-selected .mission-switcher-description,
+  .mission-switcher-row-selected .mission-switcher-description-muted {
+    color: rgb(var(--message-user-text) / 0.82) !important;
+  }
+}
+
+:root[data-theme="light"] {
+  .workbench-mission-description {
+    background-color: rgb(255 255 255 / 0.76) !important;
+    border-color: rgb(17 24 39 / 0.1) !important;
+    color: rgb(var(--foreground-secondary) / 0.95) !important;
+  }
 }
 
 /* =========================================================================
@@ -296,9 +863,40 @@ select:focus-visible {
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
+:root[data-theme="light"] {
+  .glass-panel {
+    background: rgba(255, 255, 255, 0.76);
+    border-color: rgba(17, 24, 39, 0.09);
+    box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
+  }
+}
+
 .glass {
   background: rgb(var(--background-elevated) / 0.7);
   backdrop-filter: blur(20px) saturate(180%);
+}
+
+.panel {
+  background: rgb(var(--surface-raised) / 0.86);
+  border: 1px solid rgb(var(--border-subtle) / 0.08);
+}
+
+.muted-text {
+  color: rgb(var(--text-muted) / 0.86);
+}
+
+.border-subtle {
+  border-color: rgb(var(--border-subtle) / 0.08);
+}
+
+.icon-button {
+  color: rgb(var(--text-muted) / 0.72);
+  transition: background-color 150ms ease-out, color 150ms ease-out;
+}
+
+.icon-button:hover {
+  background-color: rgb(var(--text) / 0.06);
+  color: rgb(var(--text) / 0.9);
 }
 
 /* =========================================================================
@@ -312,9 +910,28 @@ select:focus-visible {
   transition: background-color 150ms ease-out, border-color 150ms ease-out;
 }
 
+:root[data-theme="light"] {
+  .card {
+    background: rgba(255, 255, 255, 0.78);
+    border-color: rgba(17, 24, 39, 0.08);
+  }
+
+  .card:hover {
+    background: rgba(255, 255, 255, 0.95);
+    border-color: rgba(17, 24, 39, 0.14);
+  }
+}
+
 .card:hover {
   background: rgba(255, 255, 255, 0.04);
   border-color: rgba(255, 255, 255, 0.08);
+}
+
+:root[data-theme="light"] {
+  .card:hover {
+    background: rgba(255, 255, 255, 0.95);
+    border-color: rgba(17, 24, 39, 0.14);
+  }
 }
 
 .card-interactive {
@@ -332,6 +949,13 @@ select:focus-visible {
   backdrop-filter: blur(20px);
 }
 
+:root[data-theme="light"] {
+  .stat-panel {
+    background: rgba(255, 255, 255, 0.82);
+    border-color: rgba(17, 24, 39, 0.09);
+  }
+}
+
 .stat-label {
   font-size: 10px;
   text-transform: uppercase;
@@ -343,14 +967,239 @@ select:focus-visible {
 .stat-value {
   font-size: 1.5rem;
   font-weight: 300;
-  color: white;
+  color: rgb(var(--foreground));
   font-variant-numeric: tabular-nums;
 }
 
 .stat-suffix {
   font-size: 0.875rem;
-  color: rgba(255, 255, 255, 0.5);
+  color: rgb(var(--foreground-secondary) / 0.85);
   margin-left: 0.125rem;
+}
+
+/* =========================================================================
+   Harness Component Controls
+   ========================================================================= */
+.harness-status-badge {
+  min-height: 1.25rem;
+  border-width: 1px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.harness-status-badge-emerald {
+  border-color: rgb(16 185 129 / 0.3);
+  background-color: rgb(16 185 129 / 0.1);
+  color: rgb(110 231 183);
+}
+
+.harness-status-badge-amber {
+  border-color: rgb(245 158 11 / 0.3);
+  background-color: rgb(245 158 11 / 0.1);
+  color: rgb(252 211 77);
+}
+
+.harness-status-badge-red {
+  border-color: rgb(239 68 68 / 0.3);
+  background-color: rgb(239 68 68 / 0.1);
+  color: rgb(252 165 165);
+}
+
+.harness-status-dot-emerald {
+  background-color: rgb(52 211 153);
+}
+
+.harness-status-dot-amber {
+  background-color: rgb(251 191 36);
+}
+
+.harness-status-dot-red {
+  background-color: rgb(248 113 113);
+}
+
+.harness-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  min-height: 1.625rem;
+  border-radius: 0.5rem;
+  border-width: 1px;
+  padding: 0.25rem 0.625rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+  cursor: pointer;
+}
+
+.harness-action svg {
+  width: 0.75rem;
+  height: 0.75rem;
+  flex-shrink: 0;
+}
+
+.harness-action:disabled,
+.harness-icon-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.harness-action-compact {
+  min-height: 1.375rem;
+  border-radius: 0.375rem;
+  padding: 0.125rem 0.45rem;
+  font-size: 0.625rem;
+  line-height: 0.875rem;
+}
+
+.harness-action-primary {
+  border-color: rgb(99 102 241 / 0.3);
+  background-color: rgb(99 102 241 / 0.18);
+  color: rgb(199 210 254);
+}
+
+.harness-action-primary:hover {
+  background-color: rgb(99 102 241 / 0.28);
+}
+
+.harness-action-success {
+  border-color: rgb(16 185 129 / 0.3);
+  background-color: rgb(16 185 129 / 0.16);
+  color: rgb(110 231 183);
+}
+
+.harness-action-success:hover {
+  background-color: rgb(16 185 129 / 0.26);
+}
+
+.harness-action-warning {
+  border-color: rgb(245 158 11 / 0.3);
+  background-color: rgb(245 158 11 / 0.16);
+  color: rgb(252 211 77);
+}
+
+.harness-action-warning:hover {
+  background-color: rgb(245 158 11 / 0.26);
+}
+
+.harness-icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 0.5rem;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+  cursor: pointer;
+}
+
+.harness-icon-action-danger {
+  color: rgb(255 255 255 / 0.34);
+}
+
+.harness-icon-action-danger:hover {
+  background-color: rgb(239 68 68 / 0.1);
+  color: rgb(248 113 113);
+}
+
+.harness-icon-action svg {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.harness-workspace-version-synced {
+  color: rgb(110 231 183 / 0.8);
+}
+
+.harness-workspace-version-stale {
+  color: rgb(252 211 77 / 0.86);
+}
+
+:root[data-theme="light"] {
+  .harness-status-badge-emerald {
+    border-color: rgb(5 150 105 / 0.22);
+    background-color: rgb(209 250 229 / 0.7);
+    color: rgb(6 95 70);
+  }
+
+  .harness-status-badge-amber {
+    border-color: rgb(217 119 6 / 0.18);
+    background-color: rgb(255 251 235 / 0.82);
+    color: rgb(120 53 15);
+  }
+
+  .harness-status-badge-red {
+    border-color: rgb(220 38 38 / 0.2);
+    background-color: rgb(254 226 226 / 0.74);
+    color: rgb(153 27 27);
+  }
+
+  .harness-status-dot-emerald {
+    background-color: rgb(5 150 105);
+  }
+
+  .harness-status-dot-amber {
+    background-color: rgb(245 158 11);
+  }
+
+  .harness-status-dot-red {
+    background-color: rgb(220 38 38);
+  }
+
+  .harness-action-primary {
+    border-color: rgb(79 70 229 / 0.22);
+    background-color: rgb(224 231 255 / 0.78);
+    color: rgb(67 56 202);
+  }
+
+  .harness-action-primary:hover {
+    background-color: rgb(199 210 254 / 0.86);
+  }
+
+  .harness-action-success {
+    border-color: rgb(5 150 105 / 0.22);
+    background-color: rgb(209 250 229 / 0.78);
+    color: rgb(6 95 70);
+  }
+
+  .harness-action-success:hover {
+    background-color: rgb(167 243 208 / 0.86);
+  }
+
+  .harness-action-warning {
+    border-color: rgb(217 119 6 / 0.2);
+    background-color: rgb(255 251 235 / 0.9);
+    color: rgb(120 53 15);
+  }
+
+  .harness-action-warning:hover {
+    background-color: rgb(254 243 199 / 0.95);
+  }
+
+  .harness-icon-action-danger {
+    color: rgb(107 114 128);
+  }
+
+  .harness-icon-action-danger:hover {
+    background-color: rgb(254 226 226 / 0.8);
+    color: rgb(185 28 28);
+  }
+
+  .harness-workspace-version-synced {
+    color: rgb(6 95 70);
+  }
+
+  .harness-workspace-version-stale {
+    color: rgb(120 53 15);
+  }
 }
 
 /* =========================================================================
@@ -439,6 +1288,13 @@ select:focus-visible {
   font-family: var(--font-mono);
 }
 
+:root[data-theme="light"] {
+  .tag {
+    color: rgb(var(--foreground-tertiary));
+    background: rgba(17, 24, 39, 0.05);
+  }
+}
+
 /* =========================================================================
    XTerm Terminal Fixes
    ========================================================================= */
@@ -452,12 +1308,12 @@ select:focus-visible {
    Prose styles for markdown
    ========================================================================= */
 .prose-glass {
-  color: rgba(255, 255, 255, 0.9);
+  color: rgb(var(--foreground) / 0.9);
   overflow-wrap: anywhere;
 }
 
 .prose-glass strong {
-  color: white;
+  color: rgb(var(--foreground));
 }
 
 .prose-glass a {
@@ -465,23 +1321,43 @@ select:focus-visible {
   text-decoration: underline;
 }
 
-.prose-glass code {
-  background: rgb(var(--background-tertiary));
+.code-inline {
+  background: rgb(var(--code-inline-bg) / 0.82);
+  color: rgb(var(--code-inline-text));
   padding: 0.125rem 0.25rem;
   border-radius: 0.25rem;
   font-size: 0.875em;
+  border: 1px solid rgb(var(--code-inline-text) / 0.16);
 }
 
-.prose-glass pre {
-  background: rgb(var(--background-tertiary));
+.code-block,
+.prose-glass pre.code-block {
+  background: rgb(var(--code-block-bg));
+  color: rgb(var(--code-foreground));
+  border: 1px solid rgb(var(--code-border) / 0.08);
   border-radius: 0.5rem;
   padding: 1rem;
   overflow-x: auto;
 }
 
-.prose-glass pre code {
+.code-block code,
+.prose-glass pre.code-block code {
   background: transparent;
+  color: inherit;
   padding: 0;
+  border: 0;
+}
+
+:root[data-theme="light"] {
+  .code-block,
+  .prose-glass pre.code-block {
+    border-color: rgb(var(--code-border) / 0.1);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.65);
+  }
+
+  .code-inline {
+    border-color: rgb(var(--code-inline-text) / 0.14);
+  }
 }
 
 .prose-glass img {
@@ -506,7 +1382,7 @@ select:focus-visible {
   border-left: 3px solid rgb(var(--accent));
   padding-left: 1rem;
   margin: 0.5rem 0;
-  color: rgba(255, 255, 255, 0.7);
+  color: rgb(var(--foreground-secondary) / 0.9);
   font-style: italic;
 }
 
@@ -514,7 +1390,7 @@ select:focus-visible {
 .prose-glass h2,
 .prose-glass h3,
 .prose-glass h4 {
-  color: white;
+  color: rgb(var(--foreground));
   font-weight: 600;
   margin-top: 1rem;
   margin-bottom: 0.5rem;

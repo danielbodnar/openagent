@@ -601,6 +601,24 @@ impl AppServerSession {
         self.request("thread/start", params).await
     }
 
+    pub async fn login_chatgpt_auth_tokens(
+        &self,
+        access_token: &str,
+        chatgpt_account_id: &str,
+        chatgpt_plan_type: Option<&str>,
+    ) -> Result<Value> {
+        self.request(
+            "account/login/start",
+            json!({
+                "type": "chatgptAuthTokens",
+                "accessToken": access_token,
+                "chatgptAccountId": chatgpt_account_id,
+                "chatgptPlanType": chatgpt_plan_type,
+            }),
+        )
+        .await
+    }
+
     /// Resume a previously-started thread by id. Codex 0.128.0 accepts
     /// `thread/resume` with `{threadId}` to reattach to a session whose
     /// rollout already lives under `$CODEX_HOME/sessions/...` — used by

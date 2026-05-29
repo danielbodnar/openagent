@@ -1,7 +1,7 @@
 //! System component management API.
 //!
 //! Provides endpoints to query and update system components like OpenCode
-//! and oh-my-opencode.
+//! and related CLI components.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use axum::{
         Json,
     },
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use tokio::process::Command;
 
 use uuid::Uuid;
 
+use super::auth::AuthUser;
 use super::routes::AppState;
 use crate::util::home_dir;
 use crate::workspace::{Workspace, WorkspaceStatus, WorkspaceType};
@@ -308,6 +309,9 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/components", get(get_components))
         .route("/components/by-workspace", get(get_components_by_workspace))
+        .route("/hermes-assistant/adopt", post(adopt_hermes_assistant))
+        .route("/hermes-assistant/status", get(get_hermes_assistant_status))
+        .route("/hermes-assistant/stop", post(stop_hermes_assistant))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
         .route("/deploy", post(deploy_sandboxed_sh))
@@ -336,6 +340,14 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
         status,
     });
 
+    // Hermes assistant MCP connector
+    let assistant_mcp_info = get_assistant_mcp_info().await;
+    components.push(assistant_mcp_info);
+
+    // External Hermes assistant runtime/gateway service, if installed on this host.
+    let hermes_assistant_info = get_hermes_assistant_info(&state.config).await;
+    components.push(hermes_assistant_info);
+
     // OpenCode
     let opencode_info = get_opencode_info(&state.config).await;
     components.push(opencode_info);
@@ -348,15 +360,15 @@ async fn get_components(State(state): State<Arc<AppState>>) -> Json<SystemCompon
     let codex_info = get_codex_info().await;
     components.push(codex_info);
 
-    // oh-my-opencode
-    let omo_info = get_oh_my_opencode_info().await;
-    components.push(omo_info);
+    // Grok Build
+    let grok_info = get_grok_info().await;
+    components.push(grok_info);
 
     Json(SystemComponentsResponse { components })
 }
 
 /// Components that support per-workspace installations. Order is preserved in the response.
-const PER_WORKSPACE_COMPONENTS: &[&str] = &["opencode", "claude_code", "codex"];
+const PER_WORKSPACE_COMPONENTS: &[&str] = &["opencode", "claude_code", "codex", "grok"];
 
 /// Get per-workspace version info for each component. Container workspaces are probed via nspawn
 /// in parallel with a per-probe timeout to keep the page responsive.
@@ -541,6 +553,7 @@ fn component_binary_name(component: &str) -> Option<&'static str> {
         "opencode" => Some("opencode"),
         "claude_code" => Some("claude"),
         "codex" => Some("codex"),
+        "grok" => Some("grok"),
         _ => None,
     }
 }
@@ -694,6 +707,910 @@ async fn get_codex_info() -> ComponentInfo {
     }
 }
 
+/// Get Grok Build CLI version and status.
+async fn get_grok_info() -> ComponentInfo {
+    match Command::new("grok").arg("--version").output().await {
+        Ok(output) if output.status.success() => {
+            let mut version_str = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                if !version_str.is_empty() {
+                    version_str.push(' ');
+                }
+                version_str.push_str(stderr.trim());
+            }
+            let version = extract_version_token(&version_str);
+
+            ComponentInfo {
+                name: "grok".to_string(),
+                version,
+                installed: true,
+                update_available: None,
+                path: which_grok().await,
+                source_path: None,
+                status: ComponentStatus::Ok,
+            }
+        }
+        _ => ComponentInfo {
+            name: "grok".to_string(),
+            version: None,
+            installed: false,
+            update_available: None,
+            path: None,
+            source_path: None,
+            status: ComponentStatus::NotInstalled,
+        },
+    }
+}
+
+async fn get_assistant_mcp_info() -> ComponentInfo {
+    match Command::new("assistant-mcp")
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let version = extract_version_token(&String::from_utf8_lossy(&output.stdout));
+
+            ComponentInfo {
+                name: "assistant_mcp".to_string(),
+                version,
+                installed: true,
+                update_available: None,
+                path: which_assistant_mcp().await,
+                source_path: None,
+                status: ComponentStatus::Ok,
+            }
+        }
+        _ => ComponentInfo {
+            name: "assistant_mcp".to_string(),
+            version: None,
+            installed: false,
+            update_available: None,
+            path: which_assistant_mcp().await,
+            source_path: None,
+            status: ComponentStatus::NotInstalled,
+        },
+    }
+}
+
+async fn get_hermes_assistant_info(config: &crate::config::Config) -> ComponentInfo {
+    let expected_service = format!("{}.service", assistant_runtime_name(config));
+    let fallback_service = if expected_service == "hermes-assistant-dev.service" {
+        "hermes-assistant.service"
+    } else {
+        "hermes-assistant-dev.service"
+    };
+
+    for service_name in [expected_service.as_str(), fallback_service] {
+        if let Some(info) = get_systemd_service_component("hermes_assistant", service_name).await {
+            return info;
+        }
+    }
+
+    ComponentInfo {
+        name: "hermes_assistant".to_string(),
+        version: None,
+        installed: false,
+        update_available: None,
+        path: None,
+        source_path: None,
+        status: ComponentStatus::NotInstalled,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdoptHermesAssistantRequest {
+    pub gateway_id: Uuid,
+    #[serde(default)]
+    pub allow_all_users: bool,
+    #[serde(default = "default_hermes_model")]
+    pub model: String,
+    #[serde(default)]
+    pub install_hermes_if_missing: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdoptHermesAssistantResponse {
+    pub ok: bool,
+    pub gateway_id: Uuid,
+    pub gateway_username: Option<String>,
+    pub service_name: String,
+    pub env_path: String,
+    pub dotenv_path: String,
+    pub config_path: String,
+    pub soul_path: String,
+    pub workspace_path: String,
+    pub api_url: String,
+    pub model: String,
+    pub allowed_users_count: usize,
+    pub allow_all_users: bool,
+    pub legacy_gateway_active: bool,
+    pub hermes_installed: bool,
+    pub hermes_status: ComponentStatus,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HermesAssistantStatusResponse {
+    pub service_name: String,
+    pub service_active: bool,
+    pub model: Option<String>,
+    pub env_path: String,
+    pub dotenv_path: String,
+    pub config_path: String,
+    pub soul_path: String,
+    pub env_present: bool,
+    pub dotenv_present: bool,
+    pub config_present: bool,
+    pub soul_present: bool,
+    pub token_present: bool,
+    pub telegram_ok: Option<bool>,
+    pub telegram_bot_username: Option<String>,
+    pub telegram_webhook_configured: Option<bool>,
+    pub telegram_pending_update_count: Option<i64>,
+    pub telegram_last_error: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StopHermesAssistantResponse {
+    pub ok: bool,
+    pub service_name: String,
+    pub service_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramApiResponse<T> {
+    ok: bool,
+    #[serde(default)]
+    result: Option<T>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TelegramGetMeResult {
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TelegramWebhookInfoResult {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    pending_update_count: Option<i64>,
+    #[serde(default)]
+    last_error_message: Option<String>,
+}
+
+fn default_hermes_model() -> String {
+    // GLM 5.1 currently returns extended reasoning in `reasoning_content`
+    // through the OpenAI-compatible proxy before it emits visible `content`.
+    // Hermes' Telegram gateway expects visible assistant text, so the assistant
+    // runtime defaults to the Smart chain, which currently starts with MiniMax
+    // and still keeps the operator-controlled routing surface.
+    "builtin/smart".to_string()
+}
+
+fn assistant_runtime_name(config: &crate::config::Config) -> &'static str {
+    if config.port == 3002
+        || std::env::var("SANDBOXED_ENV")
+            .map(|v| v.eq_ignore_ascii_case("dev"))
+            .unwrap_or(false)
+        || std::env::var("OPEN_AGENT_ENV")
+            .map(|v| v.eq_ignore_ascii_case("dev"))
+            .unwrap_or(false)
+    {
+        "hermes-assistant-dev"
+    } else {
+        "hermes-assistant"
+    }
+}
+
+fn local_api_url(config: &crate::config::Config) -> String {
+    format!("http://127.0.0.1:{}", config.port)
+}
+
+fn env_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn env_line(key: &str, value: &str) -> String {
+    format!("{key}={}\n", env_quote(value))
+}
+
+fn env_unquote(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        return trimmed[1..trimmed.len() - 1].replace("'\\''", "'");
+    }
+    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        return trimmed[1..trimmed.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+    }
+    trimmed.to_string()
+}
+
+fn parse_env_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (candidate, value) = line.split_once('=')?;
+        if candidate.trim() == key {
+            Some(env_unquote(value))
+        } else {
+            None
+        }
+    })
+}
+
+fn comma_join_i64(values: &[i64]) -> String {
+    values
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn hermes_config_yaml(runtime_name: &str) -> String {
+    format!(
+        r#"model:
+  provider: custom
+  default: ${{HERMES_ASSISTANT_MODEL}}
+  base_url: ${{OPENAI_BASE_URL}}
+  api_key: ${{OPENAI_API_KEY}}
+  api_mode: chat_completions
+
+terminal:
+  backend: local
+  cwd: /var/lib/{runtime_name}/workspace
+
+mcp_servers:
+  sandboxed_assistant:
+    command: ${{HERMES_ASSISTANT_MCP_COMMAND}}
+    env:
+      HERMES_SANDBOXED_API_URL: ${{HERMES_SANDBOXED_API_URL}}
+      HERMES_SANDBOXED_API_TOKEN: ${{HERMES_SANDBOXED_API_TOKEN}}
+      JWT_SECRET: ${{JWT_SECRET}}
+      HERMES_ASSISTANT_USER_ID: ${{HERMES_ASSISTANT_USER_ID}}
+      HERMES_DEFAULT_WORKSPACE_ID: ${{HERMES_DEFAULT_WORKSPACE_ID}}
+    timeout: 120
+    connect_timeout: 15
+    tools:
+      include:
+        - list_active_missions
+        - list_missions
+        - get_mission
+        - get_mission_events
+        - start_mission
+        - send_message_to_mission
+        - cancel_mission
+        - list_workspaces
+      prompts: false
+      resources: false
+
+display:
+  platforms:
+    telegram:
+      tool_progress: off
+      cleanup_progress: true
+"#
+    )
+}
+
+fn hermes_soul_markdown(channel: &super::mission_store::TelegramChannel) -> String {
+    let instructions = channel.instructions.as_deref().unwrap_or_default().trim();
+    if instructions.is_empty() {
+        return "You are the sandboxed.sh Assistant. Help the operator manage missions, workspaces, and related development work through the available tools.\n".to_string();
+    }
+
+    format!("{instructions}\n")
+}
+
+fn choose_telegram_home_channel(
+    allowed_chat_ids: &[i64],
+    mappings: &[super::mission_store::TelegramChatMission],
+) -> Option<(i64, String)> {
+    if allowed_chat_ids.len() == 1 {
+        return Some((allowed_chat_ids[0], "Thomas".to_string()));
+    }
+
+    mappings
+        .iter()
+        .filter(|mapping| mapping.chat_id > 0)
+        .max_by_key(|mapping| &mapping.created_at)
+        .map(|mapping| {
+            (
+                mapping.chat_id,
+                mapping
+                    .chat_title
+                    .clone()
+                    .unwrap_or_else(|| "Thomas".to_string()),
+            )
+        })
+}
+
+fn hermes_service_unit(runtime_name: &str, env_path: &str, service_after: &str) -> String {
+    format!(
+        r#"[Unit]
+Description=Hermes Assistant gateway
+After=network-online.target {service_after}
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile={env_path}
+WorkingDirectory=/var/lib/{runtime_name}
+ExecStart=/usr/local/bin/hermes gateway --accept-hooks run
+Restart=always
+RestartSec=5
+TimeoutStopSec=240
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+"#
+    )
+}
+
+async fn run_host_command(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| format!("failed to run {program}: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        Ok(format!("{stdout}{stderr}"))
+    } else {
+        Err(format!(
+            "{program} exited with {}: {}{}",
+            output.status, stdout, stderr
+        ))
+    }
+}
+
+async fn ensure_hermes_installed(install_if_missing: bool) -> Result<bool, String> {
+    if Command::new("hermes")
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+
+    if !install_if_missing {
+        return Ok(false);
+    }
+
+    run_host_command(
+        "sh",
+        &[
+            "-lc",
+            "set -e; curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-browser; for p in /root/.local/bin/hermes /root/.hermes/bin/hermes /usr/local/bin/hermes; do if [ -x \"$p\" ]; then install -m 0755 \"$p\" /usr/local/bin/hermes; exit 0; fi; done; command -v hermes >/dev/null",
+        ],
+    )
+    .await?;
+
+    Ok(true)
+}
+
+async fn write_private_file(path: &str, contents: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = format!("{path}.tmp");
+    tokio::fs::write(&tmp, contents)
+        .await
+        .map_err(|e| format!("failed to write {tmp}: {e}"))?;
+    tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|e| format!("failed to chmod {tmp}: {e}"))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|e| format!("failed to install {path}: {e}"))?;
+    Ok(())
+}
+
+async fn rollback_legacy_gateway(
+    state: &Arc<AppState>,
+    control: &super::control::ControlState,
+    mut channel: super::mission_store::TelegramChannel,
+) {
+    channel.active = true;
+    channel.updated_at = super::mission_store::now_string();
+    if control
+        .mission_store
+        .update_telegram_channel(channel.clone())
+        .await
+        .is_ok()
+    {
+        let public_url = std::env::var("SANDBOXED_PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+        let _ = state
+            .telegram_bridge
+            .start_channel(
+                channel,
+                control.cmd_tx.clone(),
+                control.events_tx.clone(),
+                control.mission_store.clone(),
+                &public_url,
+            )
+            .await;
+    }
+}
+
+/// Adopt an existing Assistant/Telegram gateway into the host Hermes runtime.
+///
+/// The token is read from the existing encrypted/local mission store and written
+/// only to root-owned host files. The response intentionally returns no secret
+/// values.
+async fn adopt_hermes_assistant(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Json(req): Json<AdoptHermesAssistantRequest>,
+) -> Result<Json<AdoptHermesAssistantResponse>, (StatusCode, String)> {
+    let control = state.control.get_or_spawn(&user).await;
+    let mut channel = control
+        .mission_store
+        .get_telegram_channel(req.gateway_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Assistant gateway {} not found", req.gateway_id),
+            )
+        })?;
+
+    let allowed_users = comma_join_i64(&channel.allowed_chat_ids);
+    if allowed_users.is_empty() && !req.allow_all_users {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Gateway has no allowed chat/user IDs. Set allowed users first or explicitly allow all users for this adopt run.".to_string(),
+        ));
+    }
+
+    let hermes_installed = ensure_hermes_installed(req.install_hermes_if_missing)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !hermes_installed {
+        return Err((
+            StatusCode::FAILED_DEPENDENCY,
+            "Hermes is not installed. Retry with install_hermes_if_missing=true.".to_string(),
+        ));
+    }
+
+    let runtime_name = assistant_runtime_name(&state.config);
+    let service_name = format!("{runtime_name}.service");
+    let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
+    let dotenv_path = format!("/var/lib/{runtime_name}/.env");
+    let config_path = format!("/var/lib/{runtime_name}/config.yaml");
+    let soul_path = format!("/var/lib/{runtime_name}/SOUL.md");
+    let workspace_path = format!("/var/lib/{runtime_name}/workspace");
+    let api_url = local_api_url(&state.config);
+    let model = if req.model.trim().is_empty() {
+        default_hermes_model()
+    } else {
+        req.model.trim().to_string()
+    };
+    let proxy_key = state
+        .proxy_api_keys
+        .create(format!(
+            "Hermes Assistant {}",
+            chrono::Utc::now().to_rfc3339()
+        ))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .key;
+    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+    let user_id = user.id.clone();
+    let default_workspace_id = channel
+        .default_workspace_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let chat_mappings = control
+        .mission_store
+        .list_telegram_chat_missions(channel.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let home_channel = choose_telegram_home_channel(&channel.allowed_chat_ids, &chat_mappings);
+
+    run_host_command("install", &["-d", "-m", "0755", "/etc/sandboxed-sh"])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    run_host_command(
+        "install",
+        &["-d", "-m", "0755", &format!("/var/lib/{runtime_name}")],
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    run_host_command("install", &["-d", "-m", "0755", &workspace_path])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut env = String::new();
+    env.push_str(&env_line("HOME", &format!("/var/lib/{runtime_name}")));
+    env.push_str(&env_line(
+        "HERMES_HOME",
+        &format!("/var/lib/{runtime_name}"),
+    ));
+    env.push_str("HERMES_ACCEPT_HOOKS=1\n");
+    env.push_str("HERMES_INFERENCE_PROVIDER=custom\n");
+    env.push_str(&env_line("HERMES_SANDBOXED_API_URL", &api_url));
+    env.push_str("HERMES_SANDBOXED_API_TOKEN=\n");
+    env.push_str(&env_line("JWT_SECRET", &jwt_secret));
+    env.push_str(&env_line("HERMES_ASSISTANT_USER_ID", &user_id));
+    env.push_str(&env_line(
+        "HERMES_DEFAULT_WORKSPACE_ID",
+        &default_workspace_id,
+    ));
+    env.push_str(&env_line("OPENAI_BASE_URL", &format!("{api_url}/v1")));
+    env.push_str(&env_line("OPENAI_API_KEY", &proxy_key));
+    env.push_str(&env_line("HERMES_ASSISTANT_MODEL", &model));
+    env.push_str(&env_line("TELEGRAM_BOT_TOKEN", &channel.bot_token));
+    env.push_str(&env_line("TELEGRAM_ALLOWED_USERS", &allowed_users));
+    if let Some((home_channel_id, home_channel_name)) = home_channel {
+        env.push_str(&env_line(
+            "TELEGRAM_HOME_CHANNEL",
+            &home_channel_id.to_string(),
+        ));
+        env.push_str(&env_line("TELEGRAM_HOME_CHANNEL_NAME", &home_channel_name));
+    }
+    if req.allow_all_users {
+        env.push_str("GATEWAY_ALLOW_ALL_USERS=true\n");
+    }
+    env.push_str("HERMES_ASSISTANT_MCP_COMMAND=/usr/local/bin/assistant-mcp\n");
+
+    write_private_file(&env_path, &env)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_private_file(&dotenv_path, &env)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_private_file(&config_path, &hermes_config_yaml(runtime_name))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_private_file(&soul_path, &hermes_soul_markdown(&channel))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let service_path = format!("/etc/systemd/system/{service_name}");
+    let service_after = if runtime_name.ends_with("-dev") {
+        "sandboxed-sh-dev.service"
+    } else {
+        "sandboxed-sh-prod.service"
+    };
+    tokio::fs::write(
+        &service_path,
+        hermes_service_unit(runtime_name, &env_path, service_after),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to write service: {e}"),
+        )
+    })?;
+
+    let was_active = channel.active;
+    if channel.active {
+        channel.active = false;
+        channel.updated_at = super::mission_store::now_string();
+        control
+            .mission_store
+            .update_telegram_channel(channel.clone())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        state.telegram_bridge.stop_channel(channel.id).await;
+    }
+
+    let start_result = async {
+        run_host_command("systemctl", &["daemon-reload"]).await?;
+        run_host_command("systemctl", &["enable", "--now", &service_name]).await?;
+        run_host_command("systemctl", &["restart", &service_name]).await?;
+        run_host_command("systemctl", &["is-active", "--quiet", &service_name]).await
+    }
+    .await;
+
+    if let Err(error) = start_result {
+        if was_active {
+            rollback_legacy_gateway(&state, &control, channel.clone()).await;
+        }
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Hermes service failed to start; legacy gateway rollback attempted: {error}"),
+        ));
+    }
+
+    let hermes_info = get_systemd_service_component("hermes_assistant", &service_name)
+        .await
+        .unwrap_or(ComponentInfo {
+            name: "hermes_assistant".to_string(),
+            version: None,
+            installed: true,
+            update_available: None,
+            path: Some(service_path),
+            source_path: None,
+            status: ComponentStatus::Error,
+        });
+
+    let mut notes = vec![
+        "Telegram bot token was copied from the existing gateway without being returned."
+            .to_string(),
+        "Legacy sandboxed webhook was deactivated for this gateway before starting Hermes."
+            .to_string(),
+    ];
+    if allowed_users.is_empty() && req.allow_all_users {
+        notes.push("Hermes was configured with GATEWAY_ALLOW_ALL_USERS=true.".to_string());
+    }
+    if channel.allowed_chat_ids.is_empty() && !chat_mappings.is_empty() {
+        notes.push(
+            "Telegram home channel was inferred from an existing private chat mapping.".to_string(),
+        );
+    }
+
+    Ok(Json(AdoptHermesAssistantResponse {
+        ok: matches!(hermes_info.status, ComponentStatus::Ok),
+        gateway_id: channel.id,
+        gateway_username: channel.bot_username.clone(),
+        service_name,
+        env_path,
+        dotenv_path,
+        config_path,
+        soul_path,
+        workspace_path,
+        api_url,
+        model,
+        allowed_users_count: channel.allowed_chat_ids.len(),
+        allow_all_users: req.allow_all_users,
+        legacy_gateway_active: false,
+        hermes_installed,
+        hermes_status: hermes_info.status,
+        notes,
+    }))
+}
+
+async fn get_hermes_assistant_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<HermesAssistantStatusResponse> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    let service_name = format!("{runtime_name}.service");
+    let env_path = format!("/etc/sandboxed-sh/{runtime_name}.env");
+    let dotenv_path = format!("/var/lib/{runtime_name}/.env");
+    let config_path = format!("/var/lib/{runtime_name}/config.yaml");
+    let soul_path = format!("/var/lib/{runtime_name}/SOUL.md");
+    let service_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", &service_name])
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false);
+    let env_contents = tokio::fs::read_to_string(&env_path).await.ok();
+    let env_present = env_contents.is_some();
+    let dotenv_present = tokio::fs::metadata(&dotenv_path).await.is_ok();
+    let config_present = tokio::fs::metadata(&config_path).await.is_ok();
+    let soul_present = tokio::fs::metadata(&soul_path).await.is_ok();
+    let token = env_contents
+        .as_deref()
+        .and_then(|contents| parse_env_value(contents, "TELEGRAM_BOT_TOKEN"))
+        .filter(|value| !value.trim().is_empty());
+    let token_present = token.is_some();
+    let model = env_contents
+        .as_deref()
+        .and_then(|contents| parse_env_value(contents, "HERMES_ASSISTANT_MODEL"))
+        .filter(|value| !value.trim().is_empty());
+
+    let mut telegram_ok = None;
+    let mut telegram_bot_username = None;
+    let mut telegram_webhook_configured = None;
+    let mut telegram_pending_update_count = None;
+    let mut telegram_last_error = None;
+    let mut notes = Vec::new();
+
+    if let Some(token) = token {
+        let client = reqwest::Client::new();
+        let base = format!("https://api.telegram.org/bot{token}");
+
+        match client
+            .get(format!("{base}/getMe"))
+            .send()
+            .await
+            .and_then(|resp| resp.error_for_status())
+        {
+            Ok(resp) => match resp
+                .json::<TelegramApiResponse<TelegramGetMeResult>>()
+                .await
+            {
+                Ok(body) => {
+                    telegram_ok = Some(body.ok);
+                    telegram_bot_username = body.result.and_then(|result| result.username);
+                    if !body.ok {
+                        telegram_last_error = body.description;
+                    }
+                }
+                Err(error) => {
+                    telegram_ok = Some(false);
+                    telegram_last_error = Some(format!("Telegram getMe decode failed: {error}"));
+                }
+            },
+            Err(error) => {
+                telegram_ok = Some(false);
+                telegram_last_error = Some(format!("Telegram getMe failed: {error}"));
+            }
+        }
+
+        match client
+            .get(format!("{base}/getWebhookInfo"))
+            .send()
+            .await
+            .and_then(|resp| resp.error_for_status())
+        {
+            Ok(resp) => match resp
+                .json::<TelegramApiResponse<TelegramWebhookInfoResult>>()
+                .await
+            {
+                Ok(body) => {
+                    if let Some(result) = body.result {
+                        telegram_webhook_configured = Some(!result.url.trim().is_empty());
+                        telegram_pending_update_count = result.pending_update_count;
+                        if result.last_error_message.is_some() {
+                            telegram_last_error = result.last_error_message;
+                        }
+                    }
+                }
+                Err(error) => {
+                    telegram_last_error = Some(format!("Telegram webhook decode failed: {error}"));
+                }
+            },
+            Err(error) => {
+                telegram_last_error = Some(format!("Telegram getWebhookInfo failed: {error}"));
+            }
+        }
+    } else {
+        notes.push("TELEGRAM_BOT_TOKEN is not present in the Hermes env file.".to_string());
+    }
+
+    if telegram_webhook_configured == Some(false) {
+        notes.push(
+            "Telegram has no webhook configured; Hermes should receive updates by polling."
+                .to_string(),
+        );
+    }
+    if telegram_webhook_configured == Some(true) {
+        notes.push(
+            "Telegram still has a webhook configured, which can block polling mode.".to_string(),
+        );
+    }
+
+    Json(HermesAssistantStatusResponse {
+        service_name,
+        service_active,
+        model,
+        env_path,
+        dotenv_path,
+        config_path,
+        soul_path,
+        env_present,
+        dotenv_present,
+        config_present,
+        soul_present,
+        token_present,
+        telegram_ok,
+        telegram_bot_username,
+        telegram_webhook_configured,
+        telegram_pending_update_count,
+        telegram_last_error,
+        notes,
+    })
+}
+
+async fn stop_hermes_assistant(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<StopHermesAssistantResponse>, (StatusCode, String)> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    let service_name = format!("{runtime_name}.service");
+
+    run_host_command("systemctl", &["disable", "--now", &service_name])
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+
+    let service_active = Command::new("systemctl")
+        .args(["is-active", "--quiet", &service_name])
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    Ok(Json(StopHermesAssistantResponse {
+        ok: !service_active,
+        service_name,
+        service_active,
+    }))
+}
+
+async fn get_systemd_service_component(
+    component_name: &str,
+    service_name: &str,
+) -> Option<ComponentInfo> {
+    let output = Command::new("systemctl")
+        .args([
+            "show",
+            service_name,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=FragmentPath",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    // `systemctl show` emits `Key=Value` lines, but NOT necessarily in the
+    // order the `--property` flags were given (it follows internal property
+    // ordering — see systemd#28205). Parse by key instead of by position so we
+    // never swap LoadState/ActiveState/FragmentPath.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut load_state = "";
+    let mut active_state = "";
+    let mut fragment_path = "";
+    for line in stdout.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "LoadState" => load_state = value.trim(),
+                "ActiveState" => active_state = value.trim(),
+                "FragmentPath" => fragment_path = value.trim(),
+                _ => {}
+            }
+        }
+    }
+
+    systemd_service_component_from_states(
+        component_name,
+        service_name,
+        load_state,
+        active_state,
+        fragment_path,
+    )
+}
+
+fn systemd_service_component_from_states(
+    component_name: &str,
+    service_name: &str,
+    load_state: &str,
+    active_state: &str,
+    fragment_path: &str,
+) -> Option<ComponentInfo> {
+    if load_state != "loaded" {
+        return None;
+    }
+
+    Some(ComponentInfo {
+        name: component_name.to_string(),
+        version: None,
+        installed: true,
+        update_available: None,
+        path: if fragment_path.is_empty() {
+            Some(service_name.to_string())
+        } else {
+            Some(fragment_path.to_string())
+        },
+        source_path: None,
+        status: if active_state == "active" {
+            ComponentStatus::Ok
+        } else {
+            ComponentStatus::Error
+        },
+    })
+}
+
 /// Find the path to a CLI binary.
 /// Checks `which` first (respects the user's PATH), then explicit fallback paths.
 async fn which_binary(name: &str, fallback_paths: &[&str]) -> Option<String> {
@@ -721,6 +1638,16 @@ async fn which_claude_code() -> Option<String> {
 /// Find the path to the Codex binary.
 async fn which_codex() -> Option<String> {
     which_binary("codex", &["/usr/local/bin/codex"]).await
+}
+
+/// Find the path to the Grok Build binary.
+async fn which_grok() -> Option<String> {
+    which_binary("grok", &["/usr/local/bin/grok"]).await
+}
+
+/// Find the path to the Hermes assistant MCP connector.
+async fn which_assistant_mcp() -> Option<String> {
+    which_binary("assistant-mcp", &["/usr/local/bin/assistant-mcp"]).await
 }
 
 /// Find the path to the OpenCode binary.
@@ -939,105 +1866,6 @@ fn qualify_version_token(raw: &str) -> Option<String> {
     }
 }
 
-/// Get oh-my-opencode version and status.
-async fn get_oh_my_opencode_info() -> ComponentInfo {
-    // Check if oh-my-opencode is installed by looking for the config file
-    let home = home_dir();
-    let config_path = format!("{}/.config/opencode/oh-my-opencode.json", home);
-
-    let installed = tokio::fs::metadata(&config_path).await.is_ok();
-
-    if !installed {
-        return ComponentInfo {
-            name: "oh_my_opencode".to_string(),
-            version: None,
-            installed: false,
-            update_available: None,
-            path: None,
-            source_path: None,
-            status: ComponentStatus::NotInstalled,
-        };
-    }
-
-    // Try to get version from the package
-    // oh-my-opencode doesn't have a --version flag, so we check npm/bun
-    let version = get_oh_my_opencode_version().await;
-    let update_available = check_oh_my_opencode_update(version.as_deref()).await;
-    let status = if update_available.is_some() {
-        ComponentStatus::UpdateAvailable
-    } else {
-        ComponentStatus::Ok
-    };
-
-    ComponentInfo {
-        name: "oh_my_opencode".to_string(),
-        version,
-        installed: true,
-        update_available,
-        path: Some(config_path),
-        source_path: None,
-        status,
-    }
-}
-
-/// Get the installed version of oh-my-opencode.
-/// Tries `bunx oh-my-opencode --version` first (most reliable), then falls back
-/// to scanning the bun cache for platform-specific package directories.
-async fn get_oh_my_opencode_version() -> Option<String> {
-    // Primary: ask bunx directly (works regardless of cache layout)
-    if let Ok(Ok(output)) = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        Command::new("bunx")
-            .args(["oh-my-opencode", "--version"])
-            .output(),
-    )
-    .await
-    {
-        if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !version.is_empty() && version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                return Some(version);
-            }
-        }
-    }
-
-    // Fallback: scan bun cache for platform-specific packages
-    // (e.g. oh-my-opencode-linux-x64@3.0.1@@@1)
-    let home = home_dir();
-    let output = Command::new("bash")
-        .args([
-            "-c",
-            &format!(
-                r#"find {}/.bun/install/cache -maxdepth 1 -type d -name 'oh-my-opencode*@*' 2>/dev/null | \
-                   grep -oP 'oh-my-opencode[^@]*@\K[0-9]+\.[0-9]+\.[0-9]+' | \
-                   sort -V | tail -1"#,
-                home
-            ),
-        ])
-        .output()
-        .await
-        .ok()?;
-
-    if output.status.success() {
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !version.is_empty() {
-            return Some(version);
-        }
-    }
-
-    None
-}
-
-/// Check if there's a newer version of oh-my-opencode available.
-async fn check_oh_my_opencode_update(current_version: Option<&str>) -> Option<String> {
-    let latest = fetch_npm_latest_version("oh-my-opencode").await?;
-    match current_version {
-        Some(current) if latest != current && version_is_newer(&latest, current) => Some(latest),
-        None => Some(latest), // If no current version, suggest the latest
-        _ => None,
-    }
-}
-
 /// Optional query params accepted by /components/:name/update.
 #[derive(Debug, Deserialize)]
 pub struct UpdateComponentQuery {
@@ -1093,7 +1921,7 @@ fn host_update_stream(
         "opencode" => Ok(Sse::new(Box::pin(stream_opencode_update()))),
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_update()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_update()))),
-        "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_update()))),
+        "grok" => Ok(Sse::new(Box::pin(stream_grok_update()))),
         other => Err((
             StatusCode::BAD_REQUEST,
             format!("Unknown component: {}", other),
@@ -1171,6 +1999,9 @@ fn container_install_command(component: &str) -> Option<String> {
         "opencode" => Some(
             "curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path".to_string(),
         ),
+        "grok" => Some(
+            "curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash".to_string(),
+        ),
         _ => None,
     }
 }
@@ -1188,7 +2019,7 @@ async fn uninstall_component(
         "opencode" => Ok(Sse::new(Box::pin(stream_opencode_uninstall()))),
         "claude_code" => Ok(Sse::new(Box::pin(stream_claude_code_uninstall()))),
         "codex" => Ok(Sse::new(Box::pin(stream_codex_uninstall()))),
-        "oh_my_opencode" => Ok(Sse::new(Box::pin(stream_oh_my_opencode_uninstall()))),
+        "grok" => Ok(Sse::new(Box::pin(stream_grok_uninstall()))),
         _ => Err((
             StatusCode::BAD_REQUEST,
             format!("Unknown component: {}", name),
@@ -1309,7 +2140,7 @@ fn stream_sandboxed_update(
         yield sse("log", "Building sandboxed.sh (this may take a few minutes)...", Some(20));
 
         match Command::new("bash")
-            .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp"])
+            .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp --bin assistant-mcp"])
             .current_dir(repo_path)
             .output()
             .await
@@ -1394,7 +2225,7 @@ fn stream_sandboxed_update(
         }
 
         // Also install MCP binaries if they were built
-        for mcp_bin in ["workspace-mcp", "desktop-mcp"] {
+        for mcp_bin in ["workspace-mcp", "desktop-mcp", "assistant-mcp"] {
             let mcp_src = format!("{}/target/debug/{}", repo_path.display(), mcp_bin);
             let mcp_dest = format!("/usr/local/bin/{}", mcp_bin);
             if std::path::Path::new(&mcp_src).exists() {
@@ -1525,12 +2356,19 @@ pub struct DeployRequest {
     /// `/opt/sandboxed-sh-<name>/`).
     #[serde(default)]
     pub repo_path: Option<String>,
+    /// Optional guard supplied by deploy tooling. When set, the API refuses
+    /// if the request reached a different systemd service than intended.
+    #[serde(default)]
+    pub expected_service: Option<String>,
 }
 
 /// Reasons we may refuse a deploy without doing any I/O. Surfaced to the MCP
 /// tool so the agent can decide whether to retry with `force=true`.
 #[derive(Debug, PartialEq, Eq)]
 enum DeployRefusal {
+    /// The caller expected to deploy a different service than the API instance
+    /// that received the request.
+    WrongService { expected: String, actual: String },
     /// Calling mission lives on this service; restarting it would kill the
     /// caller. Returned as a refusal so an LLM can't accidentally request
     /// self-destruction; the agent can retry with `force=true` if it knows
@@ -1543,6 +2381,7 @@ enum DeployRefusal {
 impl DeployRefusal {
     fn http_status(&self) -> StatusCode {
         match self {
+            DeployRefusal::WrongService { .. } => StatusCode::CONFLICT,
             DeployRefusal::SelfTarget => StatusCode::CONFLICT,
             DeployRefusal::Debounced { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
@@ -1550,6 +2389,11 @@ impl DeployRefusal {
 
     fn message(&self) -> String {
         match self {
+            DeployRefusal::WrongService { expected, actual } => format!(
+                "Deploy target mismatch: request expected {}, but this API would restart {}. \
+                 Send the request to the correct environment/API URL.",
+                expected, actual
+            ),
             DeployRefusal::SelfTarget => {
                 "Calling mission runs on the service this deploy would restart. \
                  Pass force=true if killing your own turn is acceptable, or run the deploy from a \
@@ -1568,10 +2412,20 @@ impl DeployRefusal {
 /// Pure helper exercised by tests. Returns the refusal that should fire (if
 /// any) given the inputs the handler computed from state + request.
 fn evaluate_deploy_request(
+    actual_service: Option<&str>,
+    expected_service: Option<&str>,
     calling_mission_on_this_service: bool,
     last_deploy_secs_ago: Option<u64>,
     force: bool,
 ) -> Option<DeployRefusal> {
+    if let (Some(actual), Some(expected)) = (actual_service, expected_service) {
+        if actual != expected {
+            return Some(DeployRefusal::WrongService {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+    }
     if !force && calling_mission_on_this_service {
         return Some(DeployRefusal::SelfTarget);
     }
@@ -1602,6 +2456,9 @@ pub async fn deploy_sandboxed_sh(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DeployRequest>,
 ) -> Result<Sse<UpdateStream>, (StatusCode, String)> {
+    let actual_service =
+        current_sandboxed_service_name().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
     // Synchronous safety checks BEFORE we open SSE. A 4xx here is easier for
     // the MCP to surface than an early-error SSE event.
     let calling_on_self = match req.calling_mission_id {
@@ -1620,7 +2477,13 @@ pub async fn deploy_sandboxed_sh(
     let marker = deploy_marker_path();
     let last_age = deploy_marker_age_secs(&marker);
 
-    if let Some(refusal) = evaluate_deploy_request(calling_on_self, last_age, req.force) {
+    if let Some(refusal) = evaluate_deploy_request(
+        Some(&actual_service),
+        req.expected_service.as_deref(),
+        calling_on_self,
+        last_age,
+        req.force,
+    ) {
         return Err((refusal.http_status(), refusal.message()));
     }
 
@@ -1635,7 +2498,27 @@ pub async fn deploy_sandboxed_sh(
         );
     }
 
-    Ok(Sse::new(Box::pin(stream_deploy(state, req))))
+    Ok(Sse::new(Box::pin(stream_deploy(
+        state,
+        req,
+        actual_service,
+    ))))
+}
+
+fn current_sandboxed_service_name() -> Result<String, String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to detect current binary path: {}", e))?;
+    let exe_name = current_exe
+        .file_name()
+        .ok_or_else(|| {
+            format!(
+                "Current binary path has no file name: {}",
+                current_exe.display()
+            )
+        })?
+        .to_string_lossy()
+        .to_string();
+    Ok(format!("{}.service", exe_name))
 }
 
 /// The actual deploy stream — git checkout (optional), build (optional),
@@ -1646,6 +2529,7 @@ pub async fn deploy_sandboxed_sh(
 fn stream_deploy(
     state: Arc<AppState>,
     req: DeployRequest,
+    service_name: String,
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield sse("log", "Starting deploy with safety rails", Some(0));
@@ -1700,26 +2584,28 @@ fn stream_deploy(
                 return;
             }
         };
-        // `exe_name` is the *deployed* filename (e.g. `sandboxed-sh-prod` or
-        // `sandboxed-sh-dev`). The cargo bin name is always `sandboxed-sh`
-        // — Cargo writes to `target/debug/sandboxed-sh` regardless of how
-        // we rename it on install. Same for `orchestrator-mcp`.
-        let exe_name = current_exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+        // The cargo bin name is always `sandboxed-sh` regardless of how we
+        // rename it on install (e.g. `sandboxed-sh-prod` or `sandboxed-sh-dev`).
+        // Same for MCP binaries.
         const MAIN_CARGO_BIN: &str = "sandboxed-sh";
         const MCP_CARGO_BIN: &str = "orchestrator-mcp";
-        let service_name = format!("{}.service", exe_name);
+        const ASSISTANT_MCP_CARGO_BIN: &str = "assistant-mcp";
         let install_dest_main = current_exe.to_string_lossy().to_string();
         // Match the MCP install location: same dir as the main binary, fixed name.
         let install_dest_mcp = current_exe
             .parent()
             .map(|p| p.join(MCP_CARGO_BIN).to_string_lossy().to_string())
             .unwrap_or_else(|| format!("/usr/local/bin/{}", MCP_CARGO_BIN));
+        let install_dest_assistant_mcp = current_exe
+            .parent()
+            .map(|p| p.join(ASSISTANT_MCP_CARGO_BIN).to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("/usr/local/bin/{}", ASSISTANT_MCP_CARGO_BIN));
 
         if !req.skip_build {
-            yield sse("log", format!("Building {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN), Some(25));
+            yield sse("log", format!("Building {} + {} + {} (cargo build, debug)", MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN), Some(25));
             let build_cmd = format!(
-                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {}",
-                MAIN_CARGO_BIN, MCP_CARGO_BIN
+                "source /root/.cargo/env 2>/dev/null; cargo build --bin {} --bin {} --bin {}",
+                MAIN_CARGO_BIN, MCP_CARGO_BIN, ASSISTANT_MCP_CARGO_BIN
             );
             match Command::new("bash")
                 .args(["-c", &build_cmd])
@@ -1751,12 +2637,20 @@ fn stream_deploy(
         // clean refusal instead of a half-applied deploy.
         let src_main = repo_path.join("target").join("debug").join(MAIN_CARGO_BIN);
         let src_mcp = repo_path.join("target").join("debug").join(MCP_CARGO_BIN);
+        let src_assistant_mcp = repo_path
+            .join("target")
+            .join("debug")
+            .join(ASSISTANT_MCP_CARGO_BIN);
         if !src_main.exists() {
             yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_main.display()), None);
             return;
         }
         if !src_mcp.exists() {
             yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_mcp.display()), None);
+            return;
+        }
+        if !src_assistant_mcp.exists() {
+            yield sse("error", format!("Build artifact missing: {}. Either set skip_build=false, or point repo_path at a checkout that has been built.", src_assistant_mcp.display()), None);
             return;
         }
 
@@ -1837,7 +2731,36 @@ fn stream_deploy(
                 return;
             }
         }
-        yield sse("log", format!("Backups: {}, {}", bkp_main, bkp_mcp), Some(88));
+
+        yield sse("log", format!("Installing {} → {}", src_assistant_mcp.display(), install_dest_assistant_mcp), Some(85));
+        let bkp_assistant_mcp = format!("{}.pre-deploy-{}", install_dest_assistant_mcp, sha);
+        if std::path::Path::new(&install_dest_assistant_mcp).exists() {
+            let _ = tokio::fs::copy(&install_dest_assistant_mcp, &bkp_assistant_mcp).await;
+        }
+        let install_assistant_mcp = Command::new("install")
+            .args([
+                "-m", "0755",
+                src_assistant_mcp.to_string_lossy().as_ref(),
+                &install_dest_assistant_mcp,
+            ])
+            .output()
+            .await;
+        match install_assistant_mcp {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                yield sse("error", format!("Install of assistant-mcp failed (main/orchestrator binaries rolled back): {}", String::from_utf8_lossy(&o.stderr)), None);
+                return;
+            }
+            Err(e) => {
+                let _ = tokio::fs::rename(&bkp_main, &install_dest_main).await;
+                let _ = tokio::fs::rename(&bkp_mcp, &install_dest_mcp).await;
+                yield sse("error", format!("install command error for assistant-mcp (main/orchestrator rolled back): {}", e), None);
+                return;
+            }
+        }
+        yield sse("log", format!("Backups: {}, {}, {}", bkp_main, bkp_mcp, bkp_assistant_mcp), Some(88));
 
         // Schedule the restart in a fully detached process so this SSE
         // response can flush its final event before systemd SIGTERMs us.
@@ -2178,70 +3101,75 @@ fn stream_codex_uninstall() -> impl Stream<Item = Result<Event, std::convert::In
     stream_package_uninstall("@openai/codex", ".codex", "Codex")
 }
 
-/// Stream the oh-my-opencode update process.
-fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+/// Stream the Grok Build install/update process.
+fn stream_grok_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
-        yield sse("log", "Starting oh-my-opencode update...", Some(0));
+        yield sse("log", "Starting Grok Build installation/update...", Some(0));
 
-        let home = home_dir();
-
-        // Remove conflicting npm/nvm global installs (we only use bunx)
-        yield sse("log", "Removing npm/nvm global installs...", Some(5));
-        let _ = Command::new("bash")
-            .args([
-                "-c",
-                "npm uninstall -g oh-my-opencode 2>/dev/null || true",
-            ])
-            .output()
-            .await;
-
-        // Clear ALL oh-my-opencode caches (bun stores in multiple locations)
-        yield sse("log", "Clearing oh-my-opencode caches...", Some(15));
-        let cache_clear_script = format!(
-            r#"
-            rm -rf {home}/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.cache/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.npm/_npx/*/node_modules/oh-my-opencode* 2>/dev/null
-            "#,
-            home = home
-        );
-        let _ = Command::new("bash")
-            .args(["-c", &cache_clear_script])
-            .output()
-            .await;
-
-        yield sse("log", "Running bunx oh-my-opencode@latest install...", Some(25));
-
-        // Run the install command with @latest to force the newest version
-        // Enable all providers by default for updates
-        match Command::new("bunx")
-            .args([
-                "oh-my-opencode@latest",
-                "install",
-                "--no-tui",
-                "--claude=yes",
-                "--openai=yes",
-                "--gemini=yes",
-                "--copilot=no",
-            ])
+        match Command::new("bash")
+            .args(["-lc", "curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash"])
             .output()
             .await
         {
             Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let summary: String = stdout.lines().take(5).collect::<Vec<_>>().join("\n");
-                yield sse("log", format!("Installation output: {summary}"), Some(80));
-                yield sse("complete", "oh-my-opencode updated successfully!", Some(100));
+                yield sse("log", "Installation complete, verifying...", Some(80));
+
+                let version = Command::new("grok").arg("--version").output().await
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| {
+                        let combined = format!(
+                            "{} {}",
+                            String::from_utf8_lossy(&o.stdout),
+                            String::from_utf8_lossy(&o.stderr)
+                        );
+                        extract_version_token(&combined)
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                if version != "unknown" {
+                    yield sse("complete", format!("Grok Build installed successfully! Version: {version}"), Some(100));
+                } else {
+                    yield sse("complete", "Grok Build installed, but version check failed. You may need to restart your shell.", Some(100));
+                }
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                yield sse("error", format!("Failed to update oh-my-opencode: {} {}", stderr, stdout), None);
+                yield sse("error", format!("Failed to install Grok Build: {} {}", stderr.trim(), stdout.trim()), None);
             }
             Err(e) => {
-                yield sse("error", format!("Failed to run update: {}", e), None);
+                yield sse("error", format!("Failed to run Grok Build installer: {}", e), None);
             }
         }
+    }
+}
+
+/// Stream the Grok Build uninstall process.
+fn stream_grok_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
+        yield sse("log", "Starting Grok Build uninstall...", Some(0));
+
+        for path in ["/usr/local/bin/grok", "/usr/bin/grok"] {
+            if std::path::Path::new(path).exists() {
+                match Command::new("rm").args(["-f", path]).output().await {
+                    Ok(output) if output.status.success() => {
+                        yield sse("log", format!("Removed {path}"), Some(60));
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        yield sse("error", format!("Failed to remove {path}: {}", stderr.trim()), None);
+                        return;
+                    }
+                    Err(e) => {
+                        yield sse("error", format!("Failed to remove {path}: {}", e), None);
+                        return;
+                    }
+                }
+            }
+        }
+
+        yield sse("complete", "Grok Build uninstalled successfully.", Some(100));
     }
 }
 
@@ -2435,65 +3363,67 @@ fn stream_claude_code_uninstall() -> impl Stream<Item = Result<Event, std::conve
     stream_package_uninstall("@anthropic-ai/claude-code", ".claude", "Claude Code")
 }
 
-/// Stream the oh-my-opencode uninstall process.
-fn stream_oh_my_opencode_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>>
-{
-    async_stream::stream! {
-        yield sse("log", "Starting oh-my-opencode uninstall...", Some(0));
-
-        let home = home_dir();
-
-        // Remove npm global install if exists
-        yield sse("log", "Removing npm global install...", Some(10));
-        let _ = Command::new("npm")
-            .args(["uninstall", "-g", "oh-my-opencode"])
-            .output()
-            .await;
-
-        // Clear bun cache for oh-my-opencode
-        yield sse("log", "Clearing oh-my-opencode caches...", Some(30));
-        let cache_clear_script = format!(
-            r#"
-            rm -rf {home}/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.cache/.bun/install/cache/oh-my-opencode* 2>/dev/null
-            rm -rf {home}/.npm/_npx/*/node_modules/oh-my-opencode* 2>/dev/null
-            "#,
-            home = home
-        );
-        let _ = Command::new("bash")
-            .args(["-c", &cache_clear_script])
-            .output()
-            .await;
-
-        // Remove the oh-my-opencode config file
-        yield sse("log", "Removing oh-my-opencode configuration...", Some(60));
-        let config_path = format!("{}/.config/opencode/oh-my-opencode.json", home);
-        if std::path::Path::new(&config_path).exists() {
-            match Command::new("rm")
-                .args(["-f", &config_path])
-                .output()
-                .await
-            {
-                Ok(o) if o.status.success() => {
-                    yield sse("log", "Removed oh-my-opencode.json", Some(80));
-                }
-                _ => {}
-            }
-        }
-
-        yield sse("complete", "oh-my-opencode uninstalled successfully!", Some(100));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         evaluate_debounce, evaluate_deploy_request, extract_version_token, is_safe_repo_path,
-        normalize_repo_path, select_repo_path, DebounceDecision, DeployRefusal,
-        DEPLOY_DEBOUNCE_SECS,
+        normalize_repo_path, select_repo_path, systemd_service_component_from_states,
+        ComponentStatus, DebounceDecision, DeployRefusal, DEPLOY_DEBOUNCE_SECS,
     };
 
     // ─── Deploy safety rails ────────────────────────────────────────────────
+
+    #[test]
+    fn systemd_service_component_reports_active_service_ok() {
+        let component = systemd_service_component_from_states(
+            "hermes_assistant",
+            "hermes-assistant-dev.service",
+            "loaded",
+            "active",
+            "/etc/systemd/system/hermes-assistant-dev.service",
+        )
+        .expect("loaded service should be reported");
+
+        assert_eq!(component.name, "hermes_assistant");
+        assert!(component.installed);
+        assert_eq!(
+            component.path.as_deref(),
+            Some("/etc/systemd/system/hermes-assistant-dev.service")
+        );
+        assert!(matches!(component.status, ComponentStatus::Ok));
+    }
+
+    #[test]
+    fn systemd_service_component_reports_loaded_inactive_service_error() {
+        let component = systemd_service_component_from_states(
+            "hermes_assistant",
+            "hermes-assistant-dev.service",
+            "loaded",
+            "inactive",
+            "",
+        )
+        .expect("loaded inactive service should be visible");
+
+        assert!(component.installed);
+        assert_eq!(
+            component.path.as_deref(),
+            Some("hermes-assistant-dev.service")
+        );
+        assert!(matches!(component.status, ComponentStatus::Error));
+    }
+
+    #[test]
+    fn systemd_service_component_ignores_unloaded_services() {
+        let component = systemd_service_component_from_states(
+            "hermes_assistant",
+            "hermes-assistant-dev.service",
+            "not-found",
+            "inactive",
+            "",
+        );
+
+        assert!(component.is_none());
+    }
 
     #[test]
     fn debounce_allows_when_no_prior_deploy() {
@@ -2538,7 +3468,7 @@ mod tests {
 
     #[test]
     fn deploy_refuses_self_target_by_default() {
-        let r = evaluate_deploy_request(true, None, false);
+        let r = evaluate_deploy_request(None, None, true, None, false);
         assert_eq!(r, Some(DeployRefusal::SelfTarget));
     }
 
@@ -2547,15 +3477,21 @@ mod tests {
         // force=true bypasses self-protection (caller explicitly accepts
         // the in-flight turn dying). Still respects debounce unless the
         // debounce is also force-bypassed, which it is.
-        assert_eq!(evaluate_deploy_request(true, None, true), None);
+        assert_eq!(evaluate_deploy_request(None, None, true, None, true), None);
     }
 
     #[test]
     fn deploy_cross_service_no_self_protection() {
         // calling_on_self=false → no self-target refusal, no debounce
         // hit, no refusal at all.
-        assert_eq!(evaluate_deploy_request(false, None, false), None);
-        assert_eq!(evaluate_deploy_request(false, Some(10_000), false), None);
+        assert_eq!(
+            evaluate_deploy_request(None, None, false, None, false),
+            None
+        );
+        assert_eq!(
+            evaluate_deploy_request(None, None, false, Some(10_000), false),
+            None
+        );
     }
 
     #[test]
@@ -2563,14 +3499,17 @@ mod tests {
         // calling_on_self=false, but a deploy fired 30s ago — debounce
         // should refuse even though the self check passed.
         assert_eq!(
-            evaluate_deploy_request(false, Some(30), false),
+            evaluate_deploy_request(None, None, false, Some(30), false),
             Some(DeployRefusal::Debounced { since_secs: 30 })
         );
     }
 
     #[test]
     fn deploy_force_bypasses_both_self_and_debounce() {
-        assert_eq!(evaluate_deploy_request(true, Some(0), true), None);
+        assert_eq!(
+            evaluate_deploy_request(None, None, true, Some(0), true),
+            None
+        );
     }
 
     #[test]
@@ -2579,8 +3518,38 @@ mod tests {
         // meaningful one (self-target) so the agent sees the actual reason
         // instead of being told "wait a bit and retry" only to discover
         // it'd kill itself.
-        let r = evaluate_deploy_request(true, Some(30), false);
+        let r = evaluate_deploy_request(None, None, true, Some(30), false);
         assert_eq!(r, Some(DeployRefusal::SelfTarget));
+    }
+
+    #[test]
+    fn deploy_refuses_wrong_expected_service() {
+        let r = evaluate_deploy_request(
+            Some("sandboxed-sh-prod.service"),
+            Some("sandboxed-sh-dev.service"),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(
+            r,
+            Some(DeployRefusal::WrongService {
+                expected: "sandboxed-sh-dev.service".to_string(),
+                actual: "sandboxed-sh-prod.service".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn deploy_expected_service_match_allows_next_checks() {
+        let r = evaluate_deploy_request(
+            Some("sandboxed-sh-dev.service"),
+            Some("sandboxed-sh-dev.service"),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(r, None);
     }
 
     #[test]
