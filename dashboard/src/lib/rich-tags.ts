@@ -8,12 +8,35 @@
  */
 
 // Matches self-closing <image .../>/<file .../> tags and paired
-// <file ...></file> tags. Agents vary the exact XML-ish spelling while
-// streaming, so keep this parser deliberately small but permissive.
-const TAG_RE = /<(image|file)\s+([^>]*?)(?:\/\s*>|>\s*<\/\1\s*>)/gi;
+// <file ...>inner text</file> tags. The paired form captures any inner text
+// (group 3) so a display name written between the tags — e.g.
+// `<file path="r.pdf">My Report</file>` — is recognized instead of rendered
+// raw. Agents vary the exact XML-ish spelling while streaming, so keep this
+// parser deliberately small but permissive.
+const TAG_RE = /<(image|file)\s+([^>]*?)(?:\/\s*>|>([\s\S]*?)<\/\1\s*>)/gi;
 
-// Matches a partial (unclosed) tag at the end of streaming content
-const PARTIAL_TAG_RE = /<(?:image|file)(?:\s+[^>]*)?$/i;
+// Matches a partial (unclosed) tag at the end of streaming content: either a
+// half-written opening tag (`<file path="bar` — no `>` yet) or a fully opened
+// paired tag whose closing `</file>` hasn't streamed in yet
+// (`<file path="x">partial nam`). Excludes self-closing `/>` tags.
+const PARTIAL_TAG_RE =
+  /<(?:image|file)(?:\s+[^>]*)?$|<(?:image|file)\s+[^>]*[^/>]>(?:(?!<\/(?:image|file)\s*>)[\s\S])*$/i;
+
+/**
+ * Trim and collapse whitespace; returns undefined when the value is empty or
+ * whitespace-only. Used so an explicit empty/blank attribute (`name=""`,
+ * `alt="  "`) is treated as absent consistently across parse/transform/strip —
+ * falling back to inner text, then the path basename.
+ */
+function presentText(value: string | undefined): string | undefined {
+  const collapsed = value?.trim().replace(/\s+/g, " ");
+  return collapsed ? collapsed : undefined;
+}
+
+/** Escape markdown link/image label delimiters so freeform text stays inert. */
+function escapeLinkText(value: string): string {
+  return value.replace(/[[\]]/g, "\\$&");
+}
 
 interface RichTag {
   type: "image" | "file";
@@ -42,11 +65,12 @@ export function parseRichTags(content: string): RichTag[] {
     const tagType = m[1].toLowerCase() as "image" | "file";
     const attrs = parseAttrs(m[2]);
     if (!attrs.path) continue;
+    const innerText = presentText(m[3]);
     tags.push({
       type: tagType,
       path: attrs.path,
-      alt: attrs.alt,
-      name: attrs.name,
+      alt: presentText(attrs.alt) ?? (tagType === "image" ? innerText : undefined),
+      name: presentText(attrs.name) ?? (tagType === "file" ? innerText : undefined),
     });
   }
   return tags;
@@ -60,18 +84,23 @@ export function parseRichTags(content: string): RichTag[] {
  * Paths are URI-encoded to handle spaces and special characters.
  */
 export function transformRichTags(content: string): string {
-  return content.replace(TAG_RE, (_match, tagType: string, attrStr: string) => {
-    const attrs = parseAttrs(attrStr);
-    if (!attrs.path) return _match; // leave malformed tags as-is
-    const encodedPath = encodeURIComponent(attrs.path);
-    if (tagType.toLowerCase() === "image") {
-      const alt = attrs.alt || attrs.path.split("/").pop() || "image";
-      return `![${alt}](sandboxed-image://${encodedPath})`;
-    } else {
-      const name = attrs.name || attrs.path.split("/").pop() || "file";
-      return `[${name}](sandboxed-file://${encodedPath})`;
-    }
-  });
+  return content.replace(
+    TAG_RE,
+    (_match, tagType: string, attrStr: string, inner?: string) => {
+      const attrs = parseAttrs(attrStr);
+      if (!attrs.path) return _match; // leave malformed tags as-is
+      const innerText = presentText(inner);
+      const basename = attrs.path.split("/").pop();
+      const encodedPath = encodeURIComponent(attrs.path);
+      if (tagType.toLowerCase() === "image") {
+        const alt = presentText(attrs.alt) ?? innerText ?? basename ?? "image";
+        return `![${escapeLinkText(alt)}](sandboxed-image://${encodedPath})`;
+      } else {
+        const name = presentText(attrs.name) ?? innerText ?? basename ?? "file";
+        return `[${escapeLinkText(name)}](sandboxed-file://${encodedPath})`;
+      }
+    },
+  );
 }
 
 function fileStem(value: string): string {
@@ -109,11 +138,11 @@ export function stripRichFileTagsByName(
   }
   if (nameSet.size === 0) return content;
 
-  return content.replace(TAG_RE, (match, tagType: string, attrStr: string) => {
+  return content.replace(TAG_RE, (match, tagType: string, attrStr: string, inner?: string) => {
     if (tagType.toLowerCase() !== "file") return match;
     const attrs = parseAttrs(attrStr);
     const base = basename(attrs.path);
-    const displayName = attrs.name || base;
+    const displayName = presentText(attrs.name) ?? presentText(inner) ?? base;
     const candidates = [
       displayName,
       base,

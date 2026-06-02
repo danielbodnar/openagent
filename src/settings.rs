@@ -5,13 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Global cached RTK enabled state, updated when settings change.
-/// This allows synchronous checks from non-async contexts.
-static RTK_ENABLED_CACHED: AtomicBool = AtomicBool::new(false);
 /// Global cached max parallel missions value.
 /// A value of 0 means "unset" and callers should fall back to their default.
 static MAX_PARALLEL_MISSIONS_CACHED: AtomicUsize = AtomicUsize::new(0);
@@ -45,10 +42,6 @@ pub struct Settings {
     /// Dashboard-managed auth settings (password hash, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthSettings>,
-    /// Whether RTK (Rich Terminal Kit) wrapping is enabled for terminal commands.
-    /// When None, falls back to the SANDBOXED_SH_RTK_ENABLED env var (default: false).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtk_enabled: Option<bool>,
     /// Maximum number of missions that can run in parallel.
     /// When None, falls back to the MAX_PARALLEL_MISSIONS env var (default: 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +59,11 @@ pub struct Settings {
     /// older than this becomes eligible for GC. When None, defaults to 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cleanup_days: Option<u32>,
+    /// Model for the Ask assistant (sidecar co-pilot). When None, falls back to
+    /// the `ASK_ASSISTANT_MODEL` env var, then the built-in default
+    /// (`gpt-oss-120b`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_assistant_model: Option<String>,
 }
 
 /// In-memory store for global settings with disk persistence.
@@ -114,15 +112,6 @@ impl SettingsStore {
 
     /// Load settings from environment variables as initial defaults.
     fn defaults_from_env() -> Settings {
-        let rtk_enabled = std::env::var("SANDBOXED_SH_RTK_ENABLED")
-            .ok()
-            .and_then(|v| {
-                matches!(
-                    v.trim().to_lowercase().as_str(),
-                    "1" | "true" | "yes" | "y" | "on"
-                )
-                .then_some(true)
-            });
         let max_parallel_missions = std::env::var("MAX_PARALLEL_MISSIONS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -141,11 +130,11 @@ impl SettingsStore {
                 .ok()
                 .or_else(|| Some(DEFAULT_SANDBOXED_REPO_PATH.to_string())),
             auth: None,
-            rtk_enabled,
             max_parallel_missions,
             max_concurrent_tasks,
             auto_cleanup_enabled: None,
             auto_cleanup_days: None,
+            ask_assistant_model: std::env::var("ASK_ASSISTANT_MODEL").ok(),
         }
     }
 
@@ -231,36 +220,6 @@ impl SettingsStore {
         self.save_to_disk().await
     }
 
-    /// Get the RTK enabled setting.
-    /// Returns None if not explicitly set (caller should check env var as fallback).
-    pub async fn get_rtk_enabled(&self) -> Option<bool> {
-        self.settings.read().await.rtk_enabled
-    }
-
-    /// Update the RTK enabled setting.
-    ///
-    /// Returns `(changed, previous_value)`.
-    pub async fn set_rtk_enabled(
-        &self,
-        enabled: Option<bool>,
-    ) -> Result<(bool, Option<bool>), std::io::Error> {
-        let mut settings = self.settings.write().await;
-        let previous = settings.rtk_enabled;
-
-        if previous != enabled {
-            settings.rtk_enabled = enabled;
-            // Update the cached value for synchronous access
-            if let Some(e) = enabled {
-                set_rtk_enabled_cached(e);
-            }
-            drop(settings); // Release lock before saving
-            self.save_to_disk().await?;
-            Ok((true, previous))
-        } else {
-            Ok((false, previous))
-        }
-    }
-
     /// Get the max parallel missions setting.
     /// Returns None if not explicitly set (caller should check env var as fallback).
     pub async fn get_max_parallel_missions(&self) -> Option<usize> {
@@ -308,9 +267,6 @@ impl SettingsStore {
             let mut settings = self.settings.write().await;
             *settings = loaded;
             // Refresh atomic caches from the reloaded settings.
-            if let Some(enabled) = settings.rtk_enabled {
-                set_rtk_enabled_cached(enabled);
-            }
             if let Some(limit) = settings.max_parallel_missions {
                 set_max_parallel_missions_cached(limit);
             }
@@ -351,9 +307,6 @@ impl SettingsStore {
         // Try to get the current value using block_in_place for sync access
         // Since we're in the constructor/startup context, use try_read
         if let Ok(settings) = self.settings.try_read() {
-            if let Some(enabled) = settings.rtk_enabled {
-                set_rtk_enabled_cached(enabled);
-            }
             if let Some(limit) = settings.max_parallel_missions {
                 set_max_parallel_missions_cached(limit);
             }
@@ -366,18 +319,6 @@ impl SettingsStore {
 
 /// Shared settings store wrapped in Arc for concurrent access.
 pub type SharedSettingsStore = Arc<SettingsStore>;
-
-/// Get the cached RTK enabled state.
-/// This is a synchronous check that uses a cached value updated when settings change.
-pub fn rtk_enabled_cached() -> bool {
-    RTK_ENABLED_CACHED.load(Ordering::Relaxed)
-}
-
-/// Update the cached RTK enabled state.
-/// Called during startup and when the setting is changed via the API.
-pub fn set_rtk_enabled_cached(enabled: bool) {
-    RTK_ENABLED_CACHED.store(enabled, Ordering::Relaxed);
-}
 
 /// Get the effective max parallel missions limit from cache, with a fallback default.
 pub fn max_parallel_missions_cached_or(default: usize) -> usize {

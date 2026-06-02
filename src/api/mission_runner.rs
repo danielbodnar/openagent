@@ -2757,12 +2757,34 @@ fn is_claudecode_incomplete_turn_transport_error(result: &AgentResult) -> bool {
         || out.contains("Claude Code did not emit a terminal result event before the turn ended")
 }
 
+/// Detects Anthropic's "stale thinking block" rejection surfaced through the
+/// Claude Code turn output: a replayed `thinking`/`redacted_thinking` block in
+/// the session transcript no longer matches what the API issued (typically
+/// because it was produced under a different model). Resuming the same session
+/// just replays the same blocks, so this must escalate straight to a fresh
+/// session rather than a same-session retry.
+pub(crate) fn is_stale_thinking_error(result: &AgentResult) -> bool {
+    let output = result.output.to_lowercase();
+    output.contains("cannot be modified")
+        && (output.contains("thinking") || output.contains("redacted_thinking"))
+}
+
 pub(crate) fn claudecode_transport_recovery_strategy(
     result: &AgentResult,
     has_session_id: bool,
     attempted_same_session_resume: bool,
     attempted_session_reset: bool,
 ) -> ClaudeTransportRecoveryStrategy {
+    // A stale-thinking rejection lives in the replayed session transcript;
+    // resuming the same session would hit it again, so go straight to a fresh
+    // session (which rebuilds context as text and drops the signed thinking).
+    if is_stale_thinking_error(result) {
+        if attempted_session_reset {
+            return ClaudeTransportRecoveryStrategy::None;
+        }
+        return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+    }
+
     if !is_session_corruption_error(result) {
         return ClaudeTransportRecoveryStrategy::None;
     }
@@ -2841,6 +2863,25 @@ async fn run_mission_turn(
     boss_user_id: Option<String>,
 ) -> AgentResult {
     let mut config = config;
+    // Operator-note bridge: flush any pending Ask-assistant writes into this
+    // turn's message so the working agent learns about out-of-band edits it
+    // didn't make. Passive by construction — this only runs because a turn is
+    // already executing, so it can never wake an idle agent. Delivery is
+    // harness-agnostic (every backend receives `user_message` as a string); the
+    // note also becomes part of the logged turn, giving an inherent audit trail.
+    let mut user_message = user_message;
+    if let Ok(ask_store) = crate::api::ask::ask_store(&config).await {
+        let (msg, flushed) =
+            crate::api::ask::prepend_pending_operator_notes(&ask_store, mission_id, user_message)
+                .await;
+        user_message = msg;
+        if flushed > 0 {
+            tracing::info!(
+                mission_id = %mission_id,
+                "[Ask] flushed {flushed} operator note(s) into working-agent turn"
+            );
+        }
+    }
     let effective_agent = agent_override.clone();
     if let Some(ref agent) = effective_agent {
         config.opencode_agent = Some(agent.clone());
@@ -3548,13 +3589,17 @@ async fn run_mission_turn(
                         tracing::warn!(
                             mission_id = %mission_id,
                             requested_model = ?requested_model,
-                            "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                            "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
                         );
                         result = run_codex_turn(
                             &workspace,
                             &mission_work_dir,
                             codex_message,
-                            None,
+                            // Was `None`, which made the Codex CLI fall back to
+                            // its built-in default — currently the retired
+                            // `gpt-5.3-codex`, rejected by ChatGPT-account auth
+                            // with a 400. Retry on the requested (latest) model.
+                            requested_model,
                             model_effort.as_deref(),
                             effective_agent.as_deref(),
                             mission_id,
@@ -3685,13 +3730,16 @@ async fn run_mission_turn(
                                 attempt = attempt_idx,
                                 requested_model = ?requested_model,
                                 credential = %credential_label,
-                                "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use"
+                                "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
                             );
                             result = run_codex_turn(
                                 &workspace,
                                 &mission_work_dir,
                                 codex_message,
-                                None,
+                                // Was `None` (stale CLI default gpt-5.3-codex,
+                                // 400 on ChatGPT auth). Retry on the requested
+                                // (latest) model instead.
+                                requested_model,
                                 model_effort.as_deref(),
                                 effective_agent.as_deref(),
                                 mission_id,
@@ -3876,6 +3924,28 @@ fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
         }
     }
     None
+}
+
+/// Map a mission `model_effort` to a Claude Code extended-thinking budget
+/// (`MAX_THINKING_TOKENS`).
+///
+/// `CLAUDE_CODE_EFFORT_LEVEL` alone only nudges *adaptive* reasoning: on
+/// tool-heavy turns the model frequently chooses not to think at all, so no
+/// `thinking_delta` blocks stream and the Thoughts panel stays empty (see
+/// mission 5aede562, which ran at effort=max yet recorded 0 thinking events
+/// across ~1600 tool calls). Pinning a non-zero budget forces an extended
+/// thinking block every turn, so thoughts are captured deterministically.
+///
+/// Returns 0 for unknown efforts, leaving thinking fully adaptive.
+fn claude_thinking_budget(effort: &str) -> u32 {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "max" => 32_000,
+        "xhigh" => 24_000,
+        "high" => 16_000,
+        "medium" => 8_000,
+        "low" => 4_000,
+        _ => 0,
+    }
 }
 
 /// Execute a turn using Claude Code CLI backend.
@@ -4780,10 +4850,25 @@ pub fn run_claudecode_turn<'a>(
         // Claude Code reads CLAUDE_CODE_EFFORT_LEVEL to control adaptive reasoning depth.
         if let Some(effort) = model_effort {
             env.insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), effort.to_string());
+
+            // CLAUDE_CODE_EFFORT_LEVEL only nudges adaptive reasoning, which
+            // leaves the Thoughts panel empty on tool-heavy turns. Pin an
+            // explicit extended-thinking budget so every turn emits a thinking
+            // block we can capture and stream. (The capture pipeline already
+            // handles thinking_delta — see backend/shared.rs — the CLI just
+            // wasn't emitting any.)
+            let thinking_tokens = claude_thinking_budget(effort);
+            if thinking_tokens > 0 {
+                env.insert(
+                    "MAX_THINKING_TOKENS".to_string(),
+                    thinking_tokens.to_string(),
+                );
+            }
             tracing::info!(
                 mission_id = %mission_id,
                 effort = %effort,
-                "Setting Claude Code effort level via CLAUDE_CODE_EFFORT_LEVEL"
+                max_thinking_tokens = thinking_tokens,
+                "Setting Claude Code effort level + extended-thinking budget"
             );
         }
 
@@ -5272,6 +5357,32 @@ pub fn run_claudecode_turn<'a>(
                     pty.kill();
                     reader_handle.abort();
                     break;
+                }
+                // Timer-based liveness heartbeat, gated to AwaitingToolResults.
+                //
+                // While a foreground tool runs (notably a long build), the CLI
+                // emits no stream events for minutes, so the event-gated
+                // heartbeat below never fires. The actor-level stuck-mission
+                // watchdog (control.rs, 900s) keys off broadcast events and
+                // would cancel the mission mid-tool — even though the turn-level
+                // `tool_idle_timeout` (much larger) is the correct arbiter for a
+                // running tool. Emitting a heartbeat on a timer here makes the
+                // coarse watchdog defer to `tool_idle_timeout`.
+                //
+                // Strictly gated to AwaitingToolResults so it does NOT mask a
+                // genuine hang: a fire-and-forget background job that returns
+                // immediately leaves the turn in AwaitingTerminalResult/
+                // AwaitingClaude (not this state), so those stalls remain subject
+                // to the watchdog as before.
+                _ = tokio::time::sleep_until(last_heartbeat_at + heartbeat_interval),
+                    if saw_non_init_event
+                        && matches!(turn_wait_state, ClaudeTurnWaitState::AwaitingToolResults) => {
+                    let _ = events_tx.send(AgentEvent::MissionActivity {
+                        label: "Tool running…".to_string(),
+                        tool_name: "claudecode_heartbeat".to_string(),
+                        mission_id: Some(mission_id),
+                    });
+                    last_heartbeat_at = Instant::now();
                 }
                 line_opt = line_rx.recv() => {
                     let Some(raw_line) = line_opt else {
@@ -12247,6 +12358,22 @@ fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
     buffer.push_str(&fragment[overlap..]);
 }
 
+/// Detect the Grok CLI's interactive sign-in prompt. The CLI prints these to
+/// stderr when it can't authenticate non-interactively, then blocks on a local
+/// OAuth callback that never arrives in a headless mission. Matching any of
+/// these lets the runner fail fast instead of hanging.
+fn grok_line_requests_interactive_login(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("signing in with grok")
+        || lower.contains("open this url to sign in")
+        || lower.contains("oauth2/authorize")
+}
+
+fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_err()
+        && grok_line_requests_interactive_login(line)
+}
+
 /// Execute a turn using the Grok Build CLI backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_grok_turn(
@@ -12300,6 +12427,12 @@ pub async fn run_grok_turn(
         args.push(model.to_string());
     }
 
+    // The Grok CLI authenticates non-interactively via the XAI_API_KEY env var.
+    // The xAI OAuth access token works as a bearer key against api.x.ai, so we
+    // capture the freshest one here and inject it below. Without it the CLI
+    // falls back to an interactive browser sign-in that never completes in a
+    // headless mission — the run then hangs forever ("Agent is working").
+    let mut oauth_access_token: Option<String> = None;
     if let Some(entry) =
         crate::api::ai_providers::read_oauth_token_entry(crate::ai_providers::ProviderType::Xai)
     {
@@ -12310,7 +12443,8 @@ pub async fn run_grok_turn(
             )
             .await
             {
-                Ok((_access, _refresh, expires_at)) => {
+                Ok((access, _refresh, expires_at)) => {
+                    oauth_access_token = Some(access);
                     tracing::info!(
                         mission_id = %mission_id,
                         expires_at,
@@ -12338,16 +12472,19 @@ pub async fn run_grok_turn(
                     .with_terminal_reason(TerminalReason::LlmError);
                 }
             }
-        } else if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
-            &entry.refresh_token,
-            &entry.access_token,
-            entry.expires_at,
-        ) {
-            tracing::warn!(
-                mission_id = %mission_id,
-                error = %err,
-                "Failed to materialize fresh xAI OAuth token into Grok auth file"
-            );
+        } else {
+            oauth_access_token = Some(entry.access_token.clone());
+            if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
+                &entry.refresh_token,
+                &entry.access_token,
+                entry.expires_at,
+            ) {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    error = %err,
+                    "Failed to materialize fresh xAI OAuth token into Grok auth file"
+                );
+            }
         }
     }
 
@@ -12355,17 +12492,29 @@ pub async fn run_grok_turn(
         tracing::warn!(mission_id = %mission_id, error = %err, "Failed to sync Grok OAuth auth file");
     }
 
+    // Authenticate the Grok CLI non-interactively via XAI_API_KEY. Priority:
+    // an explicit xAI API key, then the captured OAuth access token, then any
+    // ambient env key. Setting this is what prevents the interactive-sign-in
+    // hang; the CLI prints "You are using XAI_API_KEY" and goes straight to
+    // api.x.ai.
     let mut env = HashMap::new();
-    if let Some(key) = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir) {
+    let xai_api_key = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir)
+        .or_else(|| oauth_access_token.clone())
+        .or_else(|| {
+            std::env::var("XAI_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty())
+        })
+        .or_else(|| {
+            std::env::var("GROK_CODE_XAI_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty())
+        });
+    if let Some(key) = xai_api_key {
+        // Newer Grok CLIs read XAI_API_KEY; keep GROK_CODE_XAI_API_KEY for
+        // backward compatibility with older builds.
+        env.insert("XAI_API_KEY".to_string(), key.clone());
         env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
-    } else if let Ok(key) = std::env::var("GROK_CODE_XAI_API_KEY") {
-        if !key.trim().is_empty() {
-            env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
-        }
-    } else if let Ok(key) = std::env::var("XAI_API_KEY") {
-        if !key.trim().is_empty() {
-            env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
-        }
     }
 
     let mut child = match workspace_exec
@@ -12390,6 +12539,11 @@ pub async fn run_grok_turn(
     let stderr = child.stderr.take();
     let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     let stderr_capture_clone = stderr_capture.clone();
+    // The Grok CLI prints its interactive sign-in prompt to STDERR, then blocks
+    // on a local OAuth callback. Watch for it here and signal the main loop to
+    // abort so the mission fails fast instead of hanging forever.
+    let auth_fail = CancellationToken::new();
+    let auth_fail_signal = auth_fail.clone();
     let mut stderr_handle = stderr.map(|stderr| {
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
@@ -12398,6 +12552,9 @@ pub async fn run_grok_turn(
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
+                }
+                if grok_line_requests_interactive_login(trimmed) {
+                    auth_fail_signal.cancel();
                 }
                 let mut captured = stderr_capture_clone.lock().await;
                 if !captured.is_empty() {
@@ -12435,6 +12592,19 @@ pub async fn run_grok_turn(
                 cancelled = true;
                 break;
             }
+            _ = auth_fail.cancelled() => {
+                // Grok CLI emitted an interactive sign-in prompt (it can't
+                // authenticate non-interactively). Kill it and fail fast.
+                let _ = child.kill().await;
+                if let Some(handle) = stderr_handle.take() {
+                    handle.abort();
+                }
+                return AgentResult::failure(
+                    "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::LlmError);
+            }
             line_result = lines.next_line() => {
                 match line_result {
                     Ok(Some(line)) => {
@@ -12444,6 +12614,21 @@ pub async fn run_grok_turn(
                         let value: serde_json::Value = match serde_json::from_str(&line) {
                             Ok(value) => value,
                             Err(_) => {
+                                // Fail fast on raw interactive sign-in prompts.
+                                // Valid streaming-json events may contain these
+                                // substrings as assistant/tool text, so only
+                                // inspect stdout after JSON parsing fails.
+                                if grok_stdout_line_requests_interactive_login(&line) {
+                                    let _ = child.kill().await;
+                                    if let Some(handle) = stderr_handle.take() {
+                                        handle.abort();
+                                    }
+                                    return AgentResult::failure(
+                                        "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
+                                        0,
+                                    )
+                                    .with_terminal_reason(TerminalReason::LlmError);
+                                }
                                 if final_result.is_empty() {
                                     final_result.push_str(&line);
                                 } else {
@@ -14429,8 +14614,8 @@ mod tests {
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
-        inject_telegram_identity_into_claude_md, localhost_api_base_url, merge_stream_fragment,
-        public_api_base_url,
+        grok_stdout_line_requests_interactive_login, inject_telegram_identity_into_claude_md,
+        localhost_api_base_url, merge_stream_fragment, public_api_base_url,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
     use crate::library::types::CommandParam;
@@ -14521,6 +14706,21 @@ mod tests {
 
         assert_eq!(grok_event_text(&event).as_deref(), Some("visible answer"));
         assert_eq!(grok_event_reasoning(&event), None);
+    }
+
+    #[test]
+    fn grok_stdout_login_detection_ignores_json_content() {
+        let event = json!({
+            "type": "text",
+            "data": "The docs mention https://auth.x.ai/oauth2/authorize in passing"
+        });
+
+        assert!(!grok_stdout_line_requests_interactive_login(
+            &event.to_string()
+        ));
+        assert!(grok_stdout_line_requests_interactive_login(
+            "Open this URL to sign in: https://auth.x.ai/oauth2/authorize?client_id=abc"
+        ));
     }
 
     #[test]
@@ -16086,6 +16286,29 @@ mod tests {
         assert_eq!(
             claudecode_transport_recovery_strategy(&result, true, false, false),
             ClaudeTransportRecoveryStrategy::ResumeCurrentSession
+        );
+    }
+
+    #[test]
+    fn claudecode_transport_recovery_strategy_resets_fresh_for_stale_thinking() {
+        // The stale-thinking 400 lives in the replayed transcript, so the
+        // strategy must go straight to a fresh session — even though a session
+        // id exists and no same-session resume was attempted yet (a resume
+        // would just replay the same rejected blocks).
+        let result = AgentResult::failure(
+            "API Error: 400 messages.7.content.17: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, false, false),
+            ClaudeTransportRecoveryStrategy::ResetSessionFresh
+        );
+        // Once a reset has been attempted, give up rather than loop.
+        assert_eq!(
+            claudecode_transport_recovery_strategy(&result, true, true, true),
+            ClaudeTransportRecoveryStrategy::None
         );
     }
 

@@ -9,7 +9,6 @@ import {
   updateSettings,
   downloadBackup,
   restoreBackup,
-  updateRtkEnabled,
 } from '@/lib/api';
 import {
   GitBranch,
@@ -19,7 +18,7 @@ import {
   Download,
   Upload,
   Archive,
-  Terminal,
+  Sparkles,
   Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -31,7 +30,6 @@ export default function DataSettingsPage() {
   const [editingRepoPath, setEditingRepoPath] = useState(false);
   const [repoPathValue, setRepoPathValue] = useState('');
   const [savingRepoPath, setSavingRepoPath] = useState(false);
-  const [togglingRtk, setTogglingRtk] = useState(false);
   const [togglingAutoCleanup, setTogglingAutoCleanup] = useState(false);
   const [editingCleanupDays, setEditingCleanupDays] = useState(false);
   const [cleanupDaysValue, setCleanupDaysValue] = useState('');
@@ -50,6 +48,36 @@ export default function DataSettingsPage() {
     getSettings,
     { revalidateOnFocus: false }
   );
+
+  const [askModelValue, setAskModelValue] = useState<string | null>(null);
+  const [savingAskModel, setSavingAskModel] = useState(false);
+  const handleSaveAskModel = async () => {
+    setSavingAskModel(true);
+    try {
+      // Use the effective displayed value, not just local edits: when the user
+      // hasn't typed, askModelValue is null and we must preserve the saved
+      // model rather than clear it. Clearing only happens when the user
+      // explicitly empties the field (askModelValue === "").
+      const trimmed = (
+        askModelValue ??
+        serverSettings?.ask_assistant_model ??
+        ''
+      ).trim();
+      // Send "" (not null) to clear: a present empty string is normalized to
+      // None server-side, whereas JSON null is treated as "no change".
+      await updateSettings({ ask_assistant_model: trimmed });
+      mutateSettings();
+      toast.success(
+        trimmed ? 'Assistant model updated' : 'Assistant model reset to default'
+      );
+    } catch (err) {
+      toast.error(
+        `Failed to save: ${err instanceof Error ? err.message : 'Unknown error'}`
+      );
+    } finally {
+      setSavingAskModel(false);
+    }
+  };
 
   const handleStartEditLibraryRemote = () => {
     setLibraryRemoteValue(serverSettings?.library_remote || '');
@@ -119,46 +147,6 @@ export default function DataSettingsPage() {
       );
     } finally {
       setSavingRepoPath(false);
-    }
-  };
-
-  const handleToggleRtk = async (enabled: boolean) => {
-    setTogglingRtk(true);
-    try {
-      await mutateSettings(
-        async (current) => {
-          await updateRtkEnabled(enabled);
-          return {
-            library_remote: current?.library_remote ?? null,
-            sandboxed_repo_path: current?.sandboxed_repo_path ?? null,
-            rtk_enabled: enabled,
-            max_parallel_missions: current?.max_parallel_missions ?? 1,
-            max_concurrent_tasks: current?.max_concurrent_tasks ?? null,
-            auto_cleanup_enabled: current?.auto_cleanup_enabled ?? null,
-            auto_cleanup_days: current?.auto_cleanup_days ?? null,
-          };
-        },
-        {
-          optimisticData: (current) => ({
-            library_remote: current?.library_remote ?? null,
-            sandboxed_repo_path: current?.sandboxed_repo_path ?? null,
-            rtk_enabled: enabled,
-            max_parallel_missions: current?.max_parallel_missions ?? 1,
-            max_concurrent_tasks: current?.max_concurrent_tasks ?? null,
-            auto_cleanup_enabled: current?.auto_cleanup_enabled ?? null,
-            auto_cleanup_days: current?.auto_cleanup_days ?? null,
-          }),
-          rollbackOnError: true,
-          revalidate: true,
-        }
-      );
-      toast.success(enabled ? 'RTK enabled' : 'RTK disabled');
-    } catch (err) {
-      toast.error(
-        `Failed to update RTK setting: ${err instanceof Error ? err.message : 'Unknown error'}`
-      );
-    } finally {
-      setTogglingRtk(false);
     }
   };
 
@@ -344,6 +332,64 @@ export default function DataSettingsPage() {
             </div>
           </div>
 
+          {/* Ask Assistant Model */}
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 flex-shrink-0">
+                <Sparkles className="h-5 w-5 text-sky-400" />
+              </div>
+              <div className="min-w-0">
+                <h2 className="text-sm font-medium text-white">Ask Assistant Model</h2>
+                <p className="text-xs text-white/40">
+                  Model for the non-interrupting Ask co-pilot. Blank = default
+                  (gpt-oss-120b).
+                </p>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-white/60 mb-1.5">
+                Model ID
+              </label>
+              {settingsLoading ? (
+                <div className="flex items-center gap-2 py-2.5">
+                  <Loader className="h-4 w-4 animate-spin text-white/40" />
+                  <span className="text-sm text-white/40">Loading...</span>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <input
+                    type="text"
+                    value={askModelValue ?? serverSettings?.ask_assistant_model ?? ''}
+                    onChange={(e) => setAskModelValue(e.target.value)}
+                    placeholder="gpt-oss-120b"
+                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-sky-500/50"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleSaveAskModel();
+                    }}
+                  />
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleSaveAskModel}
+                      disabled={savingAskModel}
+                      className="flex items-center gap-1.5 rounded-lg bg-sky-500 px-3 py-1.5 text-xs text-white hover:bg-sky-600 transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      {savingAskModel ? (
+                        <Loader className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Check className="h-3 w-3" />
+                      )}
+                      Save
+                    </button>
+                    <span className="text-xs text-white/30">
+                      e.g. gpt-oss-120b, qwen-3-235b-a22b-instruct-2507
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
           {/* sandboxed.sh Source */}
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
             <div className="flex items-center gap-3 mb-4">
@@ -425,59 +471,6 @@ export default function DataSettingsPage() {
           </div>
           </div>
 
-          {/* RTK Settings */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/10">
-                <Terminal className="h-5 w-5 text-violet-400" />
-              </div>
-              <div>
-                <h2 className="text-sm font-medium text-white">RTK (Rich Terminal Kit)</h2>
-                <p className="text-xs text-white/40">
-                  Compress terminal output to reduce token consumption
-                </p>
-              </div>
-            </div>
-
-            <div className="flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <p className="text-sm text-white/70">
-                  {serverSettings?.rtk_enabled
-                    ? 'RTK compression is enabled for terminal commands'
-                    : 'RTK compression is disabled'}
-                </p>
-                <p className="mt-1 text-xs text-white/40">
-                  When enabled, eligible terminal commands are wrapped with RTK to compress output
-                  before returning to the LLM, reducing token consumption.
-                </p>
-              </div>
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {togglingRtk && (
-                  <Loader className="h-3.5 w-3.5 animate-spin text-white/40" />
-                )}
-                <button
-                  type="button"
-                  aria-label="Toggle RTK compression"
-                  aria-pressed={Boolean(serverSettings?.rtk_enabled)}
-                  onClick={() => handleToggleRtk(!Boolean(serverSettings?.rtk_enabled))}
-                  disabled={togglingRtk || settingsLoading}
-                  className={cn(
-                    'relative inline-flex h-6 w-11 items-center rounded-full transition-colors disabled:opacity-60 disabled:cursor-not-allowed',
-                    serverSettings?.rtk_enabled
-                      ? 'bg-violet-500'
-                      : 'bg-white/10'
-                  )}
-                >
-                  <span
-                    className={cn(
-                      'inline-block h-4 w-4 rounded-full bg-white transition-transform',
-                      serverSettings?.rtk_enabled ? 'translate-x-6' : 'translate-x-1'
-                    )}
-                  />
-                </button>
-              </div>
-            </div>
-          </div>
 
           {/* Auto-cleanup of old mission workspace files */}
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">

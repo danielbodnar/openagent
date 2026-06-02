@@ -27,6 +27,7 @@ import {
   type EnhancedInputHandle,
   type FilePasteContext,
 } from "@/components/enhanced-input";
+import { AskPanel } from "@/components/ask-panel";
 import { deriveAssistantTurnStatus } from "@/lib/assistant-turn-status";
 import { perfBus } from "@/lib/perf-bus";
 import {
@@ -46,6 +47,8 @@ import {
   useControlStreamingDiagnosticsStore,
   useControlThinkingStore,
   useControlViewingMissionStore,
+  useControlAskStore,
+  controlAskStore,
   type StreamDiagnosticsState,
 } from "./control-stores";
 import { NowTickProvider, useNow } from "@/lib/now-tick";
@@ -169,6 +172,7 @@ import {
   Flag,
   Pencil,
   MoreVertical,
+  Sparkles,
 } from "lucide-react";
 import { IMAGE_PATH_PATTERN } from "@/lib/file-extensions";
 import {
@@ -259,18 +263,20 @@ export function appendUnpersistedLiveTail(
       .slice(lastHistoryUserIdx + 1)
       .some((item) => item.kind === "assistant");
 
-  const unpersistedTail = liveItems.slice(lastLiveUserIdx + 1).filter((item) => {
-    if (existingIds.has(item.id)) return false;
-    if (item.kind === "assistant") {
+  const unpersistedTail = liveItems
+    .slice(lastLiveUserIdx + 1)
+    .filter((item) => {
+      if (existingIds.has(item.id)) return false;
+      if (item.kind === "assistant") {
+        const content = item.content.trim();
+        return content.length > 0 && !existingAssistantContent.has(content);
+      }
+      if (item.kind !== "stream" || item.done) return false;
       const content = item.content.trim();
-      return content.length > 0 && !existingAssistantContent.has(content);
-    }
-    if (item.kind !== "stream" || item.done) return false;
-    const content = item.content.trim();
-    if (!content) return false;
-    if (existingAssistantContent.has(content)) return false;
-    return !historyHasAssistantAfterLastUser;
-  });
+      if (!content) return false;
+      if (existingAssistantContent.has(content)) return false;
+      return !historyHasAssistantAfterLastUser;
+    });
 
   return unpersistedTail.length > 0
     ? [...historyItems, ...unpersistedTail]
@@ -321,7 +327,9 @@ function formatMissionDocumentTitle(mission: Mission | null | undefined) {
     maxLength: MAX_DOCUMENT_MISSION_TITLE_LENGTH,
     fallback: getMissionShortName(mission.id),
   }).trim();
-  return title ? `${title} | ${DEFAULT_DOCUMENT_TITLE}` : DEFAULT_DOCUMENT_TITLE;
+  return title
+    ? `${title} | ${DEFAULT_DOCUMENT_TITLE}`
+    : DEFAULT_DOCUMENT_TITLE;
 }
 
 function readLegacyControlDraft(): string {
@@ -484,16 +492,51 @@ const PerfOverlay = dynamic(() =>
 type ToolItem = Extract<ChatItem, { kind: "tool" }>;
 type SidePanelItem = Extract<ChatItem, { kind: "thinking" | "stream" }>;
 
-function scheduleBackgroundHistoryFill(callback: () => void) {
-  if (typeof window === "undefined") return;
-  const start = () => {
-    if ("requestIdleCallback" in window) {
-      window.requestIdleCallback(callback, { timeout: 5_000 });
-      return;
+// Mirror of the server's conversation-anchored snapshot (see
+// `get_mission_snapshot` in src/api/control.rs). Keep these in sync.
+const SNAPSHOT_CONVERSATIONAL_MESSAGES = 10;
+const SNAPSHOT_MAX_EVENTS = 1500;
+const CONVERSATION_EVENT_TYPES = new Set([
+  "user_message",
+  "assistant_message",
+  "assistant_message_canonical",
+]);
+
+// Trim a sequence-ASC event list to the conversation-anchored tail: everything
+// from the Nth-most-recent user/assistant message to the head (tool calls in
+// between included), hard-capped at SNAPSHOT_MAX_EVENTS. Applied to the IDB
+// cache path so a cache hit behaves like `getMissionSnapshot` — without it a
+// stale or oversized cached tail would be replayed in full (slow load) and the
+// recent-message anchoring would be bypassed.
+function anchorEventsToRecentConversation(
+  events: StoredEvent[],
+): StoredEvent[] {
+  // Anchor ONLY when at least N conversation messages exist, matching the
+  // server: `nth_recent_event_sequence(N)` returns None below N, in which case
+  // get_mission_snapshot falls back to the plain recent-events tail (no
+  // conversation trim). So set the anchor only on reaching the Nth-most-recent
+  // message; with fewer than N, leave `anchorIdx = -1` and keep everything
+  // (still bounded by the MAX cap below). Setting it on every message would
+  // drop any leading events before the oldest message and diverge from the
+  // backend for short (1–9 message) missions.
+  let convoSeen = 0;
+  let anchorIdx = -1;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (CONVERSATION_EVENT_TYPES.has(events[i].event_type)) {
+      convoSeen += 1;
+      if (convoSeen >= SNAPSHOT_CONVERSATIONAL_MESSAGES) {
+        anchorIdx = i;
+        break;
+      }
     }
-    globalThis.setTimeout(callback, 250);
-  };
-  globalThis.setTimeout(start, 1_000);
+  }
+  let start = anchorIdx === -1 ? 0 : anchorIdx;
+  // Hard cap: never replay more than MAX events (mirrors the server's
+  // overflow fallback to the most-recent MAX).
+  if (events.length - start > SNAPSHOT_MAX_EVENTS) {
+    start = events.length - SNAPSHOT_MAX_EVENTS;
+  }
+  return start === 0 ? events : events.slice(start);
 }
 
 // Module-level so all duration consumers share the same implementation.
@@ -503,6 +546,25 @@ function formatDuration(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
   return `${mins}m${secs > 0 ? ` ${secs}s` : ""}`;
+}
+
+// Wall-clock (ms) of when this item last "did something" — used to anchor the
+// inline "Agent is working" heartbeat at the most recent event so the timer
+// resets each time a new event lands (healthy agent) and climbs when nothing
+// arrives (stalled/hung). Phase items carry no time of their own.
+function itemActivityTime(item: ChatItem): number | null {
+  switch (item.kind) {
+    case "tool":
+    case "thinking":
+    case "stream":
+      return item.endTime ?? item.startTime;
+    case "user":
+    case "assistant":
+    case "system":
+      return item.timestamp;
+    default:
+      return null;
+  }
 }
 
 // Renders a live-updating duration string anchored at `startTime`. ONLY this
@@ -921,7 +983,30 @@ function QuestionToolItem({
   item: ToolItem;
   onSubmit: (toolCallId: string, answers: string[][]) => Promise<void>;
 }) {
-  const questions = useMemo(() => parseQuestionArgs(item.args), [item.args]);
+  const parsedQuestions = useMemo(
+    () => parseQuestionArgs(item.args),
+    [item.args],
+  );
+  // Fallback for empty/malformed payloads (e.g. a question tool-call whose
+  // streamed input never assembled into args): render a single free-text
+  // reply so the user can still answer and unblock the mission, instead of a
+  // dead-end "Failed to render" error.
+  const isFallback = parsedQuestions.length === 0;
+  const questions = useMemo<QuestionInfo[]>(
+    () =>
+      isFallback
+        ? [
+            {
+              question:
+                "The agent asked for your input, but the question didn't include any content. Reply below to continue.",
+              options: [],
+              multiple: false,
+              freeTextOnly: true,
+            },
+          ]
+        : parsedQuestions,
+    [isFallback, parsedQuestions],
+  );
   const [answers, setAnswers] = useState<string[][]>(() =>
     questions.map(() => []),
   );
@@ -1155,12 +1240,7 @@ function QuestionToolItem({
               <button
                 onClick={handleSubmit}
                 disabled={!canSubmit || submitting}
-                className={cn(
-                  "inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors",
-                  !canSubmit || submitting
-                    ? "bg-white/5 text-white/30 cursor-not-allowed"
-                    : "bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30",
-                )}
+                className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-600 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-indigo-500"
               >
                 {submitting ? "Sending…" : "Submit Answer"}
               </button>
@@ -1185,7 +1265,6 @@ function formatTime(timestamp: number): string {
   const date = new Date(timestamp);
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
-
 
 function statusLabel(state: ControlRunState): {
   label: string;
@@ -1220,7 +1299,10 @@ function missionStatusLabel(
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
     case "awaiting_user":
-      return { label: "Needs You", className: "bg-amber-500/20 text-amber-400" };
+      return {
+        label: "Needs You",
+        className: "bg-amber-500/20 text-amber-400",
+      };
     case "acknowledged":
       return {
         label: "Acknowledged",
@@ -2202,8 +2284,7 @@ const ThinkingPanel = memo(function ThinkingPanel({
     overscan: 6,
   });
   // See `chatVirtualizer` below for rationale.
-  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
-    false;
+  thoughtsVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
   const {
     isAtBottom: isThoughtsAtBottom,
     scrollToBottom: scrollThoughtsToBottom,
@@ -2691,7 +2772,13 @@ function MissionWorkbenchPanel({
   );
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="flex items-center justify-between gap-2 py-0.5">
       <dt className="text-white/40">{label}</dt>
@@ -3742,7 +3829,9 @@ const ChatItemRow = memo(function ChatItemRow({
     // ServerShutdown turns auto-resume — render with the check icon so the
     // visual weight matches "this is being handled", not "agent died".
     const MessageStatusIcon =
-      item.success || item.terminalReason === "ServerShutdown" ? CheckCircle : XCircle;
+      item.success || item.terminalReason === "ServerShutdown"
+        ? CheckCircle
+        : XCircle;
     const displayModel = item.model
       ? item.model.includes("/")
         ? item.model.split("/").pop()
@@ -3834,7 +3923,19 @@ const ChatItemRow = memo(function ChatItemRow({
             </div>
           )}
         </div>
-        <CopyButton text={item.content} className="self-start mt-8" />
+        <div className="flex flex-col items-center gap-1 self-start mt-8">
+          <CopyButton text={item.content} />
+          <button
+            type="button"
+            onClick={() =>
+              controlAskStore.set({ open: true, seed: item.content })
+            }
+            title="Ask the co-pilot about this"
+            className="opacity-0 group-hover:opacity-100 transition-opacity text-[rgb(var(--foreground)/0.4)] hover:text-[rgb(var(--copilot))]"
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
     );
   }
@@ -4381,6 +4482,27 @@ export default function ControlClient() {
   const [showWorkbenchPanel, setShowWorkbenchPanel] = useState(
     () => searchParams.get("workbench") === "1",
   );
+  const [askSlice, setAskSlice] = useControlAskStore();
+  const showAskPanel = askSlice.open;
+  const setShowAskPanel = useCallback(
+    (next: boolean | ((v: boolean) => boolean)) =>
+      setAskSlice((s) => ({
+        ...s,
+        open: typeof next === "function" ? next(s.open) : next,
+      })),
+    [setAskSlice],
+  );
+  // ⌘/ (or Ctrl+/) toggles the Ask co-pilot panel.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "/") {
+        e.preventDefault();
+        setShowAskPanel((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [setShowAskPanel]);
   const handleToggleThinkingPanel = useCallback(() => {
     setShowThinkingPanel((prev) => {
       const next = !prev;
@@ -4407,28 +4529,43 @@ export default function ControlClient() {
     setThinkingPanelManuallyHidden(true);
   }, [setShowThinkingPanel, setThinkingPanelManuallyHidden]);
 
-  const adjustVisibleItemsLimit = useCallback((historyItems: ChatItem[]) => {
-    let lastAssistantIdx = -1;
-    for (let i = historyItems.length - 1; i >= 0; i--) {
-      if (historyItems[i].kind === "assistant") {
-        lastAssistantIdx = i;
-        break;
+  // Anchor the initial visible window on the last N conversation messages
+  // (user + assistant), not the last single assistant message. On tool-heavy
+  // missions a long run of tool calls would otherwise push the recent
+  // back-and-forth above the fold, behind "Load older messages". Expanding
+  // the window to span from the Nth-most-recent message through the newest
+  // item keeps the last ~10 turns (and the tool calls between them) visible
+  // immediately; everything older stays one click away.
+  const CONVERSATIONAL_ANCHOR_COUNT = 10;
+  const conversationalAnchorIndex = useCallback(
+    (historyItems: ChatItem[]): number => {
+      let convoSeen = 0;
+      let anchorIdx = -1;
+      for (let i = historyItems.length - 1; i >= 0; i--) {
+        const kind = historyItems[i].kind;
+        if (kind === "assistant" || kind === "user") {
+          anchorIdx = i;
+          convoSeen += 1;
+          if (convoSeen >= CONVERSATIONAL_ANCHOR_COUNT) break;
+        }
       }
-    }
+      return anchorIdx;
+    },
+    [],
+  );
 
-    if (lastAssistantIdx === -1) {
-      setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
-      return;
-    }
-
-    const required = historyItems.length - lastAssistantIdx;
-    if (required <= INITIAL_VISIBLE_ITEMS) {
-      setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
-      return;
-    }
-
-    setVisibleItemsLimit(required);
-  }, []);
+  const adjustVisibleItemsLimit = useCallback(
+    (historyItems: ChatItem[]) => {
+      const anchorIdx = conversationalAnchorIndex(historyItems);
+      if (anchorIdx === -1) {
+        setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
+        return;
+      }
+      const required = historyItems.length - anchorIdx;
+      setVisibleItemsLimit(Math.max(INITIAL_VISIBLE_ITEMS, required));
+    },
+    [conversationalAnchorIndex],
+  );
 
   const HISTORY_EVENT_TYPES = useMemo(
     () => [
@@ -4458,22 +4595,12 @@ export default function ControlClient() {
    */
   const missionMaxSeqRef = useRef<Map<string, number>>(new Map());
 
-  // Page size for each backwards-paginate-older fetch (both the explicit
-  // "Load older messages" button and the post-initial background fill).
-  // Tuned for memory headroom on long missions — see the
-  // `chatScrollContainerRef` comment block above.
+  // Page size for each backwards-paginate-older fetch (the explicit
+  // "Load older messages" button / scroll-up). Tuned for memory headroom on
+  // long missions — see the `chatScrollContainerRef` comment block above.
   const HISTORY_PAGE_SIZE = 5000;
   const HISTORY_DELTA_PAGE_SIZE = 1000;
   const HISTORY_FALLBACK_PAGE_SIZE = 1000;
-  // Cap how far the background fill walks back from the head on first load.
-  // Past this depth the user has to click "Load older messages" — keeps
-  // memory + render cost predictable on huge missions while still feeling
-  // "complete" for typical ones.
-  const BACKGROUND_FILL_TARGET = 2000;
-  // Per-page size used by the background fill. Smaller than the explicit
-  // "Load older" button so each chunk costs less and we can interleave with
-  // live SSE events without long main-thread stalls.
-  const BACKGROUND_FILL_PAGE_SIZE = 500;
 
   const loadHistoryEvents = useCallback(
     async (id: string, opts?: { sinceSeq?: number }) => {
@@ -4553,7 +4680,12 @@ export default function ControlClient() {
               }
             }
             merged.sort((a, b) => a.sequence - b.sequence);
-            sorted = merged;
+            // Bound the cached tail to the conversation-anchored window, just
+            // like the server snapshot, so a cache hit doesn't replay a
+            // stale/oversized history or bypass the recent-message anchoring.
+            // `metaTotal` below stays the true server total, so trimming here
+            // simply leaves older events to the on-demand "Load older" path.
+            sorted = anchorEventsToRecentConversation(merged);
             metaMaxSeq = maxSequence;
             // The delta fetch above runs with `includeCounts: false`, so the
             // server omits `X-Total-Events` and `delta.meta.totalEvents` is
@@ -4570,7 +4702,7 @@ export default function ControlClient() {
                 ? cached.totalEvents + addedByDelta
                 : undefined);
             cacheHit = true;
-            eventMergeCount = merged.length;
+            eventMergeCount = sorted.length;
           }
         } catch {
           // Network or auth failure on the delta — fall through to the
@@ -4636,32 +4768,15 @@ export default function ControlClient() {
         );
       }
 
-      // Kick off the background fill so the rest of the history streams in
-      // after first paint. Scheduled via setTimeout(0) so the caller's
-      // setItems/render commits first — running the next fetch synchronously
-      // here would just stall the same task we tried to free up. The ref
-      // indirection breaks TDZ against `streamOlderHistory`, which is
-      // declared after the older-paginator below.
-      const hasMoreLocal = metaTotal !== undefined && sorted.length < metaTotal;
-      if (hasMoreLocal) {
-        const fillFn = streamOlderHistoryRef.current;
-        if (fillFn) {
-          scheduleBackgroundHistoryFill(() => {
-            void fillFn(id);
-          });
-        }
-      }
+      // No eager background fill. The snapshot is conversation-anchored
+      // (it already includes the last N message turns plus the tool calls
+      // between them), so walking thousands more events back on open just
+      // re-replayed the whole accumulated set on the main thread per page —
+      // the "loads forever" jank on tool-heavy missions. Older history now
+      // loads purely on demand via "Load older messages" / scroll-up.
       return sorted;
     },
     [HISTORY_EVENT_TYPES],
-  );
-
-  // Bridge between `loadHistoryEvents` (declared above) and
-  // `streamOlderHistory` (declared below). `loadHistoryEvents` schedules
-  // the background fill at the tail end of its initial-load branch, but
-  // can't reference `streamOlderHistory` by name without a TDZ violation.
-  const streamOlderHistoryRef = useRef<((id: string) => Promise<void>) | null>(
-    null,
   );
 
   /**
@@ -4784,7 +4899,9 @@ export default function ControlClient() {
   // `text_delta` on the assistant message). Reuse the previous reference
   // when the thinking subset is unchanged so `React.memo(ThinkingPanel)`
   // can skip the re-render.
-  const thinkingItems = useStableShallowArray(rawThinkingItems) as SidePanelItem[];
+  const thinkingItems = useStableShallowArray(
+    rawThinkingItems,
+  ) as SidePanelItem[];
 
   const containerRef = useRef<HTMLDivElement>(null);
   const chatVirtualizer = useVirtualizer({
@@ -4851,16 +4968,43 @@ export default function ControlClient() {
     resetKey: viewingMissionId,
   });
 
-  const showAgentWorkingIndicator = useMemo(() => {
-    if (items.length === 0) return false;
-    if (items[items.length - 1]?.kind === "assistant") return false;
-    return !items.some(
+  // The inline "Agent is working" pill. Shown whenever the mission is running
+  // and nothing else inline is already animating liveness — i.e. no in-flight
+  // thinking/stream (with the side panel closed) and no phase row, both of
+  // which render their own live indicators. Unlike before, this stays visible
+  // *after* an intermediate assistant message: the agent keeps working between
+  // steps, and the corner sidebar pill alone is too easy to miss. `since`
+  // anchors the heartbeat timer at the most recent event so it resets on every
+  // new event and climbs when the run goes quiet.
+  const agentWorkingIndicator = useMemo(() => {
+    if (items.length === 0) return null;
+    const hasInlineLiveness = items.some(
       (it) =>
         ((it.kind === "thinking" || it.kind === "stream") &&
           !it.done &&
           !showThinkingPanel) ||
         it.kind === "phase",
     );
+    if (hasInlineLiveness) return null;
+    let since: number | null = null;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      // Queued user messages sit at the tail while the agent keeps inserting
+      // tool/assistant rows before them, so they are not "latest activity" —
+      // anchoring the heartbeat to a queued row's (older) timestamp makes the
+      // timer read as stalled while the mission is actively running. Skip them.
+      if (it.kind === "user" && it.queued) continue;
+      const t = itemActivityTime(it);
+      if (t != null) {
+        since = t;
+        break;
+      }
+    }
+    // No timed row to anchor on (e.g. only queued user messages): suppress the
+    // pill rather than pass 0, which LiveDuration would read as epoch ms and
+    // render as a ~decades-long elapsed time.
+    if (since == null) return null;
+    return { since };
   }, [items, showThinkingPanel]);
 
   // Auto-show thinking panel when thinking starts (only on transition to active)
@@ -4914,21 +5058,18 @@ export default function ControlClient() {
     return progressByMission[viewingMissionId] ?? null;
   }, [progressByMission, viewingMissionId]);
 
+  // As live events stream in, keep the last N conversation messages within
+  // the visible window. Mirrors `adjustVisibleItemsLimit` but only grows the
+  // window (never shrinks it) so unrelated growth elsewhere is preserved.
   useEffect(() => {
     if (items.length === 0) return;
-    let lastAssistantIdx = -1;
-    for (let i = items.length - 1; i >= 0; i--) {
-      if (items[i].kind === "assistant") {
-        lastAssistantIdx = i;
-        break;
-      }
-    }
-    if (lastAssistantIdx === -1) return;
+    const anchorIdx = conversationalAnchorIndex(items);
+    if (anchorIdx === -1) return;
     const visibleStart = Math.max(0, items.length - visibleItemsLimit);
-    if (lastAssistantIdx < visibleStart) {
-      setVisibleItemsLimit(items.length - lastAssistantIdx);
+    if (anchorIdx < visibleStart) {
+      setVisibleItemsLimit(items.length - anchorIdx);
     }
-  }, [items, visibleItemsLimit]);
+  }, [items, visibleItemsLimit, conversationalAnchorIndex]);
 
   const viewingMissionStallInfo = useMemo(() => {
     if (!viewingMissionId) return null;
@@ -5939,72 +6080,6 @@ export default function ControlClient() {
     // closure that bugbot flagged.
     [HISTORY_EVENT_TYPES, eventsToItems, computeHasMoreOlder, setItems],
   );
-
-  // Background fill: after the initial fetch shows the newest events,
-  // walk older pages until we've reached `BACKGROUND_FILL_TARGET` total
-  // history events or there are no more. Runs `silent` so the
-  // "Load older messages" button doesn't flash a loading state; bails
-  // if the user switches missions, if a fetch fails, or if the mission
-  // turns out to have fewer events than the target (server total reached).
-  const streamOlderHistory = useCallback(
-    async (id: string) => {
-      // Yield once so the initial-render setItems can commit and paint
-      // before we start eating network/main-thread time on background
-      // fills. Without this the first chunk can land before the user
-      // sees the latest message at all.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const stillActive = (): boolean =>
-        currentMissionRef.current?.id === id ||
-        viewingMissionRef.current?.id === id;
-
-      // Up to a few page-loads, with a small inter-page yield so live
-      // SSE events can interleave on the main thread without jank.
-      // Hard ceiling (16) is a backstop; the loop normally exits via
-      // the `hasMore`/target check first.
-      for (let i = 0; i < 16; i++) {
-        if (!stillActive()) return;
-        const accumulated =
-          missionHistoricEventsRef.current.get(id)?.length ?? 0;
-        const total = missionTotalHistoryRef.current.get(id);
-        if (total !== undefined && accumulated >= total) return;
-        if (accumulated >= BACKGROUND_FILL_TARGET) return;
-        const minSeq = missionMinSeqRef.current.get(id);
-        if (minSeq === undefined || minSeq <= 1) return;
-
-        try {
-          await loadOlderHistoryEvents(id, {
-            silent: true,
-            limit: BACKGROUND_FILL_PAGE_SIZE,
-          });
-        } catch {
-          // Stop on error — the user's manual "Load older messages"
-          // path remains available for retry.
-          return;
-        }
-
-        // If accumulated didn't grow, the server returned an empty
-        // page and there's nothing left to fetch. Avoid the
-        // pathological tight loop.
-        const after = missionHistoricEventsRef.current.get(id)?.length ?? 0;
-        if (after <= accumulated) return;
-
-        // Small pause between pages so the main thread can run other
-        // work (live event handlers, scroll, input).
-        await new Promise((resolve) => setTimeout(resolve, 150));
-      }
-    },
-    [loadOlderHistoryEvents, BACKGROUND_FILL_PAGE_SIZE, BACKGROUND_FILL_TARGET],
-  );
-
-  // Wire the ref consumed by `loadHistoryEvents` (which is declared
-  // above `streamOlderHistory`, so it can't reference it directly).
-  useEffect(() => {
-    streamOlderHistoryRef.current = streamOlderHistory;
-    return () => {
-      streamOlderHistoryRef.current = null;
-    };
-  }, [streamOlderHistory]);
 
   // Load mission from URL param on mount (and retry on auth success)
   const [authRetryTrigger, setAuthRetryTrigger] = useState(0);
@@ -9095,7 +9170,13 @@ export default function ControlClient() {
         submittingRef.current = false;
       }
     },
-    [items, isBusy, applyDesktopSessionState, missionHistoryToItems, scrollToBottom],
+    [
+      items,
+      isBusy,
+      applyDesktopSessionState,
+      missionHistoryToItems,
+      scrollToBottom,
+    ],
   );
 
   const handleStop = async () => {
@@ -9113,31 +9194,34 @@ export default function ControlClient() {
     }
   };
 
-  const syncQueueForMission = useCallback(async (missionId: string) => {
-    if (!missionId || syncingQueueRef.current) return;
-    syncingQueueRef.current = true;
-    try {
-      const queuedMessages = await getQueue();
-      const queuedForMission = queuedMessages.filter(
-        (qm) => qm.mission_id === missionId,
-      );
-      const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
+  const syncQueueForMission = useCallback(
+    async (missionId: string) => {
+      if (!missionId || syncingQueueRef.current) return;
+      syncingQueueRef.current = true;
+      try {
+        const queuedMessages = await getQueue();
+        const queuedForMission = queuedMessages.filter(
+          (qm) => qm.mission_id === missionId,
+        );
+        const queuedIds = new Set(queuedForMission.map((qm) => qm.id));
 
-      setItems((prev) =>
-        prev.map((item) => {
-          if (item.kind !== "user") return item;
-          if (item.id.startsWith("temp-")) return item;
-          const shouldBeQueued = queuedIds.has(item.id);
-          if (item.queued === shouldBeQueued) return item;
-          return { ...item, queued: shouldBeQueued };
-        }),
-      );
-    } catch (err) {
-      console.warn("[control] failed to sync queue", err);
-    } finally {
-      syncingQueueRef.current = false;
-    }
-  }, [setItems]);
+        setItems((prev) =>
+          prev.map((item) => {
+            if (item.kind !== "user") return item;
+            if (item.id.startsWith("temp-")) return item;
+            const shouldBeQueued = queuedIds.has(item.id);
+            if (item.queued === shouldBeQueued) return item;
+            return { ...item, queued: shouldBeQueued };
+          }),
+        );
+      } catch (err) {
+        console.warn("[control] failed to sync queue", err);
+      } finally {
+        syncingQueueRef.current = false;
+      }
+    },
+    [setItems],
+  );
 
   // Reload mission history from the API. Used for visibility change,
   // periodic sync, and SSE reconnect catch-up.
@@ -9434,6 +9518,38 @@ export default function ControlClient() {
     missionLoading &&
     !!viewingMissionId &&
     activeMission?.id !== viewingMissionId;
+
+  // The inline "Agent is working" pill renders *below* the virtualized
+  // timeline, so the bottom anchor (which keys off `groupedItems` only) never
+  // scrolls to reveal it — unlike the "is thinking" indicator, which is a real
+  // timeline item. Nudge to the bottom when the pill first appears while the
+  // user is already pinned there, so it shows up the same way thinking does.
+  const agentWorkingPillVisible =
+    viewingMissionIsRunning &&
+    activeMission?.status === "active" &&
+    !!agentWorkingIndicator;
+  const prevAgentWorkingPillVisible = useRef(false);
+  const pillLatchMissionId = useRef(viewingMissionId);
+  useEffect(() => {
+    // Reset the latch synchronously when the viewed mission changes, *before*
+    // evaluating the transition. A separate mission-id effect can't do this:
+    // effects run in declaration order, so the auto-scroll below would see a
+    // stale `true` from the previous running mission (no false→true edge) and
+    // never scroll on the new timeline. Folding the reset in here guarantees
+    // the new mission's first pill appearance counts as a real edge.
+    if (pillLatchMissionId.current !== viewingMissionId) {
+      pillLatchMissionId.current = viewingMissionId;
+      prevAgentWorkingPillVisible.current = false;
+    }
+    if (
+      agentWorkingPillVisible &&
+      !prevAgentWorkingPillVisible.current &&
+      isAtBottom
+    ) {
+      scrollToBottom("smooth");
+    }
+    prevAgentWorkingPillVisible.current = agentWorkingPillVisible;
+  }, [agentWorkingPillVisible, isAtBottom, scrollToBottom, viewingMissionId]);
   const workspaceNameById = useMemo(() => {
     return Object.fromEntries(workspaces.map((ws) => [ws.id, ws.name]));
   }, [workspaces]);
@@ -9504,12 +9620,16 @@ export default function ControlClient() {
     }
 
     const applyTitle = (mission: Mission | null) =>
-      mission?.id === activeMission.id ? { ...mission, title: nextTitle } : mission;
+      mission?.id === activeMission.id
+        ? { ...mission, title: nextTitle }
+        : mission;
 
     setSavingMissionTitle(true);
     setRecentMissions((prev) =>
       prev.map((mission) =>
-        mission.id === activeMission.id ? { ...mission, title: nextTitle } : mission,
+        mission.id === activeMission.id
+          ? { ...mission, title: nextTitle }
+          : mission,
       ),
     );
     setCurrentMission(applyTitle);
@@ -9522,10 +9642,14 @@ export default function ControlClient() {
       console.error("Failed to update mission title:", error);
       toast.error("Failed to update mission title");
       const restoreTitle = (mission: Mission | null) =>
-        mission?.id === activeMission.id ? { ...mission, title: previousTitle } : mission;
+        mission?.id === activeMission.id
+          ? { ...mission, title: previousTitle }
+          : mission;
       setRecentMissions((prev) =>
         prev.map((mission) =>
-          mission.id === activeMission.id ? { ...mission, title: previousTitle } : mission,
+          mission.id === activeMission.id
+            ? { ...mission, title: previousTitle }
+            : mission,
         ),
       );
       setCurrentMission(restoreTitle);
@@ -9980,6 +10104,26 @@ export default function ControlClient() {
               <span className="hidden sm:inline">Workbench</span>
             </button>
 
+            {/* Ask co-pilot toggle */}
+            <button
+              type="button"
+              onClick={() => setShowAskPanel((prev) => !prev)}
+              className={cn(
+                "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
+                showAskPanel
+                  ? "border-[rgb(var(--copilot)/0.4)] bg-[rgb(var(--copilot)/0.12)] text-[rgb(var(--copilot))]"
+                  : "border-white/[0.06] bg-white/[0.02] text-[rgb(var(--foreground)/0.7)] hover:bg-white/[0.04]",
+              )}
+              title={
+                showAskPanel
+                  ? "Hide Ask co-pilot"
+                  : "Ask about this mission (non-interrupting)"
+              }
+            >
+              <Sparkles className="h-4 w-4" />
+              <span className="hidden sm:inline">Ask</span>
+            </button>
+
             {/* Thinking panel toggle */}
             <button
               onClick={handleToggleThinkingPanel}
@@ -10325,7 +10469,7 @@ export default function ControlClient() {
             <div
               ref={containerRef}
               data-testid="chat-scroll-container"
-              className="flex-1 overflow-y-auto p-6"
+              className="flex-1 overflow-y-auto px-6 pt-6 pb-2"
             >
               {/* Backwards pagination — only when there's actually more older
               history to fetch and the chat isn't empty. Click prepends the
@@ -10502,38 +10646,38 @@ export default function ControlClient() {
                     })}
                   </div>
 
-                  {/* Show streaming indicator when running but no active thinking/phase visible inline.
-                  P2-#14: the items.some + last-index lookup live in `showAgentWorkingIndicator`
-                  memo so each NowTick render doesn't re-walk the whole items array. */}
-                  {viewingMissionIsRunning &&
-                    activeMission?.status === "active" &&
-                    showAgentWorkingIndicator && (
-                      <div className="flex justify-start gap-3 animate-fade-in">
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
-                          <Bot className="h-4 w-4 text-indigo-400 animate-pulse" />
-                        </div>
-                        <div className="rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
-                          <div className="flex items-center gap-2">
-                            <Loader className="h-4 w-4 text-indigo-400 animate-spin" />
-                            <span className="text-sm text-white/60">
-                              Agent is working...
-                            </span>
-                          </div>
-                        </div>
+                  {/* Compact "Agent is working" pill + live heartbeat timer,
+                  shown while running but no thinking/stream/phase is animating
+                  inline. P2-#14: the items.some walk lives in the
+                  `agentWorkingIndicator` memo so each NowTick render doesn't
+                  re-walk the whole items array. */}
+                  {agentWorkingPillVisible && agentWorkingIndicator && (
+                    <div className="flex justify-start animate-fade-in my-2">
+                      <div className="inline-flex items-center gap-1.5 rounded-full border border-indigo-500/20 bg-indigo-500/[0.08] px-2.5 py-1">
+                        <Loader className="h-3 w-3 text-indigo-400 animate-spin" />
+                        <span className="text-xs font-medium text-indigo-300">
+                          Agent is working
+                        </span>
+                        <span className="text-xs tabular-nums text-indigo-300/60">
+                          <LiveDuration
+                            startTime={agentWorkingIndicator.since}
+                          />
+                        </span>
                       </div>
-                    )}
+                    </div>
+                  )}
 
                   {/* Waiting banner for interactive user-input tools */}
                   {hasPendingUserInput && (
                     <div className="flex justify-center py-4 animate-fade-in">
-                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/20">
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 rounded-xl px-5 py-4 bg-indigo-500/10 border border-indigo-500/30">
                         <div className="flex items-center gap-3">
-                          <HelpCircle className="h-5 w-5 shrink-0 text-indigo-300" />
+                          <HelpCircle className="h-5 w-5 shrink-0 text-indigo-500" />
                           <div className="text-sm">
-                            <span className="font-medium text-indigo-200">
+                            <span className="font-medium text-foreground">
                               Waiting for your response
                             </span>
-                            <p className="text-white/50">
+                            <p className="text-muted-foreground">
                               The agent is paused until you answer the prompt
                               above.
                             </p>
@@ -10542,7 +10686,7 @@ export default function ControlClient() {
                         <button
                           type="button"
                           onClick={handleShowPendingUserInput}
-                          className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30 border border-indigo-500/30 transition-colors"
+                          className="shrink-0 inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium bg-indigo-600 text-white hover:bg-indigo-700 border border-indigo-600 transition-colors"
                         >
                           <ArrowDown className="h-3.5 w-3.5" />
                           Show prompt
@@ -10630,20 +10774,24 @@ export default function ControlClient() {
               )}
             </div>
 
-            {/* Auto-scroll pause chip */}
-            {!isAtBottom && items.length > 0 && (
-              <button
-                onClick={() => scrollToBottom()}
-                className="absolute bottom-20 right-6 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
-                title="Scroll to bottom"
-              >
-                <ArrowDown className="h-4 w-4" />
-                Auto-scroll paused
-              </button>
-            )}
-
             {/* Input */}
-            <div className="border-t border-white/[0.06] bg-white/[0.01] p-4">
+            <div className="relative border-t border-white/[0.06] bg-white/[0.01] p-4">
+              {/* Auto-scroll pause chip. Anchored to the composer with
+              `bottom-full` so it floats *just above* the input instead of
+              overlapping it — previously it sat at `bottom-20` with no z-index,
+              so it landed behind the textarea / queue / stop controls. `z-20`
+              keeps it above the scrolling messages without covering (and thus
+              blocking clicks on) the composer below. */}
+              {!isAtBottom && items.length > 0 && (
+                <button
+                  onClick={() => scrollToBottom()}
+                  className="absolute bottom-full right-6 z-20 mb-3 inline-flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/90 px-3 py-2 text-xs font-medium text-slate-700 shadow-lg backdrop-blur transition-all hover:bg-white hover:text-slate-950 dark:border-white/[0.1] dark:bg-black/70 dark:text-white/65 dark:hover:bg-white/[0.1] dark:hover:text-white/90"
+                  title="Scroll to bottom"
+                >
+                  <ArrowDown className="h-4 w-4" />
+                  Auto-scroll paused
+                </button>
+              )}
               {/* Upload progress */}
               {uploadProgress && (
                 <div className="mx-auto max-w-3xl mb-3">
@@ -10688,9 +10836,7 @@ export default function ControlClient() {
                 </div>
               )}
 
-              <div
-                className="mx-auto max-w-3xl w-full space-y-2"
-              >
+              <div className="mx-auto max-w-3xl w-full space-y-2">
                 {/*
                   Slim status banner above the composer for interrupted /
                   blocked / failed missions. Lives inside the composer
@@ -10730,7 +10876,8 @@ export default function ControlClient() {
                           {statusLabel}
                         </span>
                         <span className="text-white/50 hidden sm:inline truncate">
-                          Type below to continue, or use the action on the right.
+                          Type below to continue, or use the action on the
+                          right.
                         </span>
                         <span className="ml-auto inline-flex items-center gap-1 shrink-0">
                           <button
@@ -10765,6 +10912,44 @@ export default function ControlClient() {
                   onClearAll={handleClearQueue}
                 />
 
+                {(() => {
+                  // Goal-mode pill — a flow row above the composer (not an
+                  // absolute overlay) so it never overlaps the streaming /
+                  // working indicators in the message list. indigo-300 text
+                  // (vs indigo-200) so the light-theme remap renders it dark
+                  // and readable. Cleared by the SSE handler at terminal status.
+                  const activeMissionId =
+                    viewingMission?.id ?? currentMission?.id;
+                  const goal = activeMissionId
+                    ? goalInfoByMission[activeMissionId]
+                    : undefined;
+                  if (!goal) return null;
+                  const statusLabel =
+                    goal.status === "active"
+                      ? `iter ${goal.iteration}`
+                      : goal.status === "paused"
+                        ? "paused"
+                        : goal.status;
+                  return (
+                    <div
+                      className="mb-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-300 max-w-fit"
+                      title={goal.objective}
+                    >
+                      <span className="font-semibold">Goal</span>
+                      <span className="text-indigo-300/60">·</span>
+                      <span>{statusLabel}</span>
+                      {goal.objective && (
+                        <>
+                          <span className="text-indigo-300/60">·</span>
+                          <span className="truncate max-w-[40ch] text-indigo-300/60">
+                            {goal.objective}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 <form
                   onSubmit={(e) => e.preventDefault()}
                   className="flex gap-2 items-stretch"
@@ -10788,41 +10973,6 @@ export default function ControlClient() {
                     placeholder="Message the root agent… (paste files to upload)"
                     backend={viewingMission?.backend ?? currentMission?.backend}
                   />
-                  {(() => {
-                    // Goal-mode pill — shown above the composer while a codex
-                    // `/goal` continuation loop is active. Cleared automatically
-                    // by the SSE handler when status hits a terminal value.
-                    const activeMissionId =
-                      viewingMission?.id ?? currentMission?.id;
-                    const goal = activeMissionId
-                      ? goalInfoByMission[activeMissionId]
-                      : undefined;
-                    if (!goal) return null;
-                    const statusLabel =
-                      goal.status === "active"
-                        ? `iter ${goal.iteration}`
-                        : goal.status === "paused"
-                          ? "paused"
-                          : goal.status;
-                    return (
-                      <div
-                        className="absolute -top-9 left-2 right-2 flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 max-w-fit"
-                        title={goal.objective}
-                      >
-                        <span className="font-semibold">Goal</span>
-                        <span className="text-indigo-300/60">·</span>
-                        <span>{statusLabel}</span>
-                        {goal.objective && (
-                          <>
-                            <span className="text-indigo-300/60">·</span>
-                            <span className="truncate max-w-[40ch] text-indigo-200/70">
-                              {goal.objective}
-                            </span>
-                          </>
-                        )}
-                      </div>
-                    );
-                  })()}
 
                   {isBusy ? (
                     <div className="inline-flex h-[46px] shrink-0 rounded-xl border border-white/[0.06] bg-white/[0.02] overflow-hidden">
@@ -10864,9 +11014,7 @@ export default function ControlClient() {
           </div>
 
           {/* Right column: Workbench, Thinking Panel and Desktop Stream stacked */}
-          {(showWorkbenchPanel ||
-            showThinkingPanel ||
-            showDesktopStream) && (
+          {(showWorkbenchPanel || showThinkingPanel || showDesktopStream) && (
             <div
               className={cn(
                 // animate-fade-in is opacity-only and cheap; we drop the
@@ -10948,6 +11096,22 @@ export default function ControlClient() {
                 </div>
               )}
             </div>
+          )}
+
+          {/* Ask co-pilot panel (separate lane — never interrupts the agent) */}
+          {showAskPanel && viewingMissionId && (
+            <AskPanel
+              missionId={viewingMissionId}
+              seed={askSlice.seed}
+              onSeedConsumed={() =>
+                setAskSlice((s) => ({ ...s, seed: null }))
+              }
+              onClose={() => setShowAskPanel(false)}
+              onSendToAgent={(text) => {
+                setInput((prev) => (prev ? `${prev}\n\n${text}` : text));
+                setShowAskPanel(false);
+              }}
+            />
           )}
         </div>
       </div>

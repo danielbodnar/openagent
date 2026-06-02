@@ -25,6 +25,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -256,6 +257,9 @@ const GOOGLE_SCOPES: &str =
     "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
 const GROK_OAUTH_CLIENT_KEY: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
 const GROK_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const GROK_CLI_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+static GROK_CLI_RECONCILE_LAST_CHECK: LazyLock<StdMutex<Option<Instant>>> =
+    LazyLock::new(|| StdMutex::new(None));
 
 fn google_client_id() -> &'static str {
     GOOGLE_CLIENT_ID
@@ -279,9 +283,21 @@ fn grok_auth_paths() -> Vec<PathBuf> {
 }
 
 fn read_grok_auth_entry() -> Option<serde_json::Value> {
-    let contents = std::fs::read_to_string(grok_auth_path()).ok()?;
-    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    auth.get(GROK_OAUTH_CLIENT_KEY).cloned()
+    // Try every candidate path (home-based AND the service path
+    // `/var/lib/opencode/.grok/auth.json`) — `home_dir()` for the service
+    // process doesn't always resolve to where the Grok CLI wrote its auth.
+    for path in grok_auth_paths() {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(auth) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        if let Some(entry) = auth.get(GROK_OAUTH_CLIENT_KEY) {
+            return Some(entry.clone());
+        }
+    }
+    None
 }
 
 async fn wait_for_grok_auth_entry() -> Option<serde_json::Value> {
@@ -356,9 +372,11 @@ fn parse_grok_device_auth_line(line: &str) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod grok_oauth_tests {
     use super::{
-        get_xai_api_key_for_grok, grok_auth_expires_at_millis, parse_grok_device_auth_line,
+        get_xai_api_key_for_grok, grok_auth_expires_at_millis, grok_cli_reconcile_due,
+        parse_grok_device_auth_line, GROK_CLI_RECONCILE_INTERVAL,
     };
     use crate::ai_providers::{AIProvider, OAuthCredentials, ProviderType};
+    use std::time::{Duration as StdDuration, Instant};
 
     #[test]
     fn parses_device_auth_url_and_user_code_from_stderr_line() {
@@ -396,6 +414,22 @@ mod grok_oauth_tests {
         });
 
         assert_eq!(grok_auth_expires_at_millis(&entry), 1779172231759);
+    }
+
+    #[test]
+    fn grok_cli_reconcile_throttles_recent_checks() {
+        let now = Instant::now();
+
+        assert!(grok_cli_reconcile_due(None, now));
+        assert!(!grok_cli_reconcile_due(Some(now), now));
+        assert!(!grok_cli_reconcile_due(
+            Some(now - GROK_CLI_RECONCILE_INTERVAL + StdDuration::from_millis(1)),
+            now,
+        ));
+        assert!(grok_cli_reconcile_due(
+            Some(now - GROK_CLI_RECONCILE_INTERVAL),
+            now,
+        ));
     }
 
     #[test]
@@ -532,6 +566,7 @@ async fn upsert_grok_oauth_provider(
     state: &super::routes::AppState,
     entry: &serde_json::Value,
     use_for_backends: Option<Vec<String>>,
+    target_id: Option<uuid::Uuid>,
 ) -> Result<ProviderResponse, (StatusCode, String)> {
     let access_token = entry
         .get("key")
@@ -556,12 +591,13 @@ async fn upsert_grok_oauth_provider(
     let account_email = grok_auth_email(entry);
     let backends = use_for_backends.unwrap_or_else(|| vec!["grok".to_string()]);
 
-    let mut provider = state
-        .ai_providers
-        .get_all_by_type(ProviderType::Xai)
-        .await
-        .into_iter()
-        .find(|p| p.has_oauth())
+    // When reconnect targets a specific row (UUID), update *that* row so the
+    // health probe checks the same id the user clicked. Otherwise fall back to
+    // the first OAuth row, or create a new one.
+    let existing_xai = state.ai_providers.get_all_by_type(ProviderType::Xai).await;
+    let mut provider = target_id
+        .and_then(|tid| existing_xai.iter().find(|p| p.id == tid).cloned())
+        .or_else(|| existing_xai.iter().find(|p| p.has_oauth()).cloned())
         .unwrap_or_else(|| {
             crate::ai_providers::AIProvider::new(
                 ProviderType::Xai,
@@ -5840,11 +5876,86 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
 }
 
 /// GET /api/ai/providers - List all providers.
+/// Reconcile the stored xAI OAuth token from the Grok CLI's own auth file.
+///
+/// The Grok Build CLI refreshes `~/.grok/auth.json` on its own schedule. When
+/// it does, sandboxed's stored copy goes stale and the dashboard wrongly shows
+/// the xAI provider as "needs reauth" (NeedsReauth keys off the stored
+/// `expires_at`) even though the CLI's token is still valid. Adopt the CLI's
+/// token whenever it is fresher so the dashboard reflects reality and later
+/// runs reuse the freshest credential.
+pub async fn reconcile_xai_store_from_grok_cli(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) {
+    let Some(entry) = read_grok_auth_entry() else {
+        return;
+    };
+    let access = entry
+        .get("key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let refresh = entry
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let (Some(access), Some(refresh)) = (access, refresh) else {
+        return;
+    };
+    let cli_expires_at = grok_auth_expires_at_millis(&entry);
+    for account in ai_providers.get_all_by_type(ProviderType::Xai).await {
+        if !account.has_oauth() {
+            continue;
+        }
+        let stored_expires = account.oauth.as_ref().map(|o| o.expires_at).unwrap_or(0);
+        if cli_expires_at > stored_expires {
+            let mut updated = account.clone();
+            updated.oauth = Some(crate::ai_providers::OAuthCredentials {
+                access_token: access.to_string(),
+                refresh_token: refresh.to_string(),
+                expires_at: cli_expires_at,
+            });
+            ai_providers.update(account.id, updated).await;
+            tracing::info!(
+                account_id = %account.id,
+                cli_expires_at,
+                "Reconciled xAI OAuth token from Grok CLI auth file"
+            );
+        }
+    }
+}
+
+fn grok_cli_reconcile_due(last_check: Option<Instant>, now: Instant) -> bool {
+    last_check
+        .map(|last| now.duration_since(last) >= GROK_CLI_RECONCILE_INTERVAL)
+        .unwrap_or(true)
+}
+
+async fn maybe_reconcile_xai_store_from_grok_cli(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+) {
+    let now = Instant::now();
+    {
+        let mut last_check = GROK_CLI_RECONCILE_LAST_CHECK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !grok_cli_reconcile_due(*last_check, now) {
+            return;
+        }
+        *last_check = Some(now);
+    }
+
+    reconcile_xai_store_from_grok_cli(ai_providers).await;
+}
+
 async fn list_providers(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Vec<ProviderResponse>>, (StatusCode, String)> {
     // Migrate any standard providers from opencode.json to the store on first call
     migrate_opencode_providers_to_store(&state.ai_providers, &state.config.working_dir).await;
+
+    // Keep the xAI provider's stored token in sync with the Grok CLI's own
+    // refreshed auth file so it doesn't show a false "needs reauth".
+    maybe_reconcile_xai_store_from_grok_cli(&state.ai_providers).await;
 
     // All providers live in AIProviderStore now
     let store_providers = state.ai_providers.list().await;
@@ -7714,14 +7825,33 @@ async fn oauth_callback(
     let provider_type_id = id.clone();
     match oauth_callback_inner(State(state.clone()), AxumPath(id), Json(req)).await {
         Ok(json) => {
-            if ProviderType::from_id(&provider_type_id) == Some(ProviderType::Xai) {
+            // Resolve the provider type. The add-provider flow passes a
+            // provider-type id ("anthropic", ...); the reconnect button passes
+            // the stored provider's *UUID*, which `ProviderType::from_id` does
+            // not recognize. Look the UUID up in the store so reconnect still
+            // mirrors the fresh OAuth into the row instead of leaving it with
+            // expired tokens.
+            let resolved_type_and_uuid = match ProviderType::from_id(&provider_type_id) {
+                Some(pt) => Some((pt, None)),
+                None => match uuid::Uuid::parse_str(&provider_type_id) {
+                    Ok(uuid) => state
+                        .ai_providers
+                        .get(uuid)
+                        .await
+                        .map(|existing| (existing.provider_type, Some(uuid))),
+                    Err(_) => None,
+                },
+            };
+
+            if resolved_type_and_uuid.map(|(pt, _)| pt) == Some(ProviderType::Xai) {
+                // xAI tracks creds in auth.json only; don't mirror to the store.
                 return json.into_response();
             }
 
             // After successful OAuth, upsert the provider in AIProviderStore.
             // The OAuth callback already synced creds to auth.json; now mirror that
             // into the store so multiple accounts of the same type are tracked.
-            if let Some(provider_type) = ProviderType::from_id(&provider_type_id) {
+            if let Some((provider_type, existing_uuid)) = resolved_type_and_uuid {
                 let backends = use_for_backends
                     .unwrap_or_else(|| default_backends_for_provider(provider_type));
 
@@ -7779,6 +7909,51 @@ async fn oauth_callback(
                     }
                 }
 
+                // If the caller referenced an existing provider by UUID (the
+                // reconnect button passes the stored provider's id), refresh
+                // that row in place. We must NEVER fall through to `add` here:
+                // inserting a second account for the same OAuth completion would
+                // leave the targeted row stale and duplicate the credential. Any
+                // failure path returns an explicit error instead.
+                if let Some(uuid) = existing_uuid {
+                    let Some(mut existing) = state.ai_providers.get(uuid).await else {
+                        // The OAuth creds are already synced to auth.json; the
+                        // targeted row just vanished. Report rather than insert
+                        // a duplicate.
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            "Provider to reconnect no longer exists".to_string(),
+                        )
+                            .into_response();
+                    };
+                    // Only replace the stored credentials when the callback
+                    // actually produced fresh ones. If `read_opencode_auth`
+                    // returned nothing (e.g. a failed auth.json sync that still
+                    // reported success), keep the existing creds rather than
+                    // wiping a row the user just re-authorized.
+                    if provider.api_key.is_some() || provider.oauth.is_some() {
+                        existing.api_key = provider.api_key.clone();
+                        existing.oauth = provider.oauth.clone();
+                    }
+                    existing.use_for_backends = provider.use_for_backends.clone();
+                    existing.enabled = true;
+                    // Only overwrite the display name/email when the new
+                    // credentials carry an identity; otherwise keep what the
+                    // user already had.
+                    if provider.account_email.is_some() {
+                        existing.account_email = provider.account_email.clone();
+                        existing.name = provider.name.clone();
+                    }
+                    return match state.ai_providers.update(uuid, existing).await {
+                        Some(stored) => Json(build_response_from_store(&stored)).into_response(),
+                        None => (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to persist reconnected provider".to_string(),
+                        )
+                            .into_response(),
+                    };
+                }
+
                 let store_id = state.ai_providers.add(provider.clone()).await;
                 // Return a response with the store UUID so the frontend can reference it
                 let stored = state.ai_providers.get(store_id).await.unwrap_or(provider);
@@ -7825,8 +8000,12 @@ async fn oauth_callback_inner(
                     .to_string(),
             )
         })?;
+        // Reconnect passes the row's UUID as the path id; thread it through so
+        // we update that exact row instead of the first OAuth xAI account.
+        let target_id = uuid::Uuid::parse_str(&id).ok();
         let response =
-            upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone()).await?;
+            upsert_grok_oauth_provider(&state, &entry, req.use_for_backends.clone(), target_id)
+                .await?;
         return Ok(Json(response));
     }
 
@@ -8885,4 +9064,67 @@ pub async fn refresh_oauth_token_with_lock(
 
     Ok((new_access, new_refresh, expires_at))
     // _lock is dropped here, releasing the file lock
+}
+
+/// Refresh OAuth tokens for **store-backed** accounts (AIProviderStore) of
+/// `provider_type` that expire within `refresh_threshold_ms`, writing the new
+/// tokens back to the store (and credential tiers).
+///
+/// The file-based [`oauth_token_refresher_loop`] only sees tokens written to
+/// `auth.json`/`credentials.json`. Providers connected via the dashboard live
+/// in the store (e.g. xAI/Grok), so without this their short-lived access
+/// token silently expires and `resolve_chain` drops the provider until the
+/// user reconnects. Returns `(found, refreshed)`.
+pub async fn refresh_due_store_oauth(
+    ai_providers: &crate::ai_providers::AIProviderStore,
+    provider_type: ProviderType,
+    refresh_threshold_ms: i64,
+) -> (u32, u32) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut found = 0u32;
+    let mut refreshed = 0u32;
+    for account in ai_providers.get_all_by_type(provider_type).await {
+        let Some(oauth) = account.oauth.as_ref() else {
+            continue;
+        };
+        if oauth.refresh_token.trim().is_empty() {
+            continue;
+        }
+        found += 1;
+        if oauth.expires_at - now_ms > refresh_threshold_ms {
+            continue;
+        }
+        // Serialize with the file-based refresher to avoid racing a rotating
+        // refresh token (best-effort — proceed unlocked if contended).
+        let _lock = acquire_oauth_refresh_lock(provider_type).ok();
+        match refresh_oauth_token_internal(&provider_type, &oauth.refresh_token).await {
+            Ok((access, refresh, expires_at)) => {
+                let mut updated = account.clone();
+                updated.oauth = Some(crate::ai_providers::OAuthCredentials {
+                    access_token: access.clone(),
+                    refresh_token: refresh.clone(),
+                    expires_at,
+                });
+                ai_providers.update(account.id, updated).await;
+                // Keep the credential tiers consistent too (best-effort).
+                let _ = sync_oauth_to_all_tiers(provider_type, &refresh, &access, expires_at);
+                refreshed += 1;
+                tracing::info!(
+                    provider = ?provider_type,
+                    account_id = %account.id,
+                    new_expires_at = expires_at,
+                    "Refreshed store-backed OAuth token"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = ?provider_type,
+                    account_id = %account.id,
+                    error = ?e,
+                    "Failed to refresh store-backed OAuth token (account may need reconnect)"
+                );
+            }
+        }
+    }
+    (found, refreshed)
 }

@@ -82,6 +82,20 @@ final class APIService {
         return URLSession(configuration: config)
     }()
 
+    /// Session for the Ask assistant. Its synchronous backend runs an agentic
+    /// loop (up to 6 LLM iterations × ~60s each, plus tool execution) and emits
+    /// no bytes until the whole turn finishes, so the 10s/25s JSON timeouts
+    /// would abort nearly every Ask request. Generous bounds instead.
+    nonisolated private static let askSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 200
+        config.timeoutIntervalForResource = 420
+        config.waitsForConnectivity = false
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpAdditionalHeaders = ["Accept": "application/json"]
+        return URLSession(configuration: config)
+    }()
+
     // Configuration
     var baseURL: String {
         get {
@@ -515,6 +529,38 @@ final class APIService {
     
     func cancelControl() async throws {
         let _: EmptyResponse = try await post("/api/control/cancel", body: EmptyBody())
+    }
+
+    // MARK: - Ask Assistant (non-interrupting sidecar co-pilot)
+
+    func postAsk(
+        missionId: String,
+        content: String,
+        threadId: String? = nil
+    ) async throws -> AskSendResponse {
+        struct AskRequest: Encodable {
+            let content: String
+            let thread_id: String?
+        }
+        return try await post(
+            "/api/control/missions/\(missionId)/ask",
+            body: AskRequest(content: content, thread_id: threadId),
+            session: Self.askSession
+        )
+    }
+
+    func listAskThreads(missionId: String) async throws -> [AskThread] {
+        try await get("/api/control/missions/\(missionId)/ask/threads")
+    }
+
+    func getAskThread(missionId: String, threadId: String) async throws -> AskThreadDetail {
+        try await get("/api/control/missions/\(missionId)/ask/threads/\(threadId)")
+    }
+
+    func deleteAskThread(missionId: String, threadId: String) async throws {
+        let _: EmptyResponse = try await delete(
+            "/api/control/missions/\(missionId)/ask/threads/\(threadId)"
+        )
     }
 
     // MARK: - Queue Management
@@ -1032,7 +1078,12 @@ final class APIService {
         return try await executeWithResponse(request)
     }
     
-    private func post<T: Decodable, B: Encodable>(_ path: String, body: B, authenticated: Bool = true) async throws -> T {
+    private func post<T: Decodable, B: Encodable>(
+        _ path: String,
+        body: B,
+        authenticated: Bool = true,
+        session: URLSession? = nil
+    ) async throws -> T {
         guard let url = makeURL(path) else {
             throw APIError.invalidURL
         }
@@ -1047,7 +1098,7 @@ final class APIService {
 
         request.httpBody = try JSONEncoder().encode(body)
 
-        return try await execute(request)
+        return try await execute(request, session: session)
     }
 
     private func delete<T: Decodable>(_ path: String, authenticated: Bool = true) async throws -> T {
@@ -1142,17 +1193,18 @@ final class APIService {
         ))
     }
     
-    private func execute<T: Decodable>(_ request: URLRequest) async throws -> T {
-        try await executeWithResponse(request).0
+    private func execute<T: Decodable>(_ request: URLRequest, session: URLSession? = nil) async throws -> T {
+        try await executeWithResponse(request, session: session).0
     }
 
-    private func executeWithResponse<T: Decodable>(_ request: URLRequest) async throws -> (T, HTTPURLResponse) {
+    private func executeWithResponse<T: Decodable>(_ request: URLRequest, session: URLSession? = nil) async throws -> (T, HTTPURLResponse) {
         let requestLabel = "\(request.httpMethod ?? "GET") \(request.url?.path ?? "?")"
+        let urlSession = session ?? Self.jsonSession
         let (data, response) = try await ControlPerformanceDiagnostics.shared.measureAsync(
             "api.request",
             detail: requestLabel
         ) {
-            try await Self.jsonSession.data(for: request)
+            try await urlSession.data(for: request)
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {

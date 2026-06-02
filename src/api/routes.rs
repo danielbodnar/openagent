@@ -722,6 +722,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "/api/control/missions/:id/parallel",
             post(control::start_mission_parallel),
         )
+        // Ask assistant (non-interrupting sidecar co-pilot)
+        .route(
+            "/api/control/missions/:id/ask",
+            post(crate::api::ask::http::ask_send),
+        )
+        .route(
+            "/api/control/missions/:id/ask/threads",
+            get(crate::api::ask::http::list_ask_threads),
+        )
+        .route(
+            "/api/control/missions/:id/ask/threads/:tid",
+            get(crate::api::ask::http::get_ask_thread)
+                .delete(crate::api::ask::http::delete_ask_thread),
+        )
         .route(
             "/api/control/missions/:id",
             axum::routing::delete(control::delete_mission),
@@ -2515,7 +2529,7 @@ async fn search_memory(Query(params): Query<SearchMemoryQuery>) -> Json<serde_js
 /// AIProviderStore, because OAuth tokens from the callback are stored in
 /// credentials.json but may not have a corresponding AIProvider entry.
 async fn oauth_token_refresher_loop(
-    _ai_providers: Arc<crate::ai_providers::AIProviderStore>,
+    ai_providers: Arc<crate::ai_providers::AIProviderStore>,
     working_dir: std::path::PathBuf,
 ) {
     use crate::ai_providers::ProviderType;
@@ -2530,6 +2544,9 @@ async fn oauth_token_refresher_loop(
         ProviderType::Anthropic,
         ProviderType::OpenAI,
         ProviderType::Google,
+        // xAI/Grok OAuth (Grok Build) is routed directly to api.x.ai with the
+        // hoisted access token, so keep it refreshed like the others.
+        ProviderType::Xai,
     ];
 
     tracing::info!(
@@ -2654,9 +2671,22 @@ async fn oauth_token_refresher_loop(
             }
         }
 
+        // Also refresh store-backed OAuth accounts whose tokens live only in
+        // the AIProviderStore (not auth.json/credentials.json) — notably
+        // xAI/Grok connected via the dashboard. Without this their short-lived
+        // access token expires and model-routing silently drops the provider.
+        let (store_found, store_refreshed) = ai_providers_api::refresh_due_store_oauth(
+            &ai_providers,
+            ProviderType::Xai,
+            refresh_threshold_ms,
+        )
+        .await;
+
         tracing::debug!(
             oauth_tokens_found = found_count,
             oauth_tokens_refreshed = refreshed_count,
+            store_oauth_found = store_found,
+            store_oauth_refreshed = store_refreshed,
             "OAuth refresh check cycle complete"
         );
 

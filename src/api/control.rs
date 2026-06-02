@@ -505,6 +505,115 @@ fn clear_mission_metadata_refresh_state(mission_id: Uuid) {
     baselines.remove(&mission_id);
 }
 
+/// Build a one-time "backend handoff" context message used when a mission's
+/// backend is switched (e.g. claudecode ↔ codex) via run-settings.
+///
+/// Each backend keeps its own session/reasoning format (Claude's signed
+/// thinking blocks vs Codex reasoning), and on a switch the new backend starts
+/// a fresh session — so without this the prior *reasoning* is silently lost
+/// (the reconstructed history only carries user/assistant text, not `thinking`
+/// events). This carries the recent reasoning forward as plain text, which any
+/// backend can consume. The workspace files and user/assistant transcript carry
+/// over on their own. Returns `None` when there's nothing worth carrying.
+async fn build_backend_handoff_context(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    old_backend: &str,
+    new_backend: &str,
+) -> Option<String> {
+    const MAX_TRACES: usize = 6;
+    const MAX_TRACE_CHARS: usize = 1500;
+    const MAX_BODY_CHARS: usize = 6000;
+
+    // Scan recent events for the latest reasoning. Prefer `thinking` traces;
+    // fall back to recent assistant messages when a backend produced none.
+    let events = mission_store
+        .get_latest_events(mission_id, 600)
+        .await
+        .ok()?;
+    let pick = |event_type: &str, limit: usize| -> Vec<String> {
+        let mut picked: Vec<String> = events
+            .iter()
+            .rev()
+            .filter(|e| e.event_type == event_type && !e.content.trim().is_empty())
+            .take(limit)
+            .map(|e| e.content.trim().to_string())
+            .collect();
+        picked.reverse();
+        picked
+    };
+
+    let (label, traces) = {
+        let thinking = pick("thinking", MAX_TRACES);
+        if !thinking.is_empty() {
+            ("most recent reasoning", thinking)
+        } else {
+            ("most recent progress notes", pick("assistant_message", 4))
+        }
+    };
+    if traces.is_empty() {
+        return None;
+    }
+
+    let mut body = String::new();
+    for trace in traces {
+        let idx = safe_truncate_index(&trace, MAX_TRACE_CHARS);
+        let snippet = if idx < trace.len() {
+            format!("{}…", &trace[..idx])
+        } else {
+            trace
+        };
+        if body.len() + snippet.len() > MAX_BODY_CHARS && !body.is_empty() {
+            break;
+        }
+        if !body.is_empty() {
+            body.push_str("\n\n---\n\n");
+        }
+        body.push_str(&snippet);
+    }
+
+    // The reconstructed content is prior agent/user output, so treat it as
+    // untrusted: neutralize any closing `</prior_reasoning>` so it can't break
+    // out of the framing tag (prompt injection). Case-insensitive.
+    let mut safe_body = body;
+    for variant in [
+        "</prior_reasoning",
+        "</PRIOR_REASONING",
+        "</Prior_reasoning",
+    ] {
+        safe_body = safe_body.replace(variant, "<\u{200b}/prior_reasoning");
+    }
+
+    // Backend names come from run-settings input; render only a sanitized
+    // identifier (alphanumeric/-/_) so a crafted value can't inject prompt
+    // text or break the markdown.
+    let sanitize_backend = |s: &str| -> String {
+        let cleaned: String = s
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(40)
+            .collect();
+        if cleaned.is_empty() {
+            "backend".to_string()
+        } else {
+            cleaned
+        }
+    };
+    let new_label = sanitize_backend(new_backend);
+    let old_label = sanitize_backend(old_backend);
+
+    Some(format!(
+        "## Backend handoff: now continuing on `{new_label}` (was `{old_label}`)\n\n\
+         The previous backend's session is not carried over (different reasoning \
+         format), but your work is intact in the workspace and the conversation \
+         above is preserved. To keep continuity, here is your {label} from the \
+         `{old_label}` session:\n\n\
+         <prior_reasoning>\n{safe_body}\n</prior_reasoning>\n\n\
+         Pick up exactly where you left off and continue toward the goal. \
+         Re-orient by checking the current workspace state first, then proceed."
+    ))
+}
+
 async fn clear_stale_mission_metadata_refresh_state(mission_store: &Arc<dyn MissionStore>) {
     let tracked_ids: std::collections::HashSet<Uuid> = {
         let tasks = MISSION_METADATA_REFRESH_TASKS
@@ -2244,10 +2353,20 @@ pub(crate) fn resolve_gemini_default_model() -> String {
 /// grok missions from inheriting the global `DEFAULT_MODEL`
 /// (e.g. `anthropic/claude-opus-4-6`) which grok rejects as "unknown model id".
 pub(crate) fn resolve_grok_default_model() -> String {
-    // Grok Build CLI currently advertises this coding model alias. xAI API
-    // model IDs live in the provider catalog instead:
-    // https://docs.x.ai/docs/models
-    "grok-build".to_string()
+    // Allow ops to override without a rebuild (e.g. when xAI renames the coding
+    // model again).
+    if let Ok(model) = std::env::var("GROK_DEFAULT_MODEL") {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    // The Grok Build CLI's coding model id. NOTE: the bare `grok-build` alias is
+    // rejected by current CLIs ("unknown model id"); `grok models` lists
+    // `grok-build-0.1`. Passing an invalid id makes the very first turn fail, so
+    // keep this in sync with the CLI. xAI *API* model IDs (for the API-key
+    // provider catalog) live separately: https://docs.x.ai/docs/models
+    "grok-build-0.1".to_string()
 }
 
 async fn close_mission_desktop_sessions(
@@ -3382,7 +3501,7 @@ async fn set_and_emit_status(
     });
 }
 
-async fn control_for_user(state: &Arc<AppState>, user: &AuthUser) -> ControlState {
+pub(crate) async fn control_for_user(state: &Arc<AppState>, user: &AuthUser) -> ControlState {
     state.control.get_or_spawn(user).await
 }
 
@@ -4809,7 +4928,21 @@ const HISTORY_EVENT_TYPES: &[&str] = &[
     "goal_iteration",
     "goal_status",
 ];
-const SNAPSHOT_EVENT_LIMIT: usize = 200;
+/// Conversation message types used to anchor the snapshot tail. The snapshot
+/// guarantees the most recent `SNAPSHOT_CONVERSATIONAL_MESSAGES` of these are
+/// loaded (plus every tool call between them), so a tool-heavy mission opens
+/// on the actual conversation instead of a wall of tool output.
+const SNAPSHOT_ANCHOR_TYPES: &[&str] = &[
+    "user_message",
+    "assistant_message",
+    "assistant_message_canonical",
+];
+/// How many recent conversation messages the snapshot guarantees.
+const SNAPSHOT_CONVERSATIONAL_MESSAGES: usize = 10;
+/// Hard cap on snapshot size. Bounds payload if the recent conversation
+/// happens to span an unusually large number of tool calls; the rest stays
+/// reachable via backwards pagination ("Load older messages").
+const SNAPSHOT_MAX_EVENTS: usize = 1500;
 
 fn event_types_for_query(query: &GetEventsQuery) -> Option<Vec<String>> {
     if let Some(types) = query.types.as_ref() {
@@ -4881,16 +5014,66 @@ pub async fn get_mission_snapshot(
         mission.workspace_name = Some(workspace.name);
     }
 
-    let events = control
+    // Conversation-anchored snapshot tail: load everything from the
+    // Nth-most-recent conversation message to the head, so the recent
+    // back-and-forth is always present even when tool calls dominate the
+    // raw event stream. Falls back to a plain recent-events tail when the
+    // mission has fewer than N conversation messages, or (degenerate) when
+    // the anchored span would exceed the hard cap.
+    let anchor_seq = control
         .mission_store
-        .get_events_before(
+        .nth_recent_event_sequence(
             mission_id,
-            i64::MAX,
-            Some(HISTORY_EVENT_TYPES),
-            Some(SNAPSHOT_EVENT_LIMIT),
+            SNAPSHOT_ANCHOR_TYPES,
+            SNAPSHOT_CONVERSATIONAL_MESSAGES,
         )
         .await
         .map_err(internal_error)?;
+    let events = match anchor_seq {
+        Some(anchor) => {
+            // `get_events_since` is `sequence > since`, so subtract one to
+            // include the anchor itself. Fetch one past the cap to detect
+            // overflow without a separate count query.
+            let anchored = control
+                .mission_store
+                .get_events_since(
+                    mission_id,
+                    anchor.saturating_sub(1),
+                    Some(HISTORY_EVENT_TYPES),
+                    Some(SNAPSHOT_MAX_EVENTS + 1),
+                )
+                .await
+                .map_err(internal_error)?;
+            if anchored.len() > SNAPSHOT_MAX_EVENTS {
+                // The recent conversation spans more than the cap of tool
+                // calls. `get_events_since` returned the OLDEST events after
+                // the anchor (ASC), which would miss the newest — so fall
+                // back to the most-recent capped tail instead.
+                control
+                    .mission_store
+                    .get_events_before(
+                        mission_id,
+                        i64::MAX,
+                        Some(HISTORY_EVENT_TYPES),
+                        Some(SNAPSHOT_MAX_EVENTS),
+                    )
+                    .await
+                    .map_err(internal_error)?
+            } else {
+                anchored
+            }
+        }
+        None => control
+            .mission_store
+            .get_events_before(
+                mission_id,
+                i64::MAX,
+                Some(HISTORY_EVENT_TYPES),
+                Some(SNAPSHOT_MAX_EVENTS),
+            )
+            .await
+            .map_err(internal_error)?,
+    };
     let summary = if should_summarize_events(&mission) {
         summarize_inactive_stream_events(events)
     } else {
@@ -9329,6 +9512,13 @@ async fn control_actor_loop(
                             continue;
                         }
 
+                        // Capture the backend before the update so we can detect
+                        // a switch and carry reasoning across (see below).
+                        let old_backend = load_mission_record(&mission_store, id)
+                            .await
+                            .ok()
+                            .map(|m| m.backend);
+
                         let result = mission_store
                             .update_mission_run_settings(
                                 id,
@@ -9352,6 +9542,50 @@ async fn control_actor_loop(
                                 session_id: updated.session_id.clone(),
                                 updated_at: updated.updated_at.clone(),
                             });
+
+                            // Backend switch handoff: the new backend starts a
+                            // fresh session and can't replay the old backend's
+                            // reasoning format, so carry the recent reasoning
+                            // forward as a plain-text context message. It lands
+                            // in the conversation history and is picked up by
+                            // the next turn (resume or message) on either
+                            // backend. Workspace + transcript carry over already.
+                            let backend_switched = old_backend
+                                .as_deref()
+                                .map(|prev| prev != updated.backend.as_str())
+                                .unwrap_or(false);
+                            if backend_switched {
+                                let prev = old_backend.as_deref().unwrap_or("the previous backend");
+                                if let Some(handoff) = build_backend_handoff_context(
+                                    &mission_store,
+                                    id,
+                                    prev,
+                                    &updated.backend,
+                                )
+                                .await
+                                {
+                                    let event = AgentEvent::UserMessage {
+                                        id: Uuid::new_v4(),
+                                        content: handoff,
+                                        queued: false,
+                                        mission_id: Some(id),
+                                    };
+                                    if let Err(e) = mission_store.log_event(id, &event).await {
+                                        tracing::warn!(
+                                            mission_id = %id,
+                                            error = %e,
+                                            "Failed to persist backend handoff context"
+                                        );
+                                    }
+                                    let _ = events_tx.send(event);
+                                    tracing::info!(
+                                        mission_id = %id,
+                                        old_backend = ?old_backend,
+                                        new_backend = %updated.backend,
+                                        "Injected backend-switch handoff context to preserve reasoning"
+                                    );
+                                }
+                            }
                         }
 
                         let _ = respond.send(result);

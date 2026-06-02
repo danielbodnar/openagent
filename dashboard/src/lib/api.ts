@@ -492,6 +492,84 @@ export async function clearQueue(): Promise<{ cleared: number }> {
   return apiDel("/api/control/queue", "Failed to clear queue");
 }
 
+// ── Ask assistant (non-interrupting sidecar co-pilot) ──────────────────────
+
+export interface AskThread {
+  id: string;
+  mission_id: string;
+  title: string | null;
+  model: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AskMessage {
+  id: string;
+  thread_id: string;
+  seq: number;
+  /** "user" | "assistant" | "tool_call" | "tool_result" */
+  role: string;
+  content: string;
+  tool_name?: string | null;
+  tool_call_id?: string | null;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface AskSendResponse {
+  thread_id: string;
+  answer: string;
+  messages: AskMessage[];
+}
+
+/** Send a question to the Ask assistant for a mission (creates a thread if none).
+ * When `sandbox` is true, the Ask bash tool runs in an isolated git worktree so
+ * its writes never touch the live workspace. */
+export async function askSend(
+  missionId: string,
+  content: string,
+  threadId?: string,
+  sandbox?: boolean,
+): Promise<AskSendResponse> {
+  const body: { content: string; thread_id?: string; sandbox?: boolean } = {
+    content,
+  };
+  if (threadId) body.thread_id = threadId;
+  if (sandbox) body.sandbox = true;
+  return apiPost<AskSendResponse>(
+    `/api/control/missions/${missionId}/ask`,
+    body,
+    "Failed to ask the assistant",
+  );
+}
+
+export async function listAskThreads(missionId: string): Promise<AskThread[]> {
+  return apiGet<AskThread[]>(
+    `/api/control/missions/${missionId}/ask/threads`,
+    "Failed to list Ask threads",
+  );
+}
+
+export async function getAskThread(
+  missionId: string,
+  threadId: string,
+): Promise<{ messages: AskMessage[] } & AskThread> {
+  return apiGet(
+    `/api/control/missions/${missionId}/ask/threads/${threadId}`,
+    "Failed to load Ask thread",
+  );
+}
+
+export async function deleteAskThread(
+  missionId: string,
+  threadId: string,
+): Promise<void> {
+  return apiDel(
+    `/api/control/missions/${missionId}/ask/threads/${threadId}`,
+    "Failed to delete Ask thread",
+  );
+}
+
 // Agent tree snapshot (for refresh resilience)
 export interface AgentTreeNode {
   id: string;
@@ -2867,11 +2945,11 @@ export async function uninstallSystemComponent(
 export interface SettingsResponse {
   library_remote: string | null;
   sandboxed_repo_path: string | null;
-  rtk_enabled: boolean | null;
   max_parallel_missions: number | null;
   max_concurrent_tasks: number | null;
   auto_cleanup_enabled: boolean | null;
   auto_cleanup_days: number | null;
+  ask_assistant_model: string | null;
 }
 
 export interface UpdateLibraryRemoteResponse {
@@ -2912,22 +2990,6 @@ export async function updateLibraryRemote(
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || "Failed to update library remote");
-  }
-  return res.json();
-}
-
-// Update the RTK enabled setting
-export async function updateRtkEnabled(
-  rtkEnabled: boolean,
-): Promise<{ rtk_enabled: boolean; previous_value: boolean | null }> {
-  const res = await apiFetch("/api/settings/rtk-enabled", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ rtk_enabled: rtkEnabled }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || "Failed to update RTK setting");
   }
   return res.json();
 }

@@ -591,46 +591,12 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "ChatGPT Plus/Pro via OAuth".to_string(),
                 models: vec![
-                    // Keep this fallback list aligned with Codex upstream model IDs:
-                    // https://raw.githubusercontent.com/openai/codex/main/codex-rs/core/models.json
-                    // (authoritative source for Codex CLI model catalog).
-                    // Codex-optimized models (for Codex CLI)
-                    ProviderModel {
-                        id: "gpt-5-codex".to_string(),
-                        name: "GPT-5 Codex".to_string(),
-                        description: Some("Purpose-built for agentic coding".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5-codex-mini".to_string(),
-                        name: "GPT-5 Codex Mini".to_string(),
-                        description: Some("Smaller, cost-effective variant".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex".to_string(),
-                        name: "GPT-5.1 Codex".to_string(),
-                        description: Some("Balanced capability and speed".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex-max".to_string(),
-                        name: "GPT-5.1 Codex Max".to_string(),
-                        description: Some("Highest reasoning capacity".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1-codex-mini".to_string(),
-                        name: "GPT-5.1 Codex Mini".to_string(),
-                        description: Some("Fast and economical".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.2-codex".to_string(),
-                        name: "GPT-5.2 Codex".to_string(),
-                        description: Some("Smart and precise coding agent".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.3-codex".to_string(),
-                        name: "GPT-5.3 Codex".to_string(),
-                        description: Some("Newest Codex coding model".to_string()),
-                    },
-                    // Additional OpenAI models
+                    // Only current models. OpenAI's ChatGPT-account Codex keeps
+                    // a small recent set, so the older codex variants (gpt-5-codex
+                    // … gpt-5.3-codex) and stale generics (gpt-5.1/5.2/5.3) were
+                    // removed — gpt-5.3-codex now 404s ("model not supported when
+                    // using Codex with a ChatGPT account"), and everything older
+                    // than it is dead too. Newest first.
                     ProviderModel {
                         id: "gpt-5.5".to_string(),
                         name: "GPT-5.5".to_string(),
@@ -639,24 +605,14 @@ fn default_providers_config() -> ProvidersConfig {
                         ),
                     },
                     ProviderModel {
+                        id: "gpt-5.5-codex".to_string(),
+                        name: "GPT-5.5 Codex".to_string(),
+                        description: Some("Latest Codex-optimized coding model".to_string()),
+                    },
+                    ProviderModel {
                         id: "gpt-5.4".to_string(),
                         name: "GPT-5.4".to_string(),
                         description: Some("Previous frontier coding model in Codex".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.3".to_string(),
-                        name: "GPT-5.3".to_string(),
-                        description: Some("General-purpose GPT-5.3".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.2".to_string(),
-                        name: "GPT-5.2".to_string(),
-                        description: Some("General-purpose GPT-5.2".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.1".to_string(),
-                        name: "GPT-5.1".to_string(),
-                        description: Some("General-purpose GPT-5.1".to_string()),
                     },
                 ],
             },
@@ -703,12 +659,18 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "pay-per-token".to_string(),
                 description: "Grok models via xAI API key".to_string(),
                 models: vec![
-                    // Check xAI model IDs here:
-                    // https://docs.x.ai/docs/models
+                    // These IDs must match what the Grok Build CLI accepts
+                    // (`grok models`) — the bare `grok-build` alias is rejected
+                    // by current CLIs. xAI API model IDs: https://docs.x.ai/docs/models
                     ProviderModel {
-                        id: "grok-build".to_string(),
+                        id: "grok-build-0.1".to_string(),
                         name: "Grok Build".to_string(),
                         description: Some("Default Grok Build CLI coding model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "composer-2.5".to_string(),
+                        name: "Composer 2.5".to_string(),
+                        description: Some("Composer 2.5 coding model (Grok Build CLI)".to_string()),
                     },
                     ProviderModel {
                         id: "grok-4.3".to_string(),
@@ -716,9 +678,9 @@ fn default_providers_config() -> ProvidersConfig {
                         description: Some("Current flagship Grok model".to_string()),
                     },
                     ProviderModel {
-                        id: "grok-4.3-latest".to_string(),
-                        name: "Grok 4.3 Latest".to_string(),
-                        description: Some("Fast and economical".to_string()),
+                        id: "grok-4.20-0309-reasoning".to_string(),
+                        name: "Grok 4.20 (Reasoning)".to_string(),
+                        description: Some("Grok 4.20 reasoning model".to_string()),
                     },
                 ],
             },
@@ -1709,12 +1671,12 @@ pub async fn validate_model_override(
             let xai = providers.iter().find(|p| p.id == "xai");
             if let Some(provider) = xai {
                 if provider.models.iter().any(|m| m.id == model_override)
-                    || model_override.starts_with("grok-")
+                    || is_custom_grok_model_id(model_override)
                 {
                     Ok(())
                 } else {
                     Err(format!(
-                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use format 'grok-*'",
+                        "Model '{}' not found in xAI catalog. Available models: {}. For custom Grok models, use format 'grok-*' or 'composer-*'",
                         model_override,
                         provider
                             .models
@@ -1725,11 +1687,11 @@ pub async fn validate_model_override(
                             .join(", ")
                     ))
                 }
-            } else if model_override.starts_with("grok-") {
+            } else if is_custom_grok_model_id(model_override) {
                 Ok(())
             } else {
                 Err(format!(
-                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3'), got '{}'",
+                    "xAI provider not configured. Expected a Grok model ID (e.g., 'grok-4.3' or 'composer-2.5'), got '{}'",
                     model_override
                 ))
             }
@@ -1739,6 +1701,10 @@ pub async fn validate_model_override(
             Ok(())
         }
     }
+}
+
+fn is_custom_grok_model_id(model_id: &str) -> bool {
+    model_id.starts_with("grok-") || model_id.starts_with("composer-")
 }
 
 #[cfg(test)]
@@ -1781,7 +1747,17 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "xai")
             .expect("xai provider");
-        assert!(xai.models.iter().any(|model| model.id == "grok-build"));
+        // The CLI-valid coding model id (bare `grok-build` is rejected by
+        // current CLIs) plus the Composer model the Grok CLI now supports.
+        assert!(xai.models.iter().any(|model| model.id == "grok-build-0.1"));
+        assert!(xai.models.iter().any(|model| model.id == "composer-2.5"));
+    }
+
+    #[test]
+    fn grok_custom_model_prefixes_include_composer() {
+        assert!(is_custom_grok_model_id("grok-4.3"));
+        assert!(is_custom_grok_model_id("composer-2.5"));
+        assert!(!is_custom_grok_model_id("claude-opus-4-7"));
     }
 
     #[test]
