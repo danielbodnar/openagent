@@ -70,9 +70,9 @@ curl -X POST https://YOUR-BACKEND/api/ai/providers \
 **Get API Key:** https://bigmodel.cn
 
 **Recommended Models:**
-- `glm-5` - Most capable model
-- `glm-4-flash` - Fast, cost-effective
-- `glm-4-plus` - Enhanced capabilities
+- `glm-5.1` - Current flagship GLM reasoning and coding model
+- `glm-5-turbo` - Fast reasoning model with deep thinking
+- `glm-4.7` - Strong general-purpose GLM model
 
 **Example Configuration:**
 ```bash
@@ -86,6 +86,31 @@ curl -X POST https://YOUR-BACKEND/api/ai/providers \
     "use_for_backends": ["opencode"]
   }'
 ```
+
+### MiniMax
+
+**Get API Key:** https://platform.minimax.io
+
+**Recommended Models:**
+- `MiniMax-M3` - Current flagship coding and agentic model with 1M context
+- `MiniMax-M2.7` - Previous flagship MiniMax model
+- `MiniMax-M2.5-highspeed` - Fast previous-generation model
+
+**Example Configuration:**
+```bash
+curl -X POST https://YOUR-BACKEND/api/ai/providers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider_type": "minimax",
+    "name": "MiniMax",
+    "api_key": "...",
+    "enabled": true,
+    "use_for_backends": ["opencode"]
+  }'
+```
+
+Use OpenCode model overrides in `provider/model` format, for example
+`zai/glm-5.1` or `minimax/MiniMax-M3`.
 
 ### DeepInfra
 

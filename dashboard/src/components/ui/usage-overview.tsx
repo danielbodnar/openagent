@@ -9,7 +9,7 @@
  *   3. Two-column row: cost-over-time bar chart + provider mix legend.
  *   4. Compact model table (rank, swatch + model, calls, tokens, spend, share).
  *
- * The visual tokens match `/analytics`:
+ * Visual tokens:
  *   - card: `bg-white/[0.02] border border-white/[0.06] rounded-xl`
  *   - metric value: `text-2xl font-semibold font-mono tabular-nums`
  *   - axis bar: indigo-500/50 with weekend opacity dim

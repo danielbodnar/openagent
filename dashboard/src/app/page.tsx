@@ -13,6 +13,7 @@ import { RelativeTime } from '@/components/ui/relative-time';
 import {
   createMission,
   getStats,
+  getUsageSummary,
   listWorkspaces,
   listMissions,
   getRunningMissions,
@@ -22,6 +23,7 @@ import {
   resumeMission,
   type ModelEffort,
   type Mission,
+  type UsageSummary,
 } from '@/lib/api';
 import {
   Activity,
@@ -38,7 +40,7 @@ import {
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
-import { cn, formatCents } from '@/lib/utils';
+import { cn, formatCentsCompact } from '@/lib/utils';
 import { NewMissionDialog } from '@/components/new-mission-dialog';
 import { stableJsonCompare } from '@/lib/swr-config';
 import {
@@ -311,6 +313,19 @@ function OverviewPageContent() {
           hasShownErrorRef.current = true;
         }
       },
+    }
+  );
+
+  // SWR: lifetime AI spend. Mission stats `total_cost_cents` is unpopulated
+  // (per-mission cost is never recorded), so the footer reads the same
+  // source as the Providers page: aggregated AI usage records.
+  const { data: usageAll, isLoading: usageLoading } = useSWR<UsageSummary>(
+    ['usage-summary', 'all'],
+    () => getUsageSummary('all'),
+    {
+      refreshInterval: 30_000,
+      revalidateOnFocus: false,
+      compare: stableJsonCompare,
     }
   );
 
@@ -642,16 +657,12 @@ function OverviewPageContent() {
               />
               <StatsCard
                 title="Total Cost"
-                value={formatCents(stats?.total_cost_cents ?? 0)}
-                subtitle={
-                  (stats?.actual_cost_cents ?? 0) > 0 && (stats?.estimated_cost_cents ?? 0) > 0
-                    ? "mixed"
-                    : (stats?.actual_cost_cents ?? 0) > 0
-                    ? "actual"
-                    : (stats?.estimated_cost_cents ?? 0) > 0
-                    ? "est."
-                    : undefined
+                value={
+                  usageLoading
+                    ? '…'
+                    : formatCentsCompact(usageAll?.totals.cost_cents ?? 0)
                 }
+                subtitle="lifetime"
                 icon={DollarSign}
               />
             </>

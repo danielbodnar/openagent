@@ -1,14 +1,13 @@
 "use client";
 
-import { useEffect, useState, useRef, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback } from "react";
 import Link from "next/link";
 import useSWR from "swr";
 import { toast } from "@/components/toast";
 import { cn } from "@/lib/utils";
-import { listMissions, getMissionTree, deleteMission, cleanupEmptyMissions } from "@/lib/api";
+import { listMissions, deleteMission, cleanupEmptyMissions } from "@/lib/api";
 import { CopyButton } from "@/components/ui/copy-button";
 import { RelativeTime } from "@/components/ui/relative-time";
-import { AgentTreeCanvas, type AgentNode } from "@/components/agent-tree";
 import {
   Loader,
   ArrowRight,
@@ -18,8 +17,6 @@ import {
   ArrowUpDown,
   ArrowUp,
   ArrowDown,
-  Network,
-  X,
   Trash2,
   Sparkles,
 } from "lucide-react";
@@ -36,10 +33,6 @@ const statusConfig: Record<string, { color: string; bg: string }> = {
   blocked: { color: "text-orange-400", bg: "bg-orange-500/10" },
   not_feasible: { color: "text-rose-400", bg: "bg-rose-500/10" },
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
 
 // Cell shapes mirror the real missions table:
 // 1) status pill (icon + label)  2) icon + truncated title
@@ -109,106 +102,22 @@ function SortButton({
   );
 }
 
-// Convert backend tree node to frontend AgentNode
-function convertTreeNode(node: Record<string, unknown>): AgentNode {
-  const children = (node["children"] as Record<string, unknown>[] | undefined) ?? [];
-  return {
-    id: String(node["id"] ?? ""),
-    type: String(node["node_type"] ?? "Node") as AgentNode["type"],
-    status: String(node["status"] ?? "pending") as AgentNode["status"],
-    name: String(node["name"] ?? ""),
-    description: String(node["description"] ?? ""),
-    model: node["selected_model"] != null ? String(node["selected_model"]) : undefined,
-    budgetAllocated: Number(node["budget_allocated"] ?? 0),
-    budgetSpent: Number(node["budget_spent"] ?? 0),
-    complexity: node["complexity"] != null ? Number(node["complexity"]) : undefined,
-    children: children.map((c) => convertTreeNode(c)),
-  };
-}
-
 export default function HistoryPage() {
   const [filter, setFilter] = useState<string>("all");
   const [search, setSearch] = useState("");
   const [sortField, setSortField] = useState<SortField>("date");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
 
-  // SWR: fetch missions (shared key with recent-tasks sidebar)
+  // SWR: fetch missions (shared "missions" key with other views)
   const { data: missions = [], isLoading: loading, mutate: mutateMissions } = useSWR(
     'missions',
     listMissions,
     { revalidateOnFocus: false }
   );
 
-  // Tree preview state
-  const [previewMissionId, setPreviewMissionId] = useState<string | null>(null);
-  const [previewTree, setPreviewTree] = useState<AgentNode | null>(null);
-  const [loadingTree, setLoadingTree] = useState(false);
-
-  // Track the mission ID being fetched to prevent race conditions
-  const fetchingTreeMissionIdRef = useRef<string | null>(null);
-
   // Delete state
   const [deletingMissionId, setDeletingMissionId] = useState<string | null>(null);
   const [cleaningUp, setCleaningUp] = useState(false);
-
-  // Handle Escape key for modal
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && previewMissionId) {
-        setPreviewMissionId(null);
-        setPreviewTree(null);
-        fetchingTreeMissionIdRef.current = null;
-      }
-    };
-    if (previewMissionId) {
-      document.addEventListener("keydown", handleKeyDown);
-      return () => document.removeEventListener("keydown", handleKeyDown);
-    }
-  }, [previewMissionId]);
-
-  // Load tree for preview
-  const handlePreviewTree = useCallback(async (missionId: string) => {
-    if (previewMissionId === missionId) {
-      // Toggle off
-      setPreviewMissionId(null);
-      setPreviewTree(null);
-      fetchingTreeMissionIdRef.current = null;
-      return;
-    }
-
-    setPreviewMissionId(missionId);
-    setLoadingTree(true);
-    fetchingTreeMissionIdRef.current = missionId;
-    
-    try {
-      const tree = await getMissionTree(missionId);
-      
-      // Race condition guard: only update if this is still the mission we want
-      if (fetchingTreeMissionIdRef.current !== missionId) {
-        return; // Another mission was requested, discard this response
-      }
-      
-      if (tree && isRecord(tree)) {
-        setPreviewTree(convertTreeNode(tree as Record<string, unknown>));
-      } else {
-        setPreviewTree(null);
-        toast.error("No tree data available for this mission");
-      }
-    } catch {
-      // Race condition guard: only update if this is still the mission we want
-      if (fetchingTreeMissionIdRef.current !== missionId) {
-        return;
-      }
-      
-      setPreviewTree(null);
-      toast.error("Failed to load tree");
-    } finally {
-      // Only clear loading if this is still the current fetch
-      if (fetchingTreeMissionIdRef.current === missionId) {
-        setLoadingTree(false);
-      }
-    }
-  }, [previewMissionId]);
 
   const handleSort = (field: SortField) => {
     if (sortField === field) {
@@ -495,18 +404,6 @@ export default function HistoryPage() {
                                 <ArrowRight className="h-3 w-3" />
                               </Link>
                               <button
-                                onClick={() => handlePreviewTree(mission.id)}
-                                className={cn(
-                                  "inline-flex items-center gap-1 text-xs transition-colors",
-                                  previewMissionId === mission.id
-                                    ? "text-emerald-400 hover:text-emerald-300"
-                                    : "text-white/40 hover:text-white/60"
-                                )}
-                                title="View agent tree"
-                              >
-                                <Network className="h-3 w-3" />
-                              </button>
-                              <button
                                 onClick={(e) => handleDeleteMission(mission.id, e)}
                                 disabled={deletingMissionId === mission.id || mission.status === "active"}
                                 className={cn(
@@ -543,71 +440,6 @@ export default function HistoryPage() {
             </div>
           )}
       </div>
-
-      {/* Agent Tree Modal */}
-      {previewMissionId && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
-          onClick={() => {
-            setPreviewMissionId(null);
-            setPreviewTree(null);
-            fetchingTreeMissionIdRef.current = null;
-          }}
-        >
-          <div
-            className="relative w-[90vw] h-[85vh] max-w-6xl rounded-2xl bg-[#0a0a0a] border border-white/[0.08] shadow-2xl overflow-hidden flex flex-col"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {/* Modal Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.06]">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10">
-                  <Network className="h-5 w-5 text-emerald-400" />
-                </div>
-                <div>
-                  <h2 className="text-lg font-semibold text-white">Agent Tree</h2>
-                  <p className="text-xs text-white/40">
-                    {missions.find((m) => m.id === previewMissionId)?.title?.slice(0, 50) || "Mission visualization"}
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => {
-                  setPreviewMissionId(null);
-                  setPreviewTree(null);
-                  fetchingTreeMissionIdRef.current = null;
-                }}
-                className="flex h-10 w-10 items-center justify-center rounded-xl text-white/40 hover:bg-white/[0.04] hover:text-white/70 transition-colors"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-
-            {/* Modal Content */}
-            <div className="flex-1 min-h-0">
-              {loadingTree ? (
-                <div className="flex flex-col items-center justify-center h-full">
-                  <Loader className="h-8 w-8 animate-spin text-emerald-400 mb-3" />
-                  <p className="text-sm text-white/60">Loading agent tree...</p>
-                </div>
-              ) : previewTree ? (
-                <AgentTreeCanvas tree={previewTree} className="w-full h-full" />
-              ) : (
-                <div className="flex flex-col items-center justify-center h-full text-center p-8">
-                  <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-white/[0.02] mb-4">
-                    <Network className="h-10 w-10 text-white/20" />
-                  </div>
-                  <p className="text-lg font-medium text-white/60">No tree data available</p>
-                  <p className="text-sm text-white/30 mt-2 max-w-md">
-                    Agent tree data is captured during mission execution. 
-                    This mission may have been completed before tree tracking was enabled.
-                  </p>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

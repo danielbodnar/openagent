@@ -375,6 +375,8 @@ fn package_base(spec: &str) -> String {
 }
 
 pub async fn sync_global_plugins(plugins: &HashMap<String, Plugin>) -> anyhow::Result<()> {
+    const GOAL_PLUGIN: &str = "opencode-goal-plugin";
+
     let config_path = resolve_opencode_config_path();
     if let Some(parent) = config_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -408,6 +410,12 @@ pub async fn sync_global_plugins(plugins: &HashMap<String, Plugin>) -> anyhow::R
     let mut merged = existing_plugins;
     let mut seen = HashSet::new();
     merged.retain(|entry| seen.insert(entry.clone()));
+    if !merged
+        .iter()
+        .any(|entry| package_base(entry.as_str()) == GOAL_PLUGIN)
+    {
+        merged.push(GOAL_PLUGIN.to_string());
+    }
 
     for plugin in plugins.values().filter(|plugin| plugin.enabled) {
         let spec = plugin.package.trim();
@@ -426,6 +434,21 @@ pub async fn sync_global_plugins(plugins: &HashMap<String, Plugin>) -> anyhow::R
     }
 
     root_obj.insert("plugin".to_string(), json!(merged));
+    let command_entry = root_obj
+        .entry("command".to_string())
+        .or_insert_with(|| json!({}));
+    if !command_entry.is_object() {
+        *command_entry = json!({});
+    }
+    if let Some(commands) = command_entry.as_object_mut() {
+        commands.entry("goal".to_string()).or_insert_with(|| {
+            json!({
+                "description": "Set a session-scoped goal and auto-continue until complete.",
+                "template": "$ARGUMENTS",
+                "agent": "build"
+            })
+        });
+    }
 
     let payload = serde_json::to_string_pretty(&root)?;
     tokio::fs::write(&config_path, payload).await?;

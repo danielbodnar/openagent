@@ -311,6 +311,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components/by-workspace", get(get_components_by_workspace))
         .route("/hermes-assistant/adopt", post(adopt_hermes_assistant))
         .route("/hermes-assistant/status", get(get_hermes_assistant_status))
+        .route(
+            "/hermes-assistant/skills",
+            get(list_hermes_assistant_skills),
+        )
         .route("/hermes-assistant/stop", post(stop_hermes_assistant))
         .route("/components/:name/update", post(update_component))
         .route("/components/:name/uninstall", post(uninstall_component))
@@ -895,6 +899,131 @@ fn default_hermes_model() -> String {
     "builtin/assistant".to_string()
 }
 
+/// A skill the Hermes runtime installed for itself (agentskills.io / skills.sh),
+/// discovered by scanning `/var/lib/<runtime>/skills/**/SKILL.md`.
+#[derive(Debug, Serialize)]
+pub struct HermesSkill {
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub version: Option<String>,
+    /// Path relative to the skills root, e.g. `productivity/google-workspace`.
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HermesSkillsResponse {
+    pub root: String,
+    /// False when the skills directory is missing (e.g. Hermes not installed).
+    pub available: bool,
+    pub skills: Vec<HermesSkill>,
+}
+
+/// Pull `name` / `description` / `version` out of a SKILL.md YAML frontmatter
+/// block (the leading `---` … `---` section).
+fn parse_skill_frontmatter(
+    contents: &str,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let rest = contents.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    let frontmatter = &rest[..end];
+    let value: serde_yaml::Value = serde_yaml::from_str(frontmatter).ok()?;
+    let get = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    Some((get("name"), get("description"), get("version")))
+}
+
+/// Recursively collect `SKILL.md` files under `dir` (bounded depth).
+fn collect_skill_files(dir: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_skill_files(&path, depth + 1, out);
+        } else if path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
+            out.push(path);
+        }
+    }
+}
+
+/// List the skills the Hermes runtime has installed for itself.
+async fn list_hermes_assistant_skills(
+    State(state): State<Arc<AppState>>,
+) -> Json<HermesSkillsResponse> {
+    let runtime_name = assistant_runtime_name(&state.config);
+    let skills_root = std::path::PathBuf::from(format!("/var/lib/{runtime_name}/skills"));
+    let root_str = skills_root.display().to_string();
+
+    if !skills_root.is_dir() {
+        return Json(HermesSkillsResponse {
+            root: root_str,
+            available: false,
+            skills: Vec::new(),
+        });
+    }
+
+    let scan_root = skills_root.clone();
+    let mut skills = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        collect_skill_files(&scan_root, 0, &mut files);
+        let mut skills = Vec::with_capacity(files.len());
+        for file in files {
+            let rel = file
+                .parent()
+                .and_then(|p| p.strip_prefix(&scan_root).ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let category = rel
+                .split('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let dir_name = file
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("skill")
+                .to_string();
+            let (name, description, version) = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|c| parse_skill_frontmatter(&c))
+                .unwrap_or((None, None, None));
+            skills.push(HermesSkill {
+                name: name.unwrap_or(dir_name),
+                description,
+                category,
+                version,
+                path: rel,
+            });
+        }
+        skills
+    })
+    .await
+    .unwrap_or_default();
+
+    skills.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    Json(HermesSkillsResponse {
+        root: root_str,
+        available: true,
+        skills,
+    })
+}
+
 fn assistant_runtime_name(config: &crate::config::Config) -> &'static str {
     if config.port == 3002
         || std::env::var("SANDBOXED_ENV")
@@ -1223,6 +1352,56 @@ async fn rollback_legacy_gateway(
     }
 }
 
+/// Name prefix for proxy keys provisioned for the Hermes gateway.
+const HERMES_PROXY_KEY_PREFIX: &str = "Hermes Assistant";
+
+/// Get the proxy API key for the Hermes gateway, reusing the key already
+/// wired into the gateway env when it is still registered; otherwise mint a
+/// fresh one. Either way, revoke any other "Hermes Assistant" keys so
+/// repeated adopt runs don't leak one key per invocation.
+async fn ensure_hermes_proxy_key(
+    state: &AppState,
+    env_path: &str,
+    runtime_name: &str,
+) -> Result<String, String> {
+    let existing = tokio::fs::read_to_string(env_path)
+        .await
+        .ok()
+        .and_then(|contents| parse_env_value(&contents, "OPENAI_API_KEY"))
+        .filter(|v| !v.is_empty());
+
+    let mut reuse = None;
+    if let Some(raw) = existing {
+        if let Some(summary) = state.proxy_api_keys.find_by_token(&raw).await {
+            reuse = Some((raw, summary.id));
+        }
+    }
+    let (raw_key, keep_id) = match reuse {
+        Some(pair) => pair,
+        None => {
+            let created = state
+                .proxy_api_keys
+                .create(format!("{HERMES_PROXY_KEY_PREFIX} ({runtime_name})"))
+                .await?;
+            (created.key, created.id)
+        }
+    };
+    match state
+        .proxy_api_keys
+        .delete_named_except(HERMES_PROXY_KEY_PREFIX, Some(keep_id))
+        .await
+    {
+        Ok(removed) if !removed.is_empty() => tracing::info!(
+            "Revoked {} stale \"{HERMES_PROXY_KEY_PREFIX}\" proxy key(s) during adopt",
+            removed.len()
+        ),
+        Ok(_) => {}
+        // Losing the garbage collection is not worth failing the adopt over.
+        Err(e) => tracing::warn!("Failed to revoke stale Hermes proxy keys: {}", e),
+    }
+    Ok(raw_key)
+}
+
 /// Adopt an existing Assistant/Telegram gateway into the host Hermes runtime.
 ///
 /// The token is read from the existing encrypted/local mission store and written
@@ -1277,15 +1456,9 @@ async fn adopt_hermes_assistant(
     } else {
         req.model.trim().to_string()
     };
-    let proxy_key = state
-        .proxy_api_keys
-        .create(format!(
-            "Hermes Assistant {}",
-            chrono::Utc::now().to_rfc3339()
-        ))
+    let proxy_key = ensure_hermes_proxy_key(&state, &env_path, runtime_name)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .key;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
     let user_id = user.id.clone();
     let default_workspace_id = channel

@@ -21,6 +21,8 @@ import {
   listProxyApiKeys,
   createProxyApiKey,
   deleteProxyApiKey,
+  cleanupProxyApiKeys,
+  type ProxyApiKeySummary,
 } from '@/lib/api/proxy-keys';
 import {
   listProviders,
@@ -47,8 +49,9 @@ import {
   Copy,
   Check,
   Pencil,
+  Sparkles,
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { cn, formatRelativeTime } from '@/lib/utils';
 
 function ModelDropdown({
   value,
@@ -798,6 +801,70 @@ export default function ModelRoutingPage() {
     }
   };
 
+  // ── Cleanup of unused proxy keys ──
+  const [showCleanup, setShowCleanup] = useState(false);
+  const [cleanupDays, setCleanupDays] = useState(7);
+  const [cleanupCandidates, setCleanupCandidates] = useState<ProxyApiKeySummary[] | null>(null);
+  const [cleanupSelected, setCleanupSelected] = useState<Set<string>>(new Set());
+  const [cleanupLoading, setCleanupLoading] = useState(false);
+  const [cleanupDeleting, setCleanupDeleting] = useState(false);
+
+  const loadCleanupCandidates = async (days: number) => {
+    setCleanupLoading(true);
+    try {
+      const result = await cleanupProxyApiKeys(days, true);
+      setCleanupCandidates(result.keys);
+      setCleanupSelected(new Set(result.keys.map((k) => k.id)));
+    } catch (err) {
+      toast.error(`Failed to preview cleanup: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      setCleanupCandidates(null);
+    } finally {
+      setCleanupLoading(false);
+    }
+  };
+
+  const handleOpenCleanup = () => {
+    setShowCleanup(true);
+    setShowCreateKey(false);
+    void loadCleanupCandidates(cleanupDays);
+  };
+
+  const handleCleanupDaysChange = (days: number) => {
+    setCleanupDays(days);
+    if (days >= 1) void loadCleanupCandidates(days);
+  };
+
+  const toggleCleanupKey = (id: string) => {
+    setCleanupSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleConfirmCleanup = async () => {
+    const ids = [...cleanupSelected];
+    if (ids.length === 0) return;
+    setCleanupDeleting(true);
+    try {
+      // Delete the user's selection key-by-key rather than re-running the
+      // age criterion, so deselected keys are never touched.
+      const results = await Promise.allSettled(ids.map((id) => deleteProxyApiKey(id)));
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      if (failed > 0) {
+        toast.error(`Deleted ${ids.length - failed} keys, ${failed} failed`);
+      } else {
+        toast.success(`Deleted ${ids.length} unused key${ids.length > 1 ? 's' : ''}`);
+      }
+      setShowCleanup(false);
+      setCleanupCandidates(null);
+      mutateApiKeys();
+    } finally {
+      setCleanupDeleting(false);
+    }
+  };
+
   const proxyUrl = `${getRuntimeApiBase()}/v1`;
 
   return (
@@ -1066,13 +1133,23 @@ export default function ModelRoutingPage() {
                 </p>
               </div>
             </div>
-            <button
-              onClick={() => { setShowCreateKey(true); setCreatedKey(null); }}
-              className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer"
-            >
-              <Plus className="h-3 w-3" />
-              New Key
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleOpenCleanup}
+                className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                title="Find and revoke keys with no recent activity"
+              >
+                <Sparkles className="h-3 w-3" />
+                Clean Up
+              </button>
+              <button
+                onClick={() => { setShowCreateKey(true); setCreatedKey(null); setShowCleanup(false); }}
+                className="flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer"
+              >
+                <Plus className="h-3 w-3" />
+                New Key
+              </button>
+            </div>
           </div>
 
           {/* Proxy endpoint URL */}
@@ -1141,6 +1218,76 @@ export default function ModelRoutingPage() {
             </div>
           )}
 
+          {/* Cleanup unused keys */}
+          {showCleanup && (
+            <div className="mb-4 rounded-lg border border-amber-500/20 bg-amber-500/[0.03] p-3 space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-white/60">Revoke keys with no activity for</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={cleanupDays}
+                  onChange={(e) => handleCleanupDaysChange(Number(e.target.value))}
+                  className="w-16 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-amber-500/50"
+                />
+                <span className="text-xs text-white/60">days</span>
+              </div>
+              <p className="text-[10px] text-white/30">
+                Keys that never authenticated a request fall back to their creation date.
+                Usage tracking starts with this release, so older keys may show as never used.
+              </p>
+              {cleanupLoading ? (
+                <div className="flex items-center justify-center py-4">
+                  <Loader className="h-4 w-4 animate-spin text-white/30" />
+                </div>
+              ) : !cleanupCandidates || cleanupCandidates.length === 0 ? (
+                <p className="text-xs text-white/40 text-center py-2">
+                  No unused keys older than {cleanupDays} day{cleanupDays > 1 ? 's' : ''}.
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  {cleanupCandidates.map((k) => (
+                    <label
+                      key={k.id}
+                      className="flex items-center gap-2.5 rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-1.5 cursor-pointer hover:bg-white/[0.03] transition-colors"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={cleanupSelected.has(k.id)}
+                        onChange={() => toggleCleanupKey(k.id)}
+                        className="accent-amber-500"
+                      />
+                      <span className="text-xs text-white/70 flex-1 min-w-0 truncate">{k.name}</span>
+                      <span className="text-[10px] text-white/30 font-mono flex-shrink-0">{k.key_prefix}...</span>
+                      <span className="text-[10px] text-white/30 flex-shrink-0">
+                        {k.last_used_at
+                          ? `last used ${formatRelativeTime(new Date(k.last_used_at))}`
+                          : `never used · created ${new Date(k.created_at).toLocaleDateString()}`}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              <div className="flex justify-end gap-2">
+                <button
+                  onClick={() => { setShowCleanup(false); setCleanupCandidates(null); }}
+                  className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/50 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleConfirmCleanup}
+                  disabled={cleanupDeleting || cleanupLoading || cleanupSelected.size === 0}
+                  className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs text-white hover:bg-amber-700 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {cleanupDeleting
+                    ? 'Revoking...'
+                    : `Revoke ${cleanupSelected.size} key${cleanupSelected.size === 1 ? '' : 's'}`}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Key list */}
           {apiKeysLoading ? (
             <div className="flex items-center justify-center py-6">
@@ -1164,8 +1311,13 @@ export default function ModelRoutingPage() {
                   <span className="text-[10px] text-white/30 font-mono flex-shrink-0">
                     {k.key_prefix}...
                   </span>
-                  <span className="text-[10px] text-white/20 flex-shrink-0">
-                    {new Date(k.created_at).toLocaleDateString()}
+                  <span
+                    className="text-[10px] text-white/20 flex-shrink-0"
+                    title={k.last_used_at ? `Last used ${new Date(k.last_used_at).toLocaleString()}` : 'Never used'}
+                  >
+                    {k.last_used_at
+                      ? `used ${formatRelativeTime(new Date(k.last_used_at))}`
+                      : new Date(k.created_at).toLocaleDateString()}
                   </span>
                   <button
                     onClick={() => handleDeleteKey(k.id)}

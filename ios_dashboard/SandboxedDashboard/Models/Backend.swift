@@ -135,7 +135,7 @@ struct SlashCommandParam: Codable, Hashable {
 }
 
 /// Per-backend builtin commands payload. Every field decodes defensively —
-/// older codex builds (pre-0.128.0) omit the `codex` field entirely, and
+/// older backend builds can omit optional fields such as `codex` entirely, and
 /// any backend with no commands omits its array via Rust's
 /// `skip_serializing_if = "Vec::is_empty"`.
 struct BuiltinCommandsResponse: Codable {

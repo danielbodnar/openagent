@@ -5,7 +5,16 @@ import { listLibraryCommands, getBuiltinCommands as fetchBuiltinCommands, getVis
 import { cn } from '@/lib/utils';
 
 // Fallback builtin commands (used if API fails)
-const FALLBACK_OPENCODE_COMMANDS: CommandSummary[] = [];
+const FALLBACK_OPENCODE_COMMANDS: CommandSummary[] = [
+  {
+    name: 'goal',
+    description: 'Loop until the objective is achieved (OpenCode goal plugin)',
+    path: 'builtin-opencode',
+    params: [
+      { name: 'objective', required: true, description: 'What the agent should keep iterating on until done' },
+    ],
+  },
+];
 
 const FALLBACK_CLAUDECODE_COMMANDS: CommandSummary[] = [
   { name: 'plan', description: 'Enter plan mode to design an implementation approach', path: 'builtin-claude' },

@@ -13,6 +13,7 @@ import {
   listAssistantGatewayMemory,
   searchAssistantGatewayMemory,
   adoptHermesAssistant,
+  sendAssistantGatewayTestMessage,
   getHermesAssistantStatus,
   listMissions,
   getSystemComponents,
@@ -27,6 +28,7 @@ import {
   type CreateAssistantGatewayInput,
 } from '@/lib/api';
 import { listBackends, listWorkspaces, listBackendModelOptions, listProviders, listConfigProfiles, type Backend, type BackendModelOption, type Provider, type Workspace, type ConfigProfileSummary } from '@/lib/api';
+import { listMissionAutomations, listHermesAssistantSkills, type Automation, type CommandSource, type TriggerType, type HermesSkill, type HermesSkillsResponse } from '@/lib/api';
 import {
   MessageCircle,
   Plus,
@@ -43,6 +45,14 @@ import {
   Settings,
   AlertTriangle,
   GitBranch,
+  Send,
+  Search,
+  Calendar,
+  Sparkles,
+  ListChecks,
+  User,
+  Activity,
+  Brain,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from '@/components/toast';
@@ -66,6 +76,91 @@ const BACKEND_LABELS: Record<string, string> = {
 
 function gatewayLabel(bot: AssistantGateway) {
   return bot.bot_username ? `@${bot.bot_username}` : 'gateway';
+}
+
+type GatewayTab = 'conversations' | 'actions' | 'scheduled' | 'tasks' | 'memory' | 'skills';
+
+const GATEWAY_TABS: { id: GatewayTab; label: string }[] = [
+  { id: 'conversations', label: 'Conversations' },
+  { id: 'actions', label: 'Actions' },
+  { id: 'scheduled', label: 'Scheduled' },
+  { id: 'tasks', label: 'Tasks' },
+  { id: 'memory', label: 'Memory' },
+  { id: 'skills', label: 'Skills' },
+];
+
+// Solid, saturated status dots read cleanly on both light and dark surfaces.
+const STATUS_DOT: Record<string, string> = {
+  sent: 'bg-emerald-400',
+  pending: 'bg-amber-300',
+  failed: 'bg-red-400',
+};
+
+function relTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const s = Math.round((Date.now() - then) / 1000);
+  if (s < 45) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.round(h / 24);
+  if (d < 30) return `${d}d ago`;
+  const mo = Math.round(d / 30);
+  if (mo < 12) return `${mo}mo ago`;
+  return `${Math.round(mo / 12)}y ago`;
+}
+
+// Shared row chrome: hairline-separated dense rows that theme in both modes via
+// the globals.css light remap (border-white/* and hover:bg-white/* are remapped).
+const ROW = 'group border-t border-white/[0.04] first:border-t-0';
+const ROW_PAD = 'flex items-start gap-3 px-1 py-2';
+
+function humanizeDuration(seconds: number): string {
+  if (seconds <= 0) return '0s';
+  if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+  if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+  if (seconds % 60 === 0) return `${seconds / 60}m`;
+  return `${seconds}s`;
+}
+
+function triggerLabel(t: TriggerType): string {
+  switch (t.type) {
+    case 'interval':
+      return `every ${humanizeDuration(t.seconds)}`;
+    case 'agent_finished':
+      return 'when agent finishes';
+    case 'webhook':
+      return 'webhook';
+    default:
+      return String((t as { type: string }).type).replace(/_/g, ' ');
+  }
+}
+
+function automationLabel(cs: CommandSource): string {
+  switch (cs.type) {
+    case 'library':
+      return cs.name;
+    case 'local_file':
+      return cs.path.split('/').pop() || cs.path;
+    case 'inline':
+      return cs.content.split('\n')[0].slice(0, 80) || 'inline command';
+    case 'native_loop':
+      return `/${cs.command}${cs.harness ? ` · ${cs.harness}` : ''}`;
+    default:
+      return 'command';
+  }
+}
+
+// A small empty-state used for populated lists and genuinely-empty tabs.
+function EmptyHint({ icon: Icon, children }: { icon: typeof Sparkles; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
+      <Icon className="h-5 w-5 text-white/20" />
+      <p className="text-xs text-white/35 max-w-xs">{children}</p>
+    </div>
+  );
 }
 
 export default function AssistantPage() {
@@ -110,12 +205,20 @@ export default function AssistantPage() {
     getHermesAssistantStatus,
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
+  const { data: hermesSkillsData, isLoading: skillsLoading } = useSWR<HermesSkillsResponse>(
+    'hermes-skills',
+    listHermesAssistantSkills,
+    { revalidateOnFocus: false, dedupingInterval: 60000 }
+  );
+  const hermesSkills = hermesSkillsData?.skills ?? [];
 
   // Chat mappings keyed by bot ID
   const [chatsByBot, setChatsByBot] = useState<Record<string, AssistantGatewayChat[]>>({});
   const [actionsByBot, setActionsByBot] = useState<Record<string, AssistantGatewayActionExecution[]>>({});
   const [scheduledByBot, setScheduledByBot] = useState<Record<string, AssistantGatewayScheduledMessage[]>>({});
   const [memoryByBot, setMemoryByBot] = useState<Record<string, AssistantGatewayMemoryEntry[]>>({});
+  const [automationsByBot, setAutomationsByBot] = useState<Record<string, Automation[]>>({});
+  const [loadingAutomations, setLoadingAutomations] = useState<Set<string>>(new Set());
   const [memorySearchByBot, setMemorySearchByBot] = useState<Record<string, AssistantGatewayMemorySearchHit[]>>({});
   const [memorySearchQueryByBot, setMemorySearchQueryByBot] = useState<Record<string, string>>({});
   const [expandedBots, setExpandedBots] = useState<Set<string>>(new Set());
@@ -125,6 +228,21 @@ export default function AssistantPage() {
   const [loadingMemory, setLoadingMemory] = useState<Set<string>>(new Set());
   const [loadingMemorySearch, setLoadingMemorySearch] = useState<Set<string>>(new Set());
   const [adoptingGatewayId, setAdoptingGatewayId] = useState<string | null>(null);
+
+  // Per-gateway active tab, memory sub-view, expanded detail rows, and in-flight tests.
+  const [activeTabByBot, setActiveTabByBot] = useState<Record<string, GatewayTab>>({});
+  const [memoryViewByBot, setMemoryViewByBot] = useState<Record<string, 'entries' | 'profiles'>>({});
+  const [conversationQueryByBot, setConversationQueryByBot] = useState<Record<string, string>>({});
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  const [sendingTest, setSendingTest] = useState<Set<string>>(new Set());
+
+  const toggleRow = (key: string) =>
+    setExpandedRows((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   // Create dialog
   const [showCreateDialog, setShowCreateDialog] = useState(false);
@@ -196,11 +314,40 @@ export default function AssistantPage() {
     }
   };
 
+  // Tasks = scheduled automations on the missions this gateway drives. The
+  // gateway↔mission link comes from its chats, so resolve those first.
+  const loadAutomations = async (botId: string) => {
+    if (automationsByBot[botId]) return;
+    setLoadingAutomations((prev) => new Set(prev).add(botId));
+    try {
+      let chats = chatsByBot[botId];
+      if (!chats) {
+        chats = await listAssistantGatewayChats(botId);
+        setChatsByBot((prev) => ({ ...prev, [botId]: chats! }));
+      }
+      const missionIds = Array.from(new Set(chats.map((c) => c.mission_id)));
+      const lists = await Promise.all(
+        missionIds.map((id) => listMissionAutomations(id).catch(() => [] as Automation[]))
+      );
+      const seen = new Set<string>();
+      const deduped = lists.flat().filter((a) => (seen.has(a.id) ? false : (seen.add(a.id), true)));
+      setAutomationsByBot((prev) => ({ ...prev, [botId]: deduped }));
+    } catch {
+      // ignore
+    } finally {
+      setLoadingAutomations((prev) => {
+        const next = new Set(prev);
+        next.delete(botId);
+        return next;
+      });
+    }
+  };
+
   const loadScheduled = async (botId: string) => {
     if (scheduledByBot[botId]) return;
     setLoadingScheduled((prev) => new Set(prev).add(botId));
     try {
-      const scheduled = await listAssistantGatewayScheduledMessages(botId, { limit: 8 });
+      const scheduled = await listAssistantGatewayScheduledMessages(botId, { limit: 20 });
       setScheduledByBot((prev) => ({ ...prev, [botId]: scheduled }));
     } catch {
       // ignore
@@ -217,7 +364,7 @@ export default function AssistantPage() {
     if (actionsByBot[botId]) return;
     setLoadingActions((prev) => new Set(prev).add(botId));
     try {
-      const actions = await listAssistantGatewayActions(botId, { limit: 8 });
+      const actions = await listAssistantGatewayActions(botId, { limit: 20 });
       setActionsByBot((prev) => ({ ...prev, [botId]: actions }));
     } catch {
       // ignore
@@ -234,7 +381,7 @@ export default function AssistantPage() {
     if (memoryByBot[botId]) return;
     setLoadingMemory((prev) => new Set(prev).add(botId));
     try {
-      const memory = await listAssistantGatewayMemory(botId, { limit: 8 });
+      const memory = await listAssistantGatewayMemory(botId, { limit: 50 });
       setMemoryByBot((prev) => ({ ...prev, [botId]: memory }));
     } catch {
       // ignore
@@ -284,6 +431,7 @@ export default function AssistantPage() {
       void loadActions(botId);
       void loadScheduled(botId);
       void loadMemory(botId);
+      void loadAutomations(botId);
     }
   };
 
@@ -369,6 +517,23 @@ export default function AssistantPage() {
       await Promise.all([mutateBots(), mutateSystemComponents(), mutateHermesStatus()]);
     } finally {
       setAdoptingGatewayId(null);
+    }
+  };
+
+  const handleSendTest = async (bot: AssistantGateway, chat: AssistantGatewayChat) => {
+    const key = `${bot.id}:${chat.chat_id}`;
+    setSendingTest((prev) => new Set(prev).add(key));
+    try {
+      await sendAssistantGatewayTestMessage(bot.id, chat.chat_id);
+      toast.success(`Test message sent to ${chat.chat_title || `chat ${chat.chat_id}`}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to send test message');
+    } finally {
+      setSendingTest((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
     }
   };
 
@@ -469,7 +634,7 @@ export default function AssistantPage() {
           <div className="min-w-0">
             <h1 className="text-xl font-semibold text-white">Assistant</h1>
             <p className="mt-1 text-sm text-white/50">
-              Hermes readiness, Telegram gateway compatibility, mission defaults, and assistant memory.
+              Hermes runtime, Telegram gateways, and assistant memory.
             </p>
           </div>
           <button
@@ -482,19 +647,11 @@ export default function AssistantPage() {
         </header>
 
         <div className="grid gap-3 md:grid-cols-4">
-          <div className={cn(
-            'rounded-lg border p-4',
-            assistantMcpReady
-              ? 'border-emerald-500/15 bg-emerald-500/[0.04]'
-              : 'border-amber-500/15 bg-amber-500/[0.04]'
-          )}>
+          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
             <div className="flex items-center justify-between gap-3">
-              <p className={cn(
-                'text-xs font-medium uppercase tracking-[0.08em]',
-                assistantMcpReady ? 'text-emerald-300/80' : 'text-amber-300/80'
-              )}>MCP</p>
+              <p className="text-xs font-medium uppercase tracking-[0.08em] text-white/40">MCP</p>
               {assistantMcpReady ? (
-                <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+                <CheckCircle2 className="h-4 w-4 text-emerald-400" />
               ) : (
                 <CircleDashed className="h-4 w-4 text-amber-300" />
               )}
@@ -512,10 +669,10 @@ export default function AssistantPage() {
                 : 'Install assistant-mcp before handing mission control to Hermes.'}
             </p>
           </div>
-          <div className="rounded-lg border border-sky-500/15 bg-sky-500/[0.04] p-4">
+          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
             <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-medium uppercase tracking-[0.08em] text-sky-300/80">Gateway</p>
-              <Cable className="h-4 w-4 text-sky-300" />
+              <p className="text-xs font-medium uppercase tracking-[0.08em] text-white/40">Gateway</p>
+              <Cable className="h-4 w-4 text-white/30" />
             </div>
             <p className="mt-2 text-sm font-medium text-white">
               {hermesStatus?.telegram_ok
@@ -530,19 +687,11 @@ export default function AssistantPage() {
                 : `${knownConversationCount} known conversation${knownConversationCount === 1 ? '' : 's'}.`}
             </p>
           </div>
-          <div className={cn(
-            'rounded-lg border p-4',
-            hermesRuntimeReady
-              ? 'border-emerald-500/15 bg-emerald-500/[0.04]'
-              : 'border-amber-500/15 bg-amber-500/[0.04]'
-          )}>
+          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
             <div className="flex items-center justify-between gap-3">
-              <p className={cn(
-                'text-xs font-medium uppercase tracking-[0.08em]',
-                hermesRuntimeReady ? 'text-emerald-300/80' : 'text-amber-300/80'
-              )}>Runtime</p>
+              <p className="text-xs font-medium uppercase tracking-[0.08em] text-white/40">Runtime</p>
               {hermesRuntimeReady ? (
-                <CheckCircle2 className="h-4 w-4 text-emerald-300" />
+                <CheckCircle2 className="h-4 w-4 text-emerald-400" />
               ) : (
                 <CircleDashed className="h-4 w-4 text-amber-300" />
               )}
@@ -566,10 +715,10 @@ export default function AssistantPage() {
                     : 'Install hermes-assistant-dev.service before moving webhook ownership.'}
             </p>
           </div>
-          <div className="rounded-lg border border-violet-500/15 bg-violet-500/[0.04] p-4">
+          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-4">
             <div className="flex items-center justify-between gap-3">
-              <p className="text-xs font-medium uppercase tracking-[0.08em] text-violet-300/80">Routing</p>
-              <GitBranch className="h-4 w-4 text-violet-300" />
+              <p className="text-xs font-medium uppercase tracking-[0.08em] text-white/40">Routing</p>
+              <GitBranch className="h-4 w-4 text-white/30" />
             </div>
             <p className="mt-2 text-sm font-medium text-white">
               {hermesStatus?.model || assistantChain?.id || 'builtin/smart'}
@@ -810,308 +959,462 @@ export default function AssistantPage() {
                     </>
                   )}
                 </button>
-                {expandedBots.has(bot.id) && (
-                  <div className="px-4 pb-4 space-y-3 border-t border-white/[0.04]">
-                    {/* Bot details */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-3">
-                      <div className="min-w-0">
-                        <p className="text-[10px] text-white/30 mb-1">Bot ID</p>
-                        <p className="text-xs text-white/60 font-mono truncate" title={bot.id}>{bot.id}</p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] text-white/30 mb-1">Backend</p>
-                        <p className="text-xs text-white/60">
+                {expandedBots.has(bot.id) && (() => {
+                  const tab = activeTabByBot[bot.id] || 'conversations';
+                  const memView = memoryViewByBot[bot.id] || 'entries';
+                  const chats = chatsByBot[bot.id] || [];
+                  const acts = actionsByBot[bot.id] || [];
+                  const sched = scheduledByBot[bot.id] || [];
+                  const mem = memoryByBot[bot.id] || [];
+                  const autos = automationsByBot[bot.id] || [];
+                  const searchHits = memorySearchByBot[bot.id] || [];
+                  const convQuery = (conversationQueryByBot[bot.id] || '').toLowerCase();
+                  const shownChats = convQuery
+                    ? chats.filter((c) =>
+                        `${c.chat_title || ''} ${c.chat_id} ${getMissionTitle(c.mission_id)}`
+                          .toLowerCase()
+                          .includes(convQuery)
+                      )
+                    : chats;
+
+                  // Derive per-user profiles from user-scoped memory entries.
+                  const profileMap = new Map<string, { key: string; name: string; sub: string; entries: AssistantGatewayMemoryEntry[]; latest: string }>();
+                  for (const e of mem) {
+                    if (e.scope !== 'user') continue;
+                    const key = e.subject_user_id != null ? `u${e.subject_user_id}` : (e.subject_username || 'unknown');
+                    const name = e.subject_display_name || e.subject_username || (e.subject_user_id != null ? `User ${e.subject_user_id}` : 'Unknown user');
+                    const sub = e.subject_username ? `@${e.subject_username}` : (e.subject_user_id != null ? String(e.subject_user_id) : '');
+                    const cur = profileMap.get(key);
+                    if (cur) {
+                      cur.entries.push(e);
+                      if (e.updated_at > cur.latest) cur.latest = e.updated_at;
+                    } else {
+                      profileMap.set(key, { key, name, sub, entries: [e], latest: e.updated_at });
+                    }
+                  }
+                  const profiles = Array.from(profileMap.values()).sort((a, b) => (a.latest < b.latest ? 1 : -1));
+
+                  // Real "last activity" health signal derived from loaded events.
+                  const activityStamps = [
+                    ...acts.map((a) => a.updated_at),
+                    ...sched.map((s) => s.sent_at || s.send_at),
+                    ...chats.map((c) => c.created_at),
+                  ].filter(Boolean) as string[];
+                  const lastActivity = activityStamps.length
+                    ? activityStamps.reduce((max, t) => (t > max ? t : max))
+                    : null;
+
+                  const tabCount = (id: GatewayTab): number | null => {
+                    if (id === 'conversations') return chats.length || null;
+                    if (id === 'actions') return acts.length || null;
+                    if (id === 'scheduled') return sched.length || null;
+                    if (id === 'tasks') return autos.length || null;
+                    if (id === 'memory') return mem.length || null;
+                    if (id === 'skills') return hermesSkills.length || null;
+                    return null;
+                  };
+
+                  return (
+                    <div className="border-t border-white/[0.04]">
+                      {/* Compact meta strip */}
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-4 py-2 text-[10px] text-white/30 border-b border-white/[0.04]">
+                        <span className="font-mono text-white/40 truncate max-w-[220px]" title={bot.id}>{bot.id}</span>
+                        <span className="text-white/15">·</span>
+                        <span>
                           {BACKEND_LABELS[bot.default_backend || 'claudecode'] || bot.default_backend || 'Claude Code'}
                           {bot.default_model_override ? ` / ${bot.default_model_override}` : ''}
-                          {bot.default_model_effort ? ` (${bot.default_model_effort})` : ''}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-[10px] text-white/30 mb-1">Allowed Chat IDs</p>
-                        <p className="text-xs text-white/60">
+                        </span>
+                        <span className="text-white/15">·</span>
+                        <span>
                           {bot.allowed_chat_ids?.length
-                            ? bot.allowed_chat_ids.join(', ')
-                            : 'All chats'}
-                        </p>
+                            ? `${bot.allowed_chat_ids.length} allowed chat${bot.allowed_chat_ids.length === 1 ? '' : 's'}`
+                            : 'all chats'}
+                        </span>
+                        <span className="text-white/15">·</span>
+                        <span>created {relTime(bot.created_at)}</span>
+                        {lastActivity && (
+                          <>
+                            <span className="text-white/15">·</span>
+                            <span className="inline-flex items-center gap-1">
+                              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                              active {relTime(lastActivity)}
+                            </span>
+                          </>
+                        )}
                       </div>
-                      <div>
-                        <p className="text-[10px] text-white/30 mb-1">Created</p>
-                        <p className="text-xs text-white/60">
-                          {new Date(bot.created_at).toLocaleString()}
-                        </p>
-                      </div>
-                    </div>
-                    {bot.instructions && (
-                      <div>
-                        <p className="text-[10px] text-white/30 mb-1">Instructions</p>
-                        <p className="text-xs text-white/60 whitespace-pre-wrap bg-white/[0.02] rounded-lg p-2 border border-white/[0.04]">
-                          {bot.instructions}
-                        </p>
-                      </div>
-                    )}
 
-                    {/* Chat-to-mission mappings */}
-                    <div>
-                      <p className="text-[10px] text-white/30 mb-2">Active Conversations</p>
-                      {loadingChats.has(bot.id) ? (
-                        <div className="flex items-center gap-2 text-xs text-white/40">
-                          <Loader className="h-3 w-3 animate-spin" /> Loading...
-                        </div>
-                      ) : (chatsByBot[bot.id] || []).length === 0 ? (
-                        <p className="text-xs text-white/30 italic">
-                          No conversations yet. Message the connected gateway to start one.
-                        </p>
-                      ) : (
-                        <div className="space-y-1">
-                          {(chatsByBot[bot.id] || []).map((chat) => (
-                            <div
-                              key={chat.id}
-                              className="flex items-center gap-3 px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]"
+                      {/* Tab bar */}
+                      <div className="flex items-center gap-0.5 overflow-x-auto px-2 border-b border-white/[0.06]">
+                        {GATEWAY_TABS.map((t) => {
+                          const active = tab === t.id;
+                          const count = tabCount(t.id);
+                          return (
+                            <button
+                              key={t.id}
+                              type="button"
+                              onClick={() => setActiveTabByBot((prev) => ({ ...prev, [bot.id]: t.id }))}
+                              className={cn(
+                                'shrink-0 px-2.5 py-2 text-xs font-medium border-b-2 -mb-px transition-colors',
+                                active
+                                  ? 'border-indigo-400 text-white'
+                                  : 'border-transparent text-white/40 hover:text-white/70'
+                              )}
                             >
-                              <div className="flex-1 min-w-0">
-                                <p className="text-xs text-white/60">
-                                  Chat {chat.chat_id}
-                                  {chat.chat_title && (
-                                    <span className="text-white/40"> ({chat.chat_title})</span>
+                              {t.label}
+                              {count != null && (
+                                <span className={cn('ml-1.5 text-[10px]', active ? 'text-white/40' : 'text-white/25')}>{count}</span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="px-4 py-2 min-h-[64px]">
+                        {/* CONVERSATIONS */}
+                        {tab === 'conversations' && (
+                          <div>
+                            <div className="relative mb-1">
+                              <Search className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-white/25" />
+                              <input
+                                type="text"
+                                placeholder="Search conversations..."
+                                value={conversationQueryByBot[bot.id] || ''}
+                                onChange={(e) => setConversationQueryByBot((prev) => ({ ...prev, [bot.id]: e.target.value }))}
+                                className="w-full rounded-lg bg-white/[0.03] border border-white/[0.06] pl-8 pr-3 py-1.5 text-xs text-white placeholder:text-white/25 focus:outline-none focus:border-indigo-500/50"
+                              />
+                            </div>
+                            {loadingChats.has(bot.id) ? (
+                              <div className="flex items-center gap-2 px-1 py-3 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                            ) : shownChats.length === 0 ? (
+                              <EmptyHint icon={MessageCircle}>
+                                {chats.length === 0
+                                  ? 'No conversations yet. Message the gateway to start one.'
+                                  : 'No conversations match your search.'}
+                              </EmptyHint>
+                            ) : (
+                              <div>
+                                {shownChats.map((chat) => {
+                                  const testKey = `${bot.id}:${chat.chat_id}`;
+                                  return (
+                                    <div key={chat.id} className={cn(ROW, ROW_PAD, 'items-center')}>
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-xs text-white/70 truncate">{chat.chat_title || `Chat ${chat.chat_id}`}</p>
+                                        <p className="text-[10px] text-white/35 truncate">{getMissionTitle(chat.mission_id)}</p>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={() => void handleSendTest(bot, chat)}
+                                        disabled={sendingTest.has(testKey)}
+                                        className="shrink-0 inline-flex items-center gap-1 rounded-md border border-white/[0.08] px-2 py-1 text-[10px] text-white/50 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-white hover:border-white/[0.16] transition disabled:opacity-100 disabled:text-white/30"
+                                        title="Send a test message to this chat"
+                                      >
+                                        {sendingTest.has(testKey) ? <Loader className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}
+                                        Test
+                                      </button>
+                                      <span className="shrink-0 font-mono text-[10px] text-white/25 tabular-nums">{relTime(chat.created_at)}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* ACTIONS */}
+                        {tab === 'actions' && (
+                          loadingActions.has(bot.id) ? (
+                            <div className="flex items-center gap-2 px-1 py-3 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                          ) : acts.length === 0 ? (
+                            <EmptyHint icon={Activity}>No gateway actions recorded yet.</EmptyHint>
+                          ) : (
+                            <div>
+                              {acts.map((action) => {
+                                const rk = `act:${action.id}`;
+                                const open = expandedRows.has(rk);
+                                return (
+                                  <div key={action.id} className={ROW}>
+                                    <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left hover:bg-white/[0.02] rounded')}>
+                                      <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', STATUS_DOT[action.status] || 'bg-white/20')} />
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-xs text-white/70 truncate">
+                                          {action.target_chat_title || `Chat ${action.target_chat_id}`}
+                                          <span className="text-white/30"> · {action.action_kind}</span>
+                                          {action.delay_seconds > 0 ? <span className="text-white/30"> · +{action.delay_seconds}s</span> : null}
+                                        </p>
+                                        <p className="text-[11px] text-white/40 truncate">{action.text}</p>
+                                      </div>
+                                      <span className="shrink-0 font-mono text-[10px] text-white/25 tabular-nums">{relTime(action.updated_at)}</span>
+                                    </button>
+                                    {open && (
+                                      <div className="px-4 pb-2 -mt-0.5 space-y-1">
+                                        <p className="text-[11px] text-white/55 whitespace-pre-wrap">{action.text}</p>
+                                        <p className="text-[10px] text-white/30">
+                                          Target: {action.target_kind} {action.target_value}
+                                          {action.last_error ? ` · ${action.last_error}` : ''}
+                                        </p>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )
+                        )}
+
+                        {/* SCHEDULED */}
+                        {tab === 'scheduled' && (
+                          loadingScheduled.has(bot.id) ? (
+                            <div className="flex items-center gap-2 px-1 py-3 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                          ) : sched.length === 0 ? (
+                            <EmptyHint icon={Calendar}>No scheduled messages for this gateway.</EmptyHint>
+                          ) : (
+                            <div>
+                              {sched.map((message) => {
+                                const rk = `sch:${message.id}`;
+                                const open = expandedRows.has(rk);
+                                return (
+                                  <div key={message.id} className={ROW}>
+                                    <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left hover:bg-white/[0.02] rounded')}>
+                                      <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', STATUS_DOT[message.status] || 'bg-white/20')} />
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-xs text-white/70 truncate">{message.chat_title || `Chat ${message.chat_id}`}</p>
+                                        <p className="text-[11px] text-white/40 truncate">{message.text}</p>
+                                      </div>
+                                      <span className="shrink-0 font-mono text-[10px] text-white/25 tabular-nums">{relTime(message.send_at)}</span>
+                                    </button>
+                                    {open && (
+                                      <div className="px-4 pb-2 -mt-0.5 space-y-1">
+                                        <p className="text-[11px] text-white/55 whitespace-pre-wrap">{message.text}</p>
+                                        <p className="text-[10px] text-white/30">
+                                          Send at {new Date(message.send_at).toLocaleString()}
+                                          {message.sent_at ? ` · sent ${new Date(message.sent_at).toLocaleString()}` : ''}
+                                          {message.last_error ? ` · ${message.last_error}` : ''}
+                                        </p>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )
+                        )}
+
+                        {/* TASKS — scheduled automations on this gateway's missions */}
+                        {tab === 'tasks' && (
+                          loadingAutomations.has(bot.id) ? (
+                            <div className="flex items-center gap-2 px-1 py-3 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                          ) : autos.length === 0 ? (
+                            <EmptyHint icon={ListChecks}>
+                              No scheduled tasks for this gateway. Automations created on its missions (daily digests, reminders, audits) appear here.
+                            </EmptyHint>
+                          ) : (
+                            <div>
+                              {autos.map((a) => {
+                                const rk = `auto:${a.id}`;
+                                const open = expandedRows.has(rk);
+                                return (
+                                  <div key={a.id} className={ROW}>
+                                    <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left hover:bg-white/[0.02] rounded')}>
+                                      <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', a.active ? 'bg-emerald-400' : 'bg-white/20')} />
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-xs text-white/70 truncate">
+                                          {automationLabel(a.command_source)}
+                                          <span className="text-white/30"> · {triggerLabel(a.trigger)}</span>
+                                          {!a.active ? <span className="text-white/30"> · paused</span> : null}
+                                        </p>
+                                        <p className="text-[10px] text-white/35 truncate">{getMissionTitle(a.mission_id)}</p>
+                                      </div>
+                                      <span className="shrink-0 font-mono text-[10px] text-white/25 tabular-nums">
+                                        {a.last_triggered_at ? relTime(a.last_triggered_at) : 'never run'}
+                                      </span>
+                                    </button>
+                                    {open && (
+                                      <div className="px-4 pb-2 -mt-0.5 space-y-1 text-[10px] text-white/30">
+                                        <p>Trigger: {triggerLabel(a.trigger)} · {a.active ? 'active' : 'paused'}</p>
+                                        <p>Mission: {getMissionTitle(a.mission_id)}</p>
+                                        <p>Created {relTime(a.created_at)}{a.last_triggered_at ? ` · last run ${relTime(a.last_triggered_at)}` : ''}</p>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )
+                        )}
+
+                        {/* MEMORY */}
+                        {tab === 'memory' && (
+                          <div>
+                            <div className="flex items-center gap-1 mb-2">
+                              {(['entries', 'profiles'] as const).map((v) => (
+                                <button
+                                  key={v}
+                                  type="button"
+                                  onClick={() => setMemoryViewByBot((prev) => ({ ...prev, [bot.id]: v }))}
+                                  className={cn(
+                                    'rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
+                                    memView === v ? 'bg-white/[0.06] text-white/80' : 'text-white/40 hover:text-white/70'
                                   )}
-                                </p>
-                                <p className="text-[10px] text-white/30">
-                                  Mission: {getMissionTitle(chat.mission_id)}
-                                </p>
-                              </div>
-                              <p className="text-[10px] text-white/20 shrink-0">
-                                {new Date(chat.created_at).toLocaleDateString()}
-                              </p>
+                                >
+                                  {v === 'entries' ? 'Entries' : 'Profiles'}
+                                </button>
+                              ))}
                             </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
 
-                    <div>
-                      <p className="text-[10px] text-white/30 mb-2">Recent Gateway Actions</p>
-                      {loadingActions.has(bot.id) ? (
-                        <div className="flex items-center gap-2 text-xs text-white/40">
-                          <Loader className="h-3 w-3 animate-spin" /> Loading...
-                        </div>
-                      ) : (actionsByBot[bot.id] || []).length === 0 ? (
-                        <p className="text-xs text-white/30 italic">
-                          No gateway actions recorded yet.
-                        </p>
-                      ) : (
-                        <div className="space-y-1">
-                          {(actionsByBot[bot.id] || []).map((action) => (
-                            <div
-                              key={action.id}
-                              className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]"
-                            >
-                              <div className="flex items-center justify-between gap-3">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <span className="inline-flex items-center rounded bg-sky-500/10 border border-sky-500/20 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
-                                    {action.action_kind}
-                                  </span>
-                                  <p className="text-xs text-white/60 truncate">
-                                    {action.target_chat_title || `Chat ${action.target_chat_id}`}
-                                    {action.delay_seconds > 0 ? ` · +${action.delay_seconds}s` : ''}
-                                  </p>
+                            {memView === 'entries' ? (
+                              <div>
+                                <div className="relative mb-1">
+                                  <Search className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-white/25" />
+                                  <input
+                                    type="text"
+                                    placeholder="Search structured memory..."
+                                    value={memorySearchQueryByBot[bot.id] || ''}
+                                    onChange={(e) => setMemorySearchQueryByBot((prev) => ({ ...prev, [bot.id]: e.target.value }))}
+                                    onKeyDown={(e) => { if (e.key === 'Enter') void loadMemorySearch(bot.id); }}
+                                    className="w-full rounded-lg bg-white/[0.03] border border-white/[0.06] pl-8 pr-3 py-1.5 text-xs text-white placeholder:text-white/25 focus:outline-none focus:border-indigo-500/50"
+                                  />
                                 </div>
-                                <span className={cn(
-                                  'inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium',
-                                  action.status === 'sent'
-                                    ? 'bg-emerald-500/10 text-emerald-400'
-                                    : action.status === 'failed'
-                                      ? 'bg-red-500/10 text-red-400'
-                                      : 'bg-amber-500/10 text-amber-300'
-                                )}>
-                                  {action.status}
-                                </span>
-                              </div>
-                              <p className="text-[11px] text-white/40 mt-1 line-clamp-2">{action.text}</p>
-                              <p className="text-[10px] text-white/25 mt-1">
-                                Target: {action.target_kind} {action.target_value}
-                                {action.last_error ? ` · ${action.last_error}` : ''}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
+                                {loadingMemorySearch.has(bot.id) ? (
+                                  <div className="flex items-center gap-2 px-1 py-2 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Searching...</div>
+                                ) : (bot.id in memorySearchByBot) && searchHits.length > 0 ? (
+                                  <div className="mb-2">
+                                    <p className="px-1 py-1 text-[10px] uppercase tracking-wide text-white/25">Ranked matches</p>
+                                    {searchHits.map((hit) => (
+                                      <div key={`${hit.entry.id}-s`} className={cn(ROW, ROW_PAD)}>
+                                        <div className="flex-1 min-w-0">
+                                          <p className="text-xs text-white/70 truncate">{hit.entry.label ? `${hit.entry.label} · ` : ''}{hit.entry.value}</p>
+                                          <p className="text-[10px] text-white/30 truncate">{hit.reasons.join(' · ')}</p>
+                                        </div>
+                                        <span className="shrink-0 font-mono text-[10px] text-white/25 tabular-nums">{hit.score.toFixed(1)}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : (bot.id in memorySearchByBot) && memorySearchQueryByBot[bot.id]?.trim() ? (
+                                  <p className="px-1 py-1 text-[11px] text-white/30 italic">No ranked matches for this query.</p>
+                                ) : null}
 
-                    <div>
-                      <p className="text-[10px] text-white/30 mb-2">Scheduled Gateway Messages</p>
-                      {loadingScheduled.has(bot.id) ? (
-                        <div className="flex items-center gap-2 text-xs text-white/40">
-                          <Loader className="h-3 w-3 animate-spin" /> Loading...
-                        </div>
-                      ) : (scheduledByBot[bot.id] || []).length === 0 ? (
-                        <p className="text-xs text-white/30 italic">
-                          No scheduled gateway messages for this bot.
-                        </p>
-                      ) : (
-                        <div className="space-y-1">
-                          {(scheduledByBot[bot.id] || []).map((message) => (
-                            <div
-                              key={message.id}
-                              className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]"
-                            >
-                              <div className="flex items-center justify-between gap-3">
-                                <p className="text-xs text-white/60 truncate">
-                                  {message.chat_title || `Chat ${message.chat_id}`}
-                                </p>
-                                <span className={cn(
-                                  'inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium',
-                                  message.status === 'sent'
-                                    ? 'bg-emerald-500/10 text-emerald-400'
-                                    : message.status === 'failed'
-                                      ? 'bg-red-500/10 text-red-400'
-                                      : 'bg-amber-500/10 text-amber-300'
-                                )}>
-                                  {message.status}
-                                </span>
+                                {loadingMemory.has(bot.id) ? (
+                                  <div className="flex items-center gap-2 px-1 py-2 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                                ) : mem.length === 0 ? (
+                                  <EmptyHint icon={Brain}>No structured memory captured yet.</EmptyHint>
+                                ) : (
+                                  <div>
+                                    {mem.map((entry) => {
+                                      const rk = `mem:${entry.id}`;
+                                      const open = expandedRows.has(rk);
+                                      return (
+                                        <div key={entry.id} className={ROW}>
+                                          <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left hover:bg-white/[0.02] rounded')}>
+                                            <div className="flex-1 min-w-0">
+                                              <p className="text-xs text-white/70 truncate">
+                                                <span className="text-white/35">{entry.kind} · {entry.scope}</span>
+                                                {' · '}
+                                                {entry.scope === 'user'
+                                                  ? (entry.subject_display_name || entry.subject_username || `User ${entry.subject_user_id}`)
+                                                  : `Chat ${entry.chat_id}`}
+                                                {entry.label ? ` · ${entry.label}` : ''}
+                                              </p>
+                                              <p className="text-[11px] text-white/40 truncate">{entry.value}</p>
+                                            </div>
+                                            <span className="shrink-0 font-mono text-[10px] text-white/25 tabular-nums">{relTime(entry.updated_at)}</span>
+                                          </button>
+                                          {open && (
+                                            <div className="px-4 pb-2 -mt-0.5">
+                                              <p className="text-[11px] text-white/55 whitespace-pre-wrap">{entry.value}</p>
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
                               </div>
-                              <p className="text-[11px] text-white/40 mt-1 line-clamp-2">{message.text}</p>
-                              <p className="text-[10px] text-white/25 mt-1">
-                                Send at {new Date(message.send_at).toLocaleString()}
-                                {message.sent_at ? ` · Sent ${new Date(message.sent_at).toLocaleString()}` : ''}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
+                            ) : (
+                              loadingMemory.has(bot.id) ? (
+                                <div className="flex items-center gap-2 px-1 py-2 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                              ) : profiles.length === 0 ? (
+                                <EmptyHint icon={User}>No user profiles yet. User-scoped memory builds these automatically.</EmptyHint>
+                              ) : (
+                                <div>
+                                  {profiles.map((p) => {
+                                    const rk = `prof:${p.key}`;
+                                    const open = expandedRows.has(rk);
+                                    return (
+                                      <div key={p.key} className={ROW}>
+                                        <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left items-center hover:bg-white/[0.02] rounded')}>
+                                          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/[0.06] text-[10px] font-medium text-white/60">{(p.name.replace(/^@/, '') || p.name).charAt(0).toUpperCase()}</span>
+                                          <div className="flex-1 min-w-0">
+                                            <p className="text-xs text-white/70 truncate">{p.name}{p.sub && p.sub.replace(/^@/, '').toLowerCase() !== p.name.replace(/^@/, '').toLowerCase() ? <span className="text-white/30"> · {p.sub}</span> : null}</p>
+                                            <p className="text-[10px] text-white/35">{p.entries.length} fact{p.entries.length === 1 ? '' : 's'}</p>
+                                          </div>
+                                          <span className="shrink-0 font-mono text-[10px] text-white/25 tabular-nums">{relTime(p.latest)}</span>
+                                        </button>
+                                        {open && (
+                                          <div className="pl-9 pr-2 pb-2 space-y-1">
+                                            {p.entries.map((e) => (
+                                              <div key={e.id} className="flex items-start gap-2">
+                                                <span className="mt-1 h-1 w-1 shrink-0 rounded-full bg-white/25" />
+                                                <p className="text-[11px] text-white/55"><span className="text-white/35">{e.label ? `${e.label}: ` : ''}</span>{e.value}</p>
+                                              </div>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )
+                            )}
+                          </div>
+                        )}
 
-                    <div>
-                      <p className="text-[10px] text-white/30 mb-2">Structured Memory</p>
-                      <div className="flex items-center gap-2 mb-3">
-                        <input
-                          type="text"
-                          placeholder="Search structured memory..."
-                          value={memorySearchQueryByBot[bot.id] || ''}
-                          onChange={(e) =>
-                            setMemorySearchQueryByBot((prev) => ({
-                              ...prev,
-                              [bot.id]: e.target.value,
-                            }))
-                          }
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              void loadMemorySearch(bot.id);
-                            }
-                          }}
-                          className="flex-1 px-3 py-2 rounded-lg bg-white/[0.03] border border-white/[0.06] text-xs text-white placeholder:text-white/20 focus:outline-none focus:border-indigo-500/50"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => void loadMemorySearch(bot.id)}
-                          aria-label={`Search structured memory for ${gatewayLabel(bot)}`}
-                          className="px-3 py-2 rounded-lg border border-white/[0.08] bg-white/[0.03] text-xs text-white/70 hover:text-white hover:border-white/[0.16] transition-colors"
-                        >
-                          Search
-                        </button>
+                        {/* SKILLS — skills the Hermes runtime installed for itself */}
+                        {tab === 'skills' && (
+                          skillsLoading ? (
+                            <div className="flex items-center gap-2 px-1 py-3 text-xs text-white/40"><Loader className="h-3 w-3 animate-spin" /> Loading...</div>
+                          ) : hermesSkillsData && !hermesSkillsData.available ? (
+                            <EmptyHint icon={Sparkles}>
+                              Hermes skills directory not found. These are managed by the Hermes runtime and appear once it is installed.
+                            </EmptyHint>
+                          ) : hermesSkills.length === 0 ? (
+                            <EmptyHint icon={Sparkles}>
+                              The Hermes runtime has no skills installed yet.
+                            </EmptyHint>
+                          ) : (
+                            <div>
+                              {hermesSkills.map((skill: HermesSkill) => {
+                                const rk = `skill:${skill.path}`;
+                                const open = expandedRows.has(rk);
+                                return (
+                                  <div key={skill.path} className={ROW}>
+                                    <button type="button" onClick={() => toggleRow(rk)} className={cn(ROW_PAD, 'w-full text-left hover:bg-white/[0.02] rounded')}>
+                                      <Sparkles className="mt-0.5 h-3.5 w-3.5 shrink-0 text-white/30" />
+                                      <div className="flex-1 min-w-0">
+                                        <p className="text-xs text-white/70 truncate">
+                                          {skill.name}
+                                          {skill.category && <span className="text-white/30"> · {skill.category}</span>}
+                                          {skill.version && <span className="text-white/25"> · v{skill.version}</span>}
+                                        </p>
+                                        {skill.description && (
+                                          <p className={cn('text-[11px] text-white/40', open ? 'whitespace-pre-wrap' : 'truncate')}>{skill.description}</p>
+                                        )}
+                                      </div>
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )
+                        )}
                       </div>
-                      {loadingMemorySearch.has(bot.id) ? (
-                        <div className="flex items-center gap-2 text-xs text-white/40 mb-3">
-                          <Loader className="h-3 w-3 animate-spin" /> Searching...
-                        </div>
-                      ) : (bot.id in memorySearchByBot) && (memorySearchByBot[bot.id] || []).length > 0 ? (
-                        <div className="space-y-1 mb-3">
-                          {(memorySearchByBot[bot.id] || []).map((hit) => (
-                            <div
-                              key={`${bot.id}-${hit.entry.id}-search`}
-                              className="px-3 py-2 rounded-lg bg-indigo-500/5 border border-indigo-500/15"
-                            >
-                              <div className="flex items-center justify-between gap-3">
-                                <p className="text-xs text-indigo-200 truncate">
-                                  {hit.entry.label ? `${hit.entry.label} · ` : ''}{hit.entry.value}
-                                </p>
-                                <span className="text-[10px] text-indigo-200/70 shrink-0">
-                                  {hit.score.toFixed(1)}
-                                </span>
-                              </div>
-                              <p className="text-[10px] text-indigo-100/50 mt-1">
-                                {hit.reasons.join(' · ')}
-                                {hit.matched_terms.length > 0 ? ` · terms: ${hit.matched_terms.join(', ')}` : ''}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (bot.id in memorySearchByBot) && memorySearchQueryByBot[bot.id]?.trim() ? (
-                        <p className="text-xs text-white/30 italic mb-3">
-                          No ranked memory matches for this query.
-                        </p>
-                      ) : null}
-                      {loadingMemory.has(bot.id) ? (
-                        <div className="flex items-center gap-2 text-xs text-white/40">
-                          <Loader className="h-3 w-3 animate-spin" /> Loading...
-                        </div>
-                      ) : (bot.id in memoryByBot) && (memoryByBot[bot.id] || []).length === 0 ? (
-                        <p className="text-xs text-white/30 italic">
-                          No structured memory captured yet.
-                        </p>
-                      ) : (
-                        <div className="space-y-1">
-                          {(memoryByBot[bot.id] || []).map((entry) => (
-                            <div
-                              key={entry.id}
-                              className="px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04]"
-                            >
-                              <div className="flex items-center justify-between gap-3">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <span className="inline-flex items-center rounded bg-indigo-500/10 border border-indigo-500/20 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300">
-                                    {entry.kind}
-                                  </span>
-                                  <span className="inline-flex items-center rounded bg-white/[0.04] border border-white/[0.06] px-1.5 py-0.5 text-[10px] font-medium text-white/50">
-                                    {entry.scope}
-                                  </span>
-                                  <p className="text-xs text-white/60 truncate">
-                                    {entry.scope === 'user'
-                                      ? entry.subject_display_name || entry.subject_username || `User ${entry.subject_user_id}`
-                                      : `Chat ${entry.chat_id}`}
-                                    {entry.label ? ` · ${entry.label}` : ''}
-                                  </p>
-                                </div>
-                                <p className="text-[10px] text-white/20 shrink-0">
-                                  {new Date(entry.updated_at).toLocaleDateString()}
-                                </p>
-                              </div>
-                              <p className="text-[11px] text-white/40 mt-1 line-clamp-2">
-                                {entry.value}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                      )}
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
               </div>
             ))}
           </div>
         )}
         </section>
-
-        {/* Info card */}
-        <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6">
-          <h3 className="text-base font-medium text-white mb-3">Cutover path</h3>
-          <div className="grid gap-3 text-sm text-white/60 md:grid-cols-3">
-            <div>
-              <p className="text-white/80">Gateway</p>
-              <p className="mt-1 text-xs text-white/40">
-                {hermesStatus?.telegram_ok
-                  ? 'Hermes owns Telegram; the compatibility record stays here for rollback and audit.'
-                  : 'Use Adopt to move Telegram from the compatibility webhook to Hermes.'}
-              </p>
-            </div>
-            <div>
-              <p className="text-white/80">Mission control</p>
-              <p className="mt-1 text-xs text-white/40">Hermes should call sandboxed.sh through assistant-mcp for mission work.</p>
-            </div>
-            <div>
-              <p className="text-white/80">Routing</p>
-              <p className="mt-1 text-xs text-white/40">Use the Routing page for the assistant model chain and fallbacks.</p>
-            </div>
-          </div>
-        </div>
       </div>
 
       {/* Create Dialog */}

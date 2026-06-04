@@ -841,7 +841,7 @@ impl ModelChainStore {
                     // empty provider response. GLM stays as the fallback.
                     ChainEntry {
                         provider_id: "minimax".to_string(),
-                        model_id: "MiniMax-M2.7".to_string(),
+                        model_id: "MiniMax-M3".to_string(),
                     },
                     ChainEntry {
                         provider_id: "zai".to_string(),
@@ -863,8 +863,10 @@ impl ModelChainStore {
                         entry.model_id = "glm-5.1".to_string();
                         migrated = true;
                     }
-                    if entry.provider_id == "minimax" && entry.model_id == "MiniMax-M2.5" {
-                        entry.model_id = "MiniMax-M2.7".to_string();
+                    if entry.provider_id == "minimax"
+                        && matches!(entry.model_id.as_str(), "MiniMax-M2.5" | "MiniMax-M2.7")
+                    {
+                        entry.model_id = "MiniMax-M3".to_string();
                         migrated = true;
                     }
                 }
@@ -932,11 +934,11 @@ impl ModelChainStore {
                 entries: vec![
                     ChainEntry {
                         provider_id: "minimax".to_string(),
-                        model_id: "MiniMax-M2.7".to_string(),
+                        model_id: "MiniMax-M3".to_string(),
                     },
                     ChainEntry {
                         provider_id: "cerebras".to_string(),
-                        model_id: "qwen-3-235b-a22b-instruct-2507".to_string(),
+                        model_id: "zai-glm-4.7".to_string(),
                     },
                 ],
                 is_default: false,
@@ -956,16 +958,56 @@ impl ModelChainStore {
                 chain.entries = vec![
                     ChainEntry {
                         provider_id: "minimax".to_string(),
-                        model_id: "MiniMax-M2.7".to_string(),
+                        model_id: "MiniMax-M3".to_string(),
                     },
                     ChainEntry {
                         provider_id: "cerebras".to_string(),
-                        model_id: "qwen-3-235b-a22b-instruct-2507".to_string(),
+                        model_id: "zai-glm-4.7".to_string(),
                     },
                 ];
                 chain.updated_at = now;
                 changed = true;
                 tracing::info!("Healed builtin/assistant chain to visible-content providers");
+            }
+        }
+
+        // Cerebras retired its hosted Qwen models, and the old `-cs` catalog
+        // aliases never matched real API IDs (the live catalog only serves
+        // `gpt-oss-120b` and `zai-glm-4.7`). Migrate every chain — builtin or
+        // user-defined — so stale fallback entries don't 404 at resolution.
+        for chain in chains.iter_mut() {
+            let mut migrated = false;
+            for entry in &mut chain.entries {
+                if entry.provider_id != "cerebras" {
+                    continue;
+                }
+                let replacement = match entry.model_id.as_str() {
+                    "qwen-3-235b-a22b-instruct-2507" | "zai-glm-4.6" | "zai-glm-4.6-cs" => {
+                        Some("zai-glm-4.7")
+                    }
+                    "gpt-oss-120b-cs" => Some("gpt-oss-120b"),
+                    _ => None,
+                };
+                if let Some(replacement) = replacement {
+                    tracing::info!(
+                        "Migrating retired Cerebras model {} -> {} in chain {}",
+                        entry.model_id,
+                        replacement,
+                        chain.id
+                    );
+                    entry.model_id = replacement.to_string();
+                    migrated = true;
+                }
+            }
+            if migrated {
+                // The migration can collapse two entries into the same
+                // provider/model pair; drop duplicates while preserving order.
+                let mut seen = std::collections::HashSet::new();
+                chain
+                    .entries
+                    .retain(|e| seen.insert((e.provider_id.clone(), e.model_id.clone())));
+                chain.updated_at = now;
+                changed = true;
             }
         }
 
@@ -1106,12 +1148,32 @@ impl ModelChainStore {
             Some(c) => c,
             None => return Vec::new(),
         };
+        self.resolve_entries(
+            &chain.entries,
+            ai_providers,
+            standard_accounts,
+            health_tracker,
+        )
+        .await
+    }
 
+    /// Expand an ad-hoc list of `provider/model` entries into resolved,
+    /// health-filtered upstream attempts — the same expansion `resolve_chain`
+    /// applies to a stored chain, but without requiring a stored chain. Used
+    /// for direct `provider/model` passthrough in the proxy. Per provider, the
+    /// first healthy/configured account is emitted first (chain ordering).
+    pub async fn resolve_entries(
+        &self,
+        entries: &[ChainEntry],
+        ai_providers: &crate::ai_providers::AIProviderStore,
+        standard_accounts: &[StandardAccount],
+        health_tracker: &ProviderHealthTracker,
+    ) -> Vec<ResolvedEntry> {
         let mut resolved = Vec::new();
 
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        for entry in &chain.entries {
+        for entry in entries {
             let provider_type = match crate::ai_providers::ProviderType::from_id(&entry.provider_id)
             {
                 Some(pt) => pt,
@@ -1397,6 +1459,69 @@ mod tests {
 
     fn future_ms(hours: i64) -> i64 {
         chrono::Utc::now().timestamp_millis() + hours * 3600 * 1000
+    }
+
+    #[tokio::test]
+    async fn ensure_defaults_migrates_retired_cerebras_models() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("chains.json");
+        let now = chrono::Utc::now();
+        let entry = |provider: &str, model: &str| ChainEntry {
+            provider_id: provider.to_string(),
+            model_id: model.to_string(),
+        };
+        let chain = |id: &str, entries: Vec<ChainEntry>, is_default: bool| ModelChain {
+            id: id.to_string(),
+            name: id.to_string(),
+            entries,
+            is_default,
+            created_at: now,
+            updated_at: now,
+        };
+        let chains = vec![
+            chain(
+                "builtin/smart",
+                vec![
+                    entry("minimax", "MiniMax-M3"),
+                    entry("zai", "glm-5.1"),
+                    entry("cerebras", "qwen-3-235b-a22b-instruct-2507"),
+                ],
+                true,
+            ),
+            // User chain where the migration collapses a retired alias into an
+            // entry that already exists — the duplicate must be dropped.
+            chain(
+                "user/custom",
+                vec![
+                    entry("cerebras", "gpt-oss-120b-cs"),
+                    entry("cerebras", "gpt-oss-120b"),
+                ],
+                false,
+            ),
+        ];
+        std::fs::write(&path, serde_json::to_string(&chains).unwrap()).unwrap();
+
+        let store = ModelChainStore::new(path).await;
+        std::mem::forget(tmp);
+
+        let smart = store.get("builtin/smart").await.unwrap();
+        let models: Vec<_> = smart
+            .entries
+            .iter()
+            .map(|e| (e.provider_id.as_str().to_string(), e.model_id.clone()))
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                ("minimax".to_string(), "MiniMax-M3".to_string()),
+                ("zai".to_string(), "glm-5.1".to_string()),
+                ("cerebras".to_string(), "zai-glm-4.7".to_string()),
+            ]
+        );
+
+        let custom = store.get("user/custom").await.unwrap();
+        assert_eq!(custom.entries.len(), 1);
+        assert_eq!(custom.entries[0].model_id, "gpt-oss-120b");
     }
 
     fn past_ms(hours: i64) -> i64 {

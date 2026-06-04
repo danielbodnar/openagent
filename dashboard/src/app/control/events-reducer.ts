@@ -13,6 +13,25 @@ export type ChatItem =
       content: string;
       timestamp: number;
       queued?: boolean;
+      /**
+       * Optimistic-send lifecycle (client-only; never set from server
+       * events). `sending` = POST in flight, `sent` = backend acked,
+       * `failed` = never reached the backend. Drives the bubble's opacity
+       * and the inline "Sending…" / "Retry" affordances.
+       */
+      sendStatus?: "sending" | "sent" | "failed";
+      /** When `sendStatus === "failed"`: drives copy + auto-retry eligibility. */
+      failedReason?: "network" | "rejected";
+      /** Locked agent for this message, preserved so a retry re-applies it. */
+      agent?: string;
+      /**
+       * Mission this row was created for (client-only). Stamped on
+       * live/optimistic rows so a row created while viewing mission A can
+       * never be reconciled into, or rendered under, mission B during a
+       * switch race. Unset for server-history rows (already loaded per
+       * mission, so correct by construction).
+       */
+      missionId?: string;
     }
   | {
       kind: "assistant";

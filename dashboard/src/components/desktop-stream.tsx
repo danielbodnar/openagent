@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { getValidJwt } from "@/lib/auth";
 import { getRuntimeApiBase } from "@/lib/settings";
 import {
+  AppWindow,
   MonitorOff,
   Play,
   Pause,
@@ -14,10 +15,17 @@ import {
   Maximize2,
   Minimize2,
   PictureInPicture2,
+  Gauge,
+  Keyboard,
+  MousePointer2,
+  ScanLine,
+  SlidersHorizontal,
 } from "lucide-react";
 
 interface DesktopStreamProps {
   displayId?: string;
+  displayServer?: string;
+  compositor?: string;
   className?: string;
   onClose?: () => void;
   initialFps?: number;
@@ -25,9 +33,12 @@ interface DesktopStreamProps {
 }
 
 type ConnectionState = "connecting" | "connected" | "disconnected" | "error";
+type ViewportMode = "fit" | "fill";
 
 export function DesktopStream({
   displayId = ":99",
+  displayServer,
+  compositor,
   className,
   onClose,
   initialFps = 10,
@@ -38,12 +49,25 @@ export function DesktopStream({
   const [isPaused, setIsPaused] = useState(false);
   const [frameCount, setFrameCount] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [showControls, setShowControls] = useState(true);
+  const [inputErrorMessage, setInputErrorMessage] = useState<string | null>(
+    null
+  );
   const [fps, setFps] = useState(initialFps);
   const [quality, setQuality] = useState(initialQuality);
+  const [viewportMode, setViewportMode] = useState<ViewportMode>("fit");
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isPipActive, setIsPipActive] = useState(false);
   const [isPipSupported, setIsPipSupported] = useState(false);
+  const streamBackend = (displayServer || "wayland").toLowerCase();
+  const isWayland = streamBackend === "wayland";
+  const backendLabel = isWayland ? "Wayland app stream" : "Legacy desktop stream";
+  const compositorLabel = compositor
+    ? compositor.toUpperCase()
+    : isWayland
+      ? "SWAY"
+      : "Legacy";
+  const streamTitle = isWayland ? "Interactive app surface" : "Legacy desktop surface";
+  const latencyLabel = fps >= 24 ? "Low latency" : fps >= 12 ? "Balanced" : "Battery saver";
 
   const wsRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -107,6 +131,7 @@ export function DesktopStream({
 
     setConnectionState("connecting");
     setErrorMessage(null);
+    setInputErrorMessage(null);
 
     const url = buildWsUrl();
 
@@ -125,6 +150,7 @@ export function DesktopStream({
       if (connectionIdRef.current !== thisConnectionId) return;
       setConnectionState("connected");
       setErrorMessage(null);
+      setInputErrorMessage(null);
     };
 
     ws.onmessage = (event) => {
@@ -151,6 +177,7 @@ export function DesktopStream({
               }
               ctx.drawImage(img, 0, 0);
               setFrameCount((prev) => prev + 1);
+              setInputErrorMessage(null);
             }
           }
           URL.revokeObjectURL(imageUrl);
@@ -165,7 +192,12 @@ export function DesktopStream({
         try {
           const json = JSON.parse(event.data);
           if (json.error) {
-            setErrorMessage(json.message || json.error);
+            const message = json.message || json.error;
+            if (json.error === "input_failed") {
+              setInputErrorMessage(message);
+            } else {
+              setErrorMessage(message);
+            }
           }
         } catch {
           // Ignore parse errors
@@ -705,39 +737,55 @@ export function DesktopStream({
       ref={containerRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
+      data-testid="app-stream-panel"
+      data-stream-display={displayId}
+      data-stream-backend={streamBackend}
       className={cn(
-        "relative flex flex-col bg-[#0a0a0a] rounded-xl overflow-hidden border border-white/[0.06]",
+        "app-stream-surface relative flex min-h-[320px] flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-[0_18px_55px_rgba(15,23,42,0.12)] dark:border-white/[0.08] dark:bg-[#08090b] dark:shadow-[0_24px_80px_rgba(0,0,0,0.32)]",
         className
       )}
-      onMouseEnter={() => setShowControls(true)}
-      onMouseLeave={() => setShowControls(false)}
     >
-      {/* Header */}
-      <div
-        className={cn(
-          "pointer-events-none absolute top-0 left-0 right-0 z-10 flex items-center justify-between px-4 py-2 bg-gradient-to-b from-black/80 to-transparent transition-opacity duration-200",
-          showControls ? "opacity-100" : "opacity-0"
-        )}
-      >
-        <div className="pointer-events-auto flex items-center gap-3">
+      <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-50/80 px-3 py-2.5 dark:border-white/[0.08] dark:bg-white/[0.035]">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-600 dark:border-indigo-400/25 dark:bg-indigo-400/12 dark:text-indigo-200">
+            <AppWindow className="h-[18px] w-[18px]" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-sm font-semibold text-slate-950 dark:text-white/90">
+                {streamTitle}
+              </span>
+              <span className="hidden rounded-md border border-slate-200 bg-white px-1.5 py-0.5 font-mono text-[11px] text-slate-500 sm:inline dark:border-white/[0.08] dark:bg-black/30 dark:text-white/55">
+                {displayId}
+              </span>
+            </div>
+            <div className="mt-0.5 flex min-w-0 items-center gap-2 text-[11px] text-slate-500 dark:text-white/45">
+              <span className="truncate">{backendLabel}</span>
+              <span className="text-slate-300 dark:text-white/20">/</span>
+              <span>{compositorLabel}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-1.5">
           <div
             className={cn(
-              "flex items-center gap-2 text-xs",
+              "hidden items-center gap-1.5 rounded-md border px-2 py-1 text-xs sm:flex",
               connectionState === "connected"
-                ? "text-emerald-400"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-400/10 dark:text-emerald-300"
                 : connectionState === "connecting"
-                ? "text-amber-400"
-                : "text-red-400"
+                ? "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-400/20 dark:bg-amber-400/10 dark:text-amber-300"
+                : "border-red-200 bg-red-50 text-red-700 dark:border-red-400/20 dark:bg-red-400/10 dark:text-red-300"
             )}
           >
-            <div
+            <span
               className={cn(
-                "w-2 h-2 rounded-full",
+                "h-1.5 w-1.5 rounded-full",
                 connectionState === "connected"
-                  ? "bg-emerald-400"
-                  : connectionState === "connecting"
-                  ? "bg-amber-400 animate-pulse"
-                  : "bg-red-400"
+                  ? "bg-emerald-300"
+                : connectionState === "connecting"
+                  ? "animate-pulse bg-amber-300"
+                  : "bg-red-300"
               )}
             />
             {connectionState === "connected"
@@ -745,25 +793,20 @@ export function DesktopStream({
                 ? "Paused"
                 : "Live"
               : connectionState === "connecting"
-              ? "Connecting..."
-              : "Disconnected"}
+              ? "Connecting"
+              : "Offline"}
           </div>
-          <span className="text-xs text-white/40 font-mono">{displayId}</span>
-          <span className="text-xs text-white/30">{frameCount} frames</span>
-        </div>
-
-        <div className="pointer-events-auto flex items-center gap-2">
           {isPipSupported && (
             <button
               onClick={handlePip}
               disabled={connectionState !== "connected"}
               className={cn(
-                "p-1.5 rounded-lg transition-colors",
+                "rounded-lg p-2 transition-colors",
                 connectionState === "connected"
                   ? isPipActive
-                    ? "bg-indigo-500/30 text-indigo-400 hover:bg-indigo-500/40"
-                    : "hover:bg-white/10 text-white/60 hover:text-white"
-                  : "text-white/30 cursor-not-allowed"
+                    ? "bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-400/20 dark:text-indigo-200 dark:hover:bg-indigo-400/25"
+                    : "text-slate-500 hover:bg-slate-100 hover:text-slate-950 dark:text-white/55 dark:hover:bg-white/10 dark:hover:text-white"
+                  : "cursor-not-allowed text-slate-300 dark:text-white/30"
               )}
               title={isPipActive ? "Exit Picture-in-Picture" : "Picture-in-Picture"}
             >
@@ -772,7 +815,7 @@ export function DesktopStream({
           )}
           <button
             onClick={handleFullscreen}
-            className="p-1.5 rounded-lg hover:bg-white/10 text-white/60 hover:text-white transition-colors"
+            className="rounded-lg p-2 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-950 dark:text-white/55 dark:hover:bg-white/10 dark:hover:text-white"
             title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
           >
             {isFullscreen ? (
@@ -784,7 +827,7 @@ export function DesktopStream({
           {onClose && (
             <button
               onClick={onClose}
-              className="p-1.5 rounded-lg hover:bg-white/10 text-white/60 hover:text-white transition-colors"
+              className="rounded-lg p-2 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-950 dark:text-white/55 dark:hover:bg-white/10 dark:hover:text-white"
               title="Close"
             >
               <X className="w-4 h-4" />
@@ -793,44 +836,77 @@ export function DesktopStream({
         </div>
       </div>
 
-      {/* Canvas */}
-      <div className="flex-1 flex items-center justify-center bg-black min-h-[200px]">
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-white/[0.06] dark:bg-black/20 dark:text-white/50">
+        <span className="inline-flex items-center gap-1.5 rounded-md bg-white px-2 py-1 ring-1 ring-slate-200 dark:bg-white/[0.04] dark:ring-0">
+          <Gauge className="h-3.5 w-3.5 text-indigo-600 dark:text-indigo-200" />
+          {latencyLabel}
+        </span>
+        <span className="inline-flex items-center gap-1.5 rounded-md bg-white px-2 py-1 ring-1 ring-slate-200 dark:bg-white/[0.04] dark:ring-0">
+          <MousePointer2 className="h-3.5 w-3.5 text-slate-500 dark:text-white/45" />
+          Pointer
+        </span>
+        <span className="inline-flex items-center gap-1.5 rounded-md bg-white px-2 py-1 ring-1 ring-slate-200 dark:bg-white/[0.04] dark:ring-0">
+          <Keyboard className="h-3.5 w-3.5 text-slate-500 dark:text-white/45" />
+          Keyboard
+        </span>
+        <span className="ml-auto hidden font-mono text-[11px] text-slate-400 dark:text-white/35 sm:inline">
+          {frameCount} frames
+        </span>
+      </div>
+
+      {/* App viewport */}
+      <div className="flex min-h-[220px] flex-1 items-center justify-center bg-slate-100 p-2 dark:bg-[radial-gradient(circle_at_center,rgba(99,102,241,0.08),transparent_42%),#020203]">
         {connectionState === "connected" && !errorMessage ? (
-          <canvas
-            ref={canvasRef}
-            className="max-w-full max-h-full object-contain"
-            onMouseMove={handleMouseMove}
-            onMouseDown={handleMouseDown}
-            onMouseUp={handleMouseUp}
-            onMouseLeave={handleMouseLeave}
-            onAuxClick={handleAuxClick}
-            onContextMenu={handleContextMenu}
-            onWheel={handleWheel}
-          />
+          <div className="relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg border border-slate-300 bg-slate-200 shadow-inner dark:border-white/[0.06] dark:bg-black">
+            <canvas
+              ref={canvasRef}
+              data-testid="app-stream-canvas"
+              className={cn(
+                "block",
+                viewportMode === "fit"
+                  ? "max-h-full max-w-full object-contain"
+                  : "h-full w-full object-cover"
+              )}
+              onMouseMove={handleMouseMove}
+              onMouseDown={handleMouseDown}
+              onMouseUp={handleMouseUp}
+              onMouseLeave={handleMouseLeave}
+              onAuxClick={handleAuxClick}
+              onContextMenu={handleContextMenu}
+              onWheel={handleWheel}
+            />
+            {inputErrorMessage && (
+              <div className="pointer-events-none absolute left-3 right-3 top-3 rounded-lg border border-amber-300 bg-amber-50/95 px-3 py-2 text-xs text-amber-800 shadow-lg dark:border-amber-400/25 dark:bg-black/75 dark:text-amber-200">
+                {inputErrorMessage}
+              </div>
+            )}
+          </div>
         ) : connectionState === "connecting" ? (
-          <div className="h-full w-full p-6">
-            <div className="h-full min-h-[220px] rounded-lg border border-white/[0.04] bg-white/[0.03] animate-pulse" />
+          <div className="h-full w-full p-4">
+            <div className="flex h-full min-h-[220px] items-center justify-center rounded-lg border border-slate-200 bg-white dark:border-white/[0.06] dark:bg-white/[0.03]">
+              <div className="h-28 w-44 animate-pulse rounded-md border border-slate-200 bg-slate-100 dark:border-white/[0.05] dark:bg-white/[0.04]" />
+            </div>
           </div>
         ) : (
-          <div className="flex flex-col items-center gap-4 text-white/60 px-6 py-8">
-            <MonitorOff className="w-14 h-14 text-red-400/50" />
+          <div className="flex flex-col items-center gap-4 px-6 py-8 text-slate-600 dark:text-white/60">
+            <MonitorOff className="w-14 h-14 text-red-500/60 dark:text-red-400/50" />
             <div className="flex flex-col items-center gap-1.5 text-center">
-              <h3 className="text-base font-medium text-white/80">
+              <h3 className="text-base font-medium text-slate-900 dark:text-white/80">
                 {errorMessage?.includes("no longer available") ||
                 errorMessage?.includes("session may have")
-                  ? "Desktop Unavailable"
+                  ? "App Stream Unavailable"
                   : "Connection Lost"}
               </h3>
-              <p className="max-w-[280px] text-sm text-white/50 leading-relaxed">
+              <p className="max-w-[280px] text-sm leading-relaxed text-slate-500 dark:text-white/50">
                 {errorMessage?.includes("no longer available") ||
                 errorMessage?.includes("session may have")
-                  ? `Display ${displayId} has been closed. Select another session from the dropdown above.`
-                  : errorMessage || "Unable to connect to the desktop stream."}
+                  ? `Session ${displayId} has been closed. Select another app stream above.`
+                  : errorMessage || "Unable to connect to the app stream."}
               </p>
             </div>
             <button
               onClick={connect}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-500 text-white text-sm font-medium hover:bg-indigo-600 transition-colors"
+              className="flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-600"
             >
               <RefreshCw className="w-4 h-4" />
               Reconnect
@@ -839,24 +915,17 @@ export function DesktopStream({
         )}
       </div>
 
-      {/* Controls */}
-      <div
-        className={cn(
-          "pointer-events-none absolute bottom-0 left-0 right-0 z-10 p-4 bg-gradient-to-t from-black/80 to-transparent transition-opacity duration-200",
-          showControls ? "opacity-100" : "opacity-0"
-        )}
-      >
-        <div className="pointer-events-auto flex items-center justify-between gap-4">
-          {/* Play/Pause */}
+      <div className="border-t border-slate-200 bg-slate-50/80 px-3 py-3 dark:border-white/[0.08] dark:bg-white/[0.035]">
+        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex items-center gap-2">
             <button
               onClick={isPaused ? handleResume : handlePause}
               disabled={connectionState !== "connected"}
               className={cn(
-                "p-2 rounded-full transition-colors",
+                "rounded-lg p-2 transition-colors",
                 connectionState === "connected"
-                  ? "bg-white/10 hover:bg-white/20 text-white"
-                  : "bg-white/5 text-white/30 cursor-not-allowed"
+                  ? "bg-slate-200 text-slate-800 hover:bg-slate-300 dark:bg-white/10 dark:text-white dark:hover:bg-white/20"
+                  : "cursor-not-allowed bg-slate-100 text-slate-300 dark:bg-white/5 dark:text-white/30"
               )}
               title={isPaused ? "Resume" : "Pause"}
             >
@@ -869,32 +938,56 @@ export function DesktopStream({
 
             <button
               onClick={connect}
-              className="p-2 rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors"
+              className="rounded-lg bg-slate-200 p-2 text-slate-800 transition-colors hover:bg-slate-300 dark:bg-white/10 dark:text-white dark:hover:bg-white/20"
               title="Reconnect"
             >
               <RefreshCw className="w-4 h-4" />
             </button>
+
+            <div className="ml-1 inline-flex overflow-hidden rounded-lg border border-slate-200 bg-white dark:border-white/[0.08] dark:bg-black/20">
+              {(["fit", "fill"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setViewportMode(mode)}
+                  aria-label={mode === "fit" ? "Fit surface" : "Fill surface"}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 px-2.5 py-2 text-xs font-medium capitalize transition-colors",
+                    viewportMode === mode
+                      ? "bg-indigo-100 text-indigo-700 dark:bg-indigo-400/18 dark:text-indigo-100"
+                      : "text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-white/45 dark:hover:bg-white/[0.06] dark:hover:text-white/75"
+                  )}
+                  title={mode === "fit" ? "Fit app to surface" : "Fill surface"}
+                >
+                  <ScanLine className="h-3.5 w-3.5" />
+                  {mode}
+                </button>
+              ))}
+            </div>
           </div>
 
-          {/* Sliders */}
-          <div className="flex-1 flex items-center gap-6 max-w-md">
-            <div className="flex-1 flex items-center gap-2">
-              <span className="text-xs text-white/40 w-8">FPS</span>
+          <div className="flex min-w-0 flex-1 flex-col gap-2 lg:flex-row lg:items-center xl:max-w-xl">
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="flex w-14 items-center gap-1 text-xs text-slate-500 dark:text-white/45">
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+                FPS
+              </span>
               <input
                 type="range"
                 min={1}
                 max={30}
                 value={fps}
                 onChange={(e) => handleFpsChange(Number(e.target.value))}
-                className="flex-1 h-1 bg-white/20 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-indigo-500 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer"
+                aria-label="Stream FPS"
+                className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-slate-300 accent-indigo-500 dark:bg-white/20 dark:accent-indigo-400 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-indigo-500 dark:[&::-webkit-slider-thumb]:bg-indigo-400"
               />
-              <span className="text-xs text-white/60 w-6 text-right tabular-nums">
+              <span className="w-6 text-right text-xs tabular-nums text-slate-600 dark:text-white/60">
                 {fps}
               </span>
             </div>
 
-            <div className="flex-1 flex items-center gap-2">
-              <span className="text-xs text-white/40 w-12">Quality</span>
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <span className="w-14 text-xs text-slate-500 dark:text-white/45">Quality</span>
               <input
                 type="range"
                 min={10}
@@ -902,9 +995,10 @@ export function DesktopStream({
                 step={5}
                 value={quality}
                 onChange={(e) => handleQualityChange(Number(e.target.value))}
-                className="flex-1 h-1 bg-white/20 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-indigo-500 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer"
+                aria-label="Stream quality"
+                className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-slate-300 accent-indigo-500 dark:bg-white/20 dark:accent-indigo-400 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-indigo-500 dark:[&::-webkit-slider-thumb]:bg-indigo-400"
               />
-              <span className="text-xs text-white/60 w-8 text-right tabular-nums">
+              <span className="w-8 text-right text-xs tabular-nums text-slate-600 dark:text-white/60">
                 {quality}%
               </span>
             </div>

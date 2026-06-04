@@ -16,6 +16,7 @@ import {
   EyeOff,
   Check,
   Loader,
+  Type,
   Zap,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -134,21 +135,21 @@ export default function LLMSettingsPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full max-w-xl space-y-6">
+      <div className="w-full max-w-4xl space-y-6">
         <header>
           <h1 className="text-xl font-semibold text-white">LLM</h1>
           <p className="mt-1 text-sm text-white/50">
-            Configure a fast LLM provider for dashboard features like
-            auto-generated mission titles
+            Fast model used for dashboard features like mission titles
           </p>
         </header>
 
         <div className="space-y-5">
+          <div className="grid gap-5 md:grid-cols-2">
           {/* Enable toggle */}
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10">
+                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 flex-shrink-0">
                   <Sparkles className="h-5 w-5 text-amber-400" />
                 </div>
                 <div>
@@ -156,7 +157,7 @@ export default function LLMSettingsPage() {
                     LLM Integration
                   </h2>
                   <p className="text-xs text-white/40">
-                    Enable AI-powered UX features in the dashboard
+                    Powers mission titles and other dashboard AI features
                   </p>
                 </div>
               </div>
@@ -177,11 +178,57 @@ export default function LLMSettingsPage() {
             </div>
           </div>
 
+          {/* Features */}
+          <div
+            className={cn(
+              'rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 transition-opacity',
+              !config.enabled && 'opacity-60 dark:opacity-40 pointer-events-none'
+            )}
+          >
+            <div className="flex items-center gap-3 mb-4">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 flex-shrink-0">
+                <Type className="h-5 w-5 text-sky-400" />
+              </div>
+              <div>
+                <h2 className="text-sm font-medium text-white">Features</h2>
+                <p className="text-xs text-white/40">
+                  What the dashboard uses this model for
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm text-white/80">
+                  Auto-generate mission titles
+                </p>
+                <p className="text-xs text-white/40">
+                  Use the LLM to create meaningful titles from mission content
+                </p>
+              </div>
+              <button
+                onClick={() => save({ autoTitle: !config.autoTitle })}
+                className={cn(
+                  'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
+                  config.autoTitle ? 'bg-emerald-500' : 'bg-white/10'
+                )}
+              >
+                <span
+                  className={cn(
+                    'inline-block h-4 w-4 rounded-full bg-white transition-transform',
+                    config.autoTitle ? 'translate-x-6' : 'translate-x-1'
+                  )}
+                />
+              </button>
+            </div>
+          </div>
+          </div>
+
           {/* Provider config */}
           <div
             className={cn(
               'rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 space-y-4 transition-opacity',
-              !config.enabled && 'opacity-75 dark:opacity-40 pointer-events-none'
+              !config.enabled && 'opacity-60 dark:opacity-40 pointer-events-none'
             )}
           >
             <div className="flex items-center gap-3 mb-4">
@@ -191,7 +238,7 @@ export default function LLMSettingsPage() {
               <div>
                 <h2 className="text-sm font-medium text-white">Provider</h2>
                 <p className="text-xs text-white/40">
-                  Choose a fast LLM provider. Cerebras is recommended for speed
+                  Cerebras is the fastest option
                 </p>
               </div>
             </div>
@@ -325,40 +372,6 @@ export default function LLMSettingsPage() {
             </div>
           </div>
 
-          {/* Features */}
-          <div
-            className={cn(
-              'rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 transition-opacity',
-              !config.enabled && 'opacity-40 pointer-events-none'
-            )}
-          >
-            <h2 className="text-sm font-medium text-white mb-4">Features</h2>
-
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-white/80">
-                  Auto-generate mission titles
-                </p>
-                <p className="text-xs text-white/40">
-                  Use the LLM to create meaningful titles from mission content
-                </p>
-              </div>
-              <button
-                onClick={() => save({ autoTitle: !config.autoTitle })}
-                className={cn(
-                  'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                  config.autoTitle ? 'bg-emerald-500' : 'bg-white/10'
-                )}
-              >
-                <span
-                  className={cn(
-                    'inline-block h-4 w-4 rounded-full bg-white transition-transform',
-                    config.autoTitle ? 'translate-x-6' : 'translate-x-1'
-                  )}
-                />
-              </button>
-            </div>
-          </div>
         </div>
       </div>
     </div>

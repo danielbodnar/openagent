@@ -341,8 +341,8 @@ export default function DataSettingsPage() {
               <div className="min-w-0">
                 <h2 className="text-sm font-medium text-white">Ask Assistant Model</h2>
                 <p className="text-xs text-white/40">
-                  Model for the non-interrupting Ask co-pilot. Blank = default
-                  (gpt-oss-120b).
+                  Model for the non-interrupting Ask co-pilot. Leave blank for
+                  the default (gpt-oss-120b).
                 </p>
               </div>
             </div>
@@ -372,7 +372,7 @@ export default function DataSettingsPage() {
                     <button
                       onClick={handleSaveAskModel}
                       disabled={savingAskModel}
-                      className="flex items-center gap-1.5 rounded-lg bg-sky-500 px-3 py-1.5 text-xs text-white hover:bg-sky-600 transition-colors cursor-pointer disabled:opacity-50"
+                      className="flex items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors cursor-pointer disabled:opacity-50"
                     >
                       {savingAskModel ? (
                         <Loader className="h-3 w-3 animate-spin" />
@@ -382,7 +382,8 @@ export default function DataSettingsPage() {
                       Save
                     </button>
                     <span className="text-xs text-white/30">
-                      e.g. gpt-oss-120b, qwen-3-235b-a22b-instruct-2507
+                      e.g. gpt-oss-120b (fast default), zai-glm-4.7 (larger,
+                      slower)
                     </span>
                   </div>
                 </div>
@@ -391,7 +392,7 @@ export default function DataSettingsPage() {
           </div>
 
           {/* sandboxed.sh Source */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col md:col-span-2">
             <div className="flex items-center gap-3 mb-4">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 flex-shrink-0">
                 <Archive className="h-5 w-5 text-emerald-400" />
@@ -431,7 +432,7 @@ export default function DataSettingsPage() {
                     <button
                       onClick={handleSaveRepoPath}
                       disabled={savingRepoPath}
-                      className="flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs text-white hover:bg-emerald-600 transition-colors cursor-pointer disabled:opacity-50"
+                      className="flex items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors cursor-pointer disabled:opacity-50"
                     >
                       {savingRepoPath ? (
                         <Loader className="h-3 w-3 animate-spin" />
@@ -454,10 +455,10 @@ export default function DataSettingsPage() {
                 <div
                   onClick={handleStartEditRepoPath}
                   className={cn(
-                    'w-full rounded-lg border px-3 py-2.5 text-sm font-mono cursor-pointer transition-colors',
+                    'w-full rounded-lg border px-3 py-2.5 text-sm font-mono cursor-pointer transition-colors border-white/[0.06] hover:border-emerald-500/30 hover:bg-white/[0.02]',
                     serverSettings?.sandboxed_repo_path
-                      ? 'border-white/[0.06] bg-white/[0.01] text-white/70 hover:border-emerald-500/30 hover:bg-white/[0.02]'
-                      : 'border-amber-500/20 bg-amber-500/5 text-amber-400/80 hover:border-amber-500/30 hover:bg-amber-500/10'
+                      ? 'bg-white/[0.01] text-white/70'
+                      : 'bg-white/[0.01] text-white/40 italic'
                   )}
                   title="Click to edit"
                 >
@@ -490,10 +491,10 @@ export default function DataSettingsPage() {
               <div className="min-w-0">
                 <p className="text-sm text-white/70">
                   {serverSettings?.auto_cleanup_enabled
-                    ? `Sweeping every hour — anything completed, failed, or interrupted more than ${
+                    ? `Sweeping every hour: anything completed, failed, or interrupted more than ${
                         serverSettings?.auto_cleanup_days ?? 7
                       } day${(serverSettings?.auto_cleanup_days ?? 7) === 1 ? '' : 's'} ago is removed`
-                    : 'Disabled — old mission directories accumulate until you clean them manually'}
+                    : 'Disabled: old mission directories accumulate until you clean them manually'}
                 </p>
                 <p className="mt-1 text-xs text-white/40">
                   Only the agent&apos;s sandbox files are deleted. Conversation history stays in the
@@ -559,7 +560,7 @@ export default function DataSettingsPage() {
                       type="button"
                       onClick={handleSaveCleanupDays}
                       disabled={savingCleanupDays}
-                      className="flex items-center gap-1 rounded-md bg-rose-500/20 hover:bg-rose-500/30 px-2 py-1 text-xs text-rose-200 disabled:opacity-60"
+                      className="flex items-center gap-1 rounded-md bg-indigo-500 hover:bg-indigo-600 px-2 py-1 text-xs text-white disabled:opacity-60"
                     >
                       {savingCleanupDays ? (
                         <Loader className="h-3 w-3 animate-spin" />

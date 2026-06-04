@@ -216,4 +216,44 @@ describe("appendUnpersistedLiveTail", () => {
 
     expect(views).toEqual([userItem, streamItem]);
   });
+
+  it("carries over a failed user row not present in server history", () => {
+    const failed: Extract<ChatItem, { kind: "user" }> = {
+      id: "user-failed",
+      kind: "user",
+      content: "Did not reach the server",
+      timestamp: 2,
+      sendStatus: "failed",
+      failedReason: "network",
+    };
+
+    const views = appendUnpersistedLiveTail([], [failed]);
+
+    expect(views).toEqual([failed]);
+  });
+
+  it("carries over a still-sending user row not present in server history", () => {
+    const sending: Extract<ChatItem, { kind: "user" }> = {
+      id: "user-sending",
+      kind: "user",
+      content: "In flight",
+      timestamp: 2,
+      sendStatus: "sending",
+    };
+
+    const views = appendUnpersistedLiveTail([userItem], [userItem, sending]);
+
+    expect(views).toEqual([userItem, sending]);
+  });
+
+  it("does not duplicate a sent user row already in server history", () => {
+    const sent: Extract<ChatItem, { kind: "user" }> = {
+      ...userItem,
+      sendStatus: "sent",
+    };
+
+    const views = appendUnpersistedLiveTail([userItem], [sent]);
+
+    expect(views).toEqual([userItem]);
+  });
 });

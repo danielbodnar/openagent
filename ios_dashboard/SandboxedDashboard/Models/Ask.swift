@@ -37,6 +37,12 @@ struct AskMessage: Codable, Identifiable {
     let toolName: String?
     let toolCallId: String?
     let createdAt: String
+    /// Client-only delivery state for optimistic user bubbles. Excluded from
+    /// `CodingKeys`, so it's never decoded from / encoded to the backend and
+    /// defaults to `.sent` for server-sourced messages. Mirrors the main
+    /// composer's `ChatMessage.sendState` so Ask gets the same
+    /// pending/failed/tap-to-retry UX.
+    var sendState: MessageSendState = .sent
 
     enum CodingKeys: String, CodingKey {
         case id, seq, role, content
@@ -44,7 +50,8 @@ struct AskMessage: Codable, Identifiable {
         case toolName = "tool_name"
         case toolCallId = "tool_call_id"
         case createdAt = "created_at"
-        // `metadata` is intentionally omitted — arbitrary JSON we don't render.
+        // `metadata` and `sendState` are intentionally omitted — arbitrary
+        // JSON we don't render, and a client-only field, respectively.
     }
 
     var isUser: Bool { role == "user" }
@@ -85,4 +92,31 @@ struct AskThreadDetail: Codable {
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }
+}
+
+/// One Server-Sent Event from `POST /api/control/missions/:id/ask/stream`.
+/// A single shape covers every variant (`type` discriminates).
+struct AskStreamEvent: Decodable {
+    let type: String
+    let content: String?
+    let toolCallId: String?
+    let name: String?
+    let args: String?
+    let result: String?
+    let threadId: String?
+    let answer: String?
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, content, name, args, result, answer, message
+        case toolCallId = "tool_call_id"
+        case threadId = "thread_id"
+    }
+}
+
+/// Error carrying a co-pilot stream failure message (from an SSE `error` event
+/// or an abruptly-ended stream), so it surfaces through the normal throw path.
+struct AskStreamError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }

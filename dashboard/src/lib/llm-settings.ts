@@ -25,7 +25,7 @@ const DEFAULTS: LLMConfig = {
   provider: "cerebras",
   baseUrl: "https://api.cerebras.ai/v1",
   apiKey: "",
-  model: "gpt-oss-120b-cs",
+  model: "gpt-oss-120b",
   autoTitle: true,
 };
 
@@ -37,10 +37,12 @@ export const LLM_PROVIDERS: Record<
   cerebras: {
     name: "Cerebras",
     baseUrl: "https://api.cerebras.ai/v1",
-    defaultModel: "gpt-oss-120b-cs",
+    // Keep aligned with the live catalog (GET /v1/models): Cerebras retired
+    // its Qwen models and the old `-cs` aliases.
+    defaultModel: "gpt-oss-120b",
     models: [
-      "gpt-oss-120b-cs",
-      "zai-glm-4.6-cs",
+      "gpt-oss-120b",
+      "zai-glm-4.7",
     ],
   },
   zai: {

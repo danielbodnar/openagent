@@ -14,6 +14,16 @@ export interface ProxyApiKeySummary {
   name: string;
   key_prefix: string;
   created_at: string;
+  /** Last successful proxy authentication; null if never used (or the key predates usage tracking). */
+  last_used_at: string | null;
+}
+
+export interface ProxyApiKeyCleanupResult {
+  dry_run: boolean;
+  /** Keys whose last activity predates this instant were selected. */
+  cutoff: string;
+  /** Candidate keys (dry run) or deleted keys. */
+  keys: ProxyApiKeySummary[];
 }
 
 export interface ProxyApiKeyCreated {
@@ -38,4 +48,18 @@ export async function createProxyApiKey(name: string): Promise<ProxyApiKeyCreate
 
 export async function deleteProxyApiKey(id: string): Promise<void> {
   return apiDel(`/api/proxy-keys/${encodeURIComponent(id)}`, "Failed to delete proxy API key");
+}
+
+/**
+ * Delete (or, with dryRun, list) keys with no activity for maxAgeDays days.
+ */
+export async function cleanupProxyApiKeys(
+  maxAgeDays: number,
+  dryRun: boolean,
+): Promise<ProxyApiKeyCleanupResult> {
+  return apiPost(
+    "/api/proxy-keys/cleanup",
+    { max_age_days: maxAgeDays, dry_run: dryRun },
+    "Failed to clean up proxy API keys",
+  );
 }

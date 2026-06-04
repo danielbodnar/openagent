@@ -168,6 +168,7 @@ fn mint_service_jwt(secret: &str) -> Option<String> {
 struct AssistantMcp {
     api_url: String,
     api_token: Option<String>,
+    jwt_secret: Option<String>,
     client: reqwest::Client,
 }
 
@@ -183,23 +184,24 @@ impl AssistantMcp {
             .or_else(|_| std::env::var("SANDBOXED_API_TOKEN"))
             .or_else(|_| std::env::var("OPEN_AGENT_API_TOKEN"))
             .ok()
-            .filter(|token| !token.trim().is_empty())
-            .or_else(|| {
-                std::env::var("JWT_SECRET")
-                    .ok()
-                    .filter(|secret| !secret.trim().is_empty())
-                    .and_then(|secret| mint_service_jwt(&secret))
-            });
+            .filter(|token| !token.trim().is_empty());
+        let jwt_secret = std::env::var("JWT_SECRET")
+            .ok()
+            .filter(|secret| !secret.trim().is_empty());
         Self {
             api_url,
             api_token,
+            jwt_secret,
             client: reqwest::Client::new(),
         }
     }
 
     fn auth_header(&self) -> Option<(String, String)> {
+        // Prefer an explicit static token; otherwise mint a fresh service JWT
+        // per request so long-running processes never send an expired token.
         self.api_token
-            .as_ref()
+            .clone()
+            .or_else(|| self.jwt_secret.as_deref().and_then(mint_service_jwt))
             .map(|token| ("Authorization".to_string(), format!("Bearer {token}")))
     }
 
@@ -661,6 +663,7 @@ mod tests {
         "HERMES_SANDBOXED_API_TOKEN",
         "SANDBOXED_API_TOKEN",
         "OPEN_AGENT_API_TOKEN",
+        "JWT_SECRET",
         "HERMES_DEFAULT_WORKSPACE_ID",
         "ASSISTANT_DEFAULT_WORKSPACE_ID",
     ];

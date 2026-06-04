@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 
 import {
-  askSend,
+  askSendStream,
   listAskThreads,
   getAskThread,
   deleteAskThread,
@@ -63,6 +63,13 @@ export function AskPanel({
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Id of the assistant bubble currently being streamed into (null between segments).
+  const streamIdRef = useRef<string | null>(null);
+  // Bumped on every send / thread switch so an in-flight post-stream reconcile
+  // fetch can detect it's stale and skip overwriting the current view.
+  const genRef = useRef(0);
+  // Aborts the in-flight stream when a new send / thread switch supersedes it.
+  const abortRef = useRef<AbortController | null>(null);
 
   // Auto-grow the composer with input, capped (lighter than the main composer's
   // 10-line cap). Runs on every input change, including seed prefill and reset.
@@ -86,14 +93,27 @@ export function AskPanel({
   // On mission change: load threads and open the most recent (if any).
   useEffect(() => {
     let cancelled = false;
+    // A mission switch supersedes any in-flight stream from the old mission, and
+    // we clear the old mission's view immediately rather than showing it until
+    // the refetch lands.
+    genRef.current += 1;
+    abortRef.current?.abort();
+    setLoading(false);
+    streamIdRef.current = null;
+    setThreadId(null);
+    setMessages([]);
+    setThreads([]);
+    setError(null);
+    const myGen = genRef.current;
+    const live = () => !cancelled && genRef.current === myGen;
     (async () => {
       const t = await refreshThreads();
-      if (cancelled) return;
+      if (!live()) return;
       if (t.length > 0) {
         setThreadId(t[0].id);
         try {
           const detail = await getAskThread(missionId, t[0].id);
-          if (!cancelled) setMessages(detail.messages ?? []);
+          if (live()) setMessages(detail.messages ?? []);
         } catch {
           /* ignore */
         }
@@ -126,20 +146,30 @@ export function AskPanel({
 
   const selectThread = useCallback(
     async (id: string) => {
+      genRef.current += 1;
+      const myGen = genRef.current;
+      abortRef.current?.abort();
+      setLoading(false);
+      streamIdRef.current = null;
       setShowThreadList(false);
       setThreadId(id);
       setMessages([]);
       try {
         const detail = await getAskThread(missionId, id);
-        setMessages(detail.messages ?? []);
+        // A later switch / send may have superseded this fetch.
+        if (genRef.current === myGen) setMessages(detail.messages ?? []);
       } catch {
-        setMessages([]);
+        if (genRef.current === myGen) setMessages([]);
       }
     },
     [missionId],
   );
 
   const newThread = useCallback(() => {
+    genRef.current += 1;
+    abortRef.current?.abort();
+    setLoading(false);
+    streamIdRef.current = null;
     setShowThreadList(false);
     setThreadId(null);
     setMessages([]);
@@ -152,38 +182,150 @@ export function AskPanel({
     setInput("");
     setError(null);
     setLoading(true);
+    streamIdRef.current = null;
+    genRef.current += 1;
+    const myGen = genRef.current;
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
 
-    // Optimistic user bubble.
-    const tempId = `temp-${Date.now()}`;
+    // Ids of every bubble this turn added, so a failed turn can roll them back
+    // (the backend may not have persisted these fragments).
+    const turnIds: string[] = [];
+    const rollbackTurn = () =>
+      setMessages((prev) => prev.filter((m) => !turnIds.includes(m.id)));
+
+    const now = () => new Date().toISOString();
+    const userId = `u-${Date.now()}`;
+    turnIds.push(userId);
     setMessages((prev) => [
       ...prev,
       {
-        id: tempId,
+        id: userId,
         thread_id: threadId ?? "",
         seq: prev.length + 1,
         role: "user",
         content,
-        created_at: new Date().toISOString(),
+        created_at: now(),
       },
     ]);
 
+    // Append a streamed delta to the current assistant bubble, creating one on
+    // the first fragment (so it lands after any preceding tool rows).
+    // True once a newer send / thread switch has superseded this turn; its
+    // late-arriving stream events must not mutate the current view.
+    const stale = () => genRef.current !== myGen;
+
+    const appendDelta = (text: string) => {
+      if (stale()) return;
+      setMessages((prev) => {
+        const id = streamIdRef.current;
+        if (id) {
+          return prev.map((m) =>
+            m.id === id ? { ...m, content: m.content + text } : m,
+          );
+        }
+        const newId = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        streamIdRef.current = newId;
+        turnIds.push(newId);
+        return [
+          ...prev,
+          {
+            id: newId,
+            thread_id: threadId ?? "",
+            seq: prev.length + 1,
+            role: "assistant",
+            content: text,
+            created_at: now(),
+          },
+        ];
+      });
+    };
+
     try {
-      const res = await askSend(
+      await askSendStream(
         missionId,
         content,
-        threadId ?? undefined,
-        sandbox,
+        { threadId: threadId ?? undefined, sandbox },
+        {
+          onDelta: appendDelta,
+          onToolCall: (t) => {
+            if (stale()) return;
+            streamIdRef.current = null; // close the current assistant segment
+            turnIds.push(`tc-${t.tool_call_id}`);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `tc-${t.tool_call_id}`,
+                thread_id: threadId ?? "",
+                seq: prev.length + 1,
+                role: "tool_call",
+                content: t.args,
+                tool_name: t.name,
+                tool_call_id: t.tool_call_id,
+                created_at: now(),
+              },
+            ]);
+          },
+          onToolResult: (t) => {
+            if (stale()) return;
+            turnIds.push(`tr-${t.tool_call_id}`);
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `tr-${t.tool_call_id}`,
+                thread_id: threadId ?? "",
+                seq: prev.length + 1,
+                role: "tool_result",
+                content: t.result,
+                tool_name: t.name,
+                tool_call_id: t.tool_call_id,
+                created_at: now(),
+              },
+            ]);
+          },
+          onDone: (d) => {
+            if (stale()) return;
+            streamIdRef.current = null;
+            setThreadId(d.thread_id);
+            // Reconcile the locally-streamed bubbles with the canonical
+            // persisted messages (the backend stores tool steps + the final
+            // answer, but not pre-tool interim text).
+            void (async () => {
+              try {
+                const detail = await getAskThread(missionId, d.thread_id);
+                // Skip if a newer send / thread switch / mission change happened.
+                if (genRef.current === myGen) setMessages(detail.messages ?? []);
+              } catch {
+                /* keep the streamed bubbles on failure */
+              }
+              if (genRef.current === myGen) void refreshThreads();
+            })();
+          },
+          onError: (msg) => {
+            if (stale()) return;
+            setError(msg);
+            // Drop this turn's in-progress bubbles and restore the question so
+            // it isn't lost (unless the user already started a new draft).
+            rollbackTurn();
+            setInput((cur) => cur || content);
+          },
+        },
+        ac.signal,
       );
-      setThreadId(res.thread_id);
-      setMessages(res.messages);
-      void refreshThreads();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Ask failed");
-      // Roll back the optimistic bubble.
-      setMessages((prev) => prev.filter((m) => m.id !== tempId));
-      setInput(content);
+      // Superseded turns (thread switch / new send aborted this one) must not
+      // surface an error, roll back, or restore input for the new turn.
+      if (genRef.current === myGen) {
+        setError(e instanceof Error ? e.message : "Ask failed");
+        rollbackTurn();
+        setInput((cur) => cur || content);
+      }
     } finally {
-      setLoading(false);
+      if (genRef.current === myGen) {
+        setLoading(false);
+        streamIdRef.current = null;
+      }
     }
   }, [input, loading, missionId, threadId, sandbox, refreshThreads]);
 
@@ -355,7 +497,7 @@ export function AskPanel({
 
       {/* Composer — mirrors the main mission composer's treatment */}
       <div className="border-t border-[rgb(var(--foreground)/0.1)] p-2.5">
-        <div className="flex items-end gap-2 rounded-xl border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3.5 py-2.5 transition-[border-color] duration-150 ease-out focus-within:border-[rgb(var(--copilot)/0.5)]">
+        <div className="flex items-center gap-2 rounded-xl border border-[rgb(var(--foreground)/0.08)] bg-[rgb(var(--foreground)/0.03)] px-3.5 py-2 transition-[border-color] duration-150 ease-out focus-within:border-[rgb(var(--copilot)/0.5)]">
           <textarea
             ref={textareaRef}
             value={input}
@@ -368,7 +510,7 @@ export function AskPanel({
             }}
             rows={1}
             placeholder="Ask the co-pilot…"
-            className="min-h-[24px] flex-1 resize-none overflow-y-auto bg-transparent text-sm leading-5 text-[rgb(var(--foreground)/0.9)] placeholder:text-[rgb(var(--foreground)/0.4)] focus:outline-none"
+            className="min-h-[20px] flex-1 resize-none overflow-y-auto bg-transparent text-sm leading-5 text-[rgb(var(--foreground)/0.9)] placeholder:text-[rgb(var(--foreground)/0.4)] focus:outline-none"
           />
           <button
             type="button"

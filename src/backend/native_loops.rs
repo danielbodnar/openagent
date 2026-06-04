@@ -110,6 +110,21 @@ impl NativeLoopAdapter for GrokGoal {
     }
 }
 
+// ─── Adapter: OpenCode `/goal` plugin ────────────────────────────────────────
+pub struct OpenCodeGoal;
+
+impl NativeLoopAdapter for OpenCodeGoal {
+    fn harness(&self) -> &'static str {
+        "opencode"
+    }
+    fn command(&self) -> &'static str {
+        "goal"
+    }
+    fn observe(&self, event: &AgentEvent) -> LoopObservation {
+        observe_goal_event(event)
+    }
+}
+
 /// Shared observer for `/goal` — all three harnesses emit `GoalIteration`
 /// and `GoalStatus` events with the same shape, so the classification is
 /// identical.
@@ -136,7 +151,7 @@ fn observe_goal_event(event: &AgentEvent) -> LoopObservation {
 /// Returns the registered adapters in iteration order. Add a new harness here
 /// (and only here) to expose it as a native loop.
 pub fn registry() -> &'static [&'static dyn NativeLoopAdapter] {
-    &[&ClaudeCodeGoal, &CodexGoal, &GrokGoal]
+    &[&ClaudeCodeGoal, &CodexGoal, &GrokGoal, &OpenCodeGoal]
 }
 
 /// Find the adapter for a given (harness, command) pair, if any.
@@ -192,7 +207,7 @@ mod tests {
         assert!(find_adapter("claudecode", "goal").is_some());
         assert!(find_adapter("codex", "goal").is_some());
         assert!(find_adapter("grok", "goal").is_some());
-        assert!(find_adapter("opencode", "goal").is_none());
+        assert!(find_adapter("opencode", "goal").is_some());
         assert!(find_adapter("claudecode", "audit").is_none());
     }
 }

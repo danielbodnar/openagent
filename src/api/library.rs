@@ -1012,7 +1012,18 @@ async fn get_builtin_commands() -> (HeaderMap, Json<BuiltinCommandsResponse>) {
 }
 
 fn build_builtin_commands() -> BuiltinCommandsResponse {
-    let opencode_commands = vec![];
+    let opencode_commands = vec![CommandSummary {
+        name: "goal".to_string(),
+        description: Some(
+            "Loop until the objective is achieved (OpenCode goal plugin)".to_string(),
+        ),
+        path: "builtin-opencode".to_string(),
+        params: vec![CommandParam {
+            name: "objective".to_string(),
+            required: true,
+            description: Some("What the agent should keep iterating on until done".to_string()),
+        }],
+    }];
 
     // Claude Code builtin commands
     let claudecode_commands = vec![

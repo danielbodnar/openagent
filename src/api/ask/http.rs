@@ -4,16 +4,19 @@
 //! They run in the Ask lane: never acquiring the harness lock, never enqueuing
 //! into the mission's message queue, and never writing to `mission_events`.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{Extension, Json};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::store::{AskMessage, AskThread};
-use super::{run_ask_turn, AskClient, AskTurn};
+use super::{run_ask_turn, run_ask_turn_streaming, AskClient, AskTurn};
 use crate::api::auth::AuthUser;
 use crate::api::routes::AppState;
 
@@ -60,6 +63,37 @@ pub struct AskThreadDetail {
     #[serde(flatten)]
     pub thread: AskThread,
     pub messages: Vec<AskMessage>,
+}
+
+/// Resolve the directory the Ask bash tool should run in — the same place the
+/// harness actually ran the mission. Precedence mirrors the mission runner:
+///   1. an explicit `working_directory` override (e.g. an orchestrated worker's
+///      git worktree), but only when it still exists;
+///   2. otherwise the per-mission workspace dir
+///      (`<workspace>/workspaces/mission-<short>`), which is where the backend
+///      ran — `working_directory` is left NULL for ordinary missions, so this
+///      is the common path;
+///   3. a last-resort fall back to the raw workspace root.
+///
+/// Without step 2 the bash tool started at the workspace *base*, forcing the
+/// model to burn its whole iteration budget just locating the project.
+fn resolve_base_work_dir(
+    working_directory: Option<&str>,
+    workspace_path: &std::path::Path,
+    mission_id: Uuid,
+) -> std::path::PathBuf {
+    if let Some(dir) = working_directory.map(std::path::PathBuf::from) {
+        if dir.exists() {
+            return dir;
+        }
+    }
+    let per_mission_dir =
+        crate::workspace::mission_workspace_dir_for_root(workspace_path, mission_id);
+    if per_mission_dir.exists() {
+        per_mission_dir
+    } else {
+        workspace_path.to_path_buf()
+    }
 }
 
 /// POST /api/control/missions/:id/ask — send a question to the Ask assistant.
@@ -124,11 +158,11 @@ pub async fn ask_send(
         Some(mission.workspace_id),
     )
     .await;
-    let base_work_dir = mission
-        .working_directory
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| workspace.path.clone());
+    let base_work_dir = resolve_base_work_dir(
+        mission.working_directory.as_deref(),
+        &workspace.path,
+        mission_id,
+    );
 
     // Optional sandbox-copy isolation: writes go to a throwaway worktree/copy.
     let setup_exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
@@ -180,6 +214,137 @@ pub async fn ask_send(
         answer,
         messages,
     }))
+}
+
+/// POST /api/control/missions/:id/ask/stream — same as `ask_send`, but streams
+/// the answer token-by-token (and tool steps) as Server-Sent Events.
+pub async fn ask_send_stream(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    Json(req): Json<AskSendRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    if req.content.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "content is empty".to_string()));
+    }
+
+    let control = crate::api::control::control_for_user(&state, &user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
+
+    let cfg = crate::api::metadata_llm::build_assistant_llm_config(&state.ai_providers, {
+        state.settings.get().await.ask_assistant_model
+    })
+    .await
+    .ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No assistant LLM configured (set a Cerebras key or ASK_ASSISTANT_MODEL)".to_string(),
+    ))?;
+
+    let ask_store = super::ask_store(&state.config).await.map_err(internal)?;
+
+    let is_new_thread = req.thread_id.is_none();
+    let thread = match req.thread_id {
+        Some(tid) => {
+            let t = ask_store
+                .get_thread(tid)
+                .await
+                .map_err(internal)?
+                .ok_or((StatusCode::NOT_FOUND, "Thread not found".to_string()))?;
+            if t.mission_id != mission_id {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Thread does not belong to this mission".to_string(),
+                ));
+            }
+            t
+        }
+        None => ask_store
+            .create_thread(mission_id, Some(cfg.model.clone()))
+            .await
+            .map_err(internal)?,
+    };
+
+    let workspace = crate::workspace::resolve_workspace(
+        &state.workspaces,
+        &state.config,
+        Some(mission.workspace_id),
+    )
+    .await;
+    let base_work_dir = resolve_base_work_dir(
+        mission.working_directory.as_deref(),
+        &workspace.path,
+        mission_id,
+    );
+
+    // Optional sandbox-copy isolation (same as the synchronous path): set up a
+    // throwaway worktree, run the streamed turn in it, tear it down after.
+    let setup_exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
+    let sandbox_dir = if req.sandbox {
+        super::prepare_sandbox(&setup_exec, &base_work_dir).await
+    } else {
+        None
+    };
+    if req.sandbox && sandbox_dir.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Sandbox mode requires a git workspace (no isolated worktree could be created)"
+                .to_string(),
+        ));
+    }
+    let used_sandbox = sandbox_dir.is_some();
+    let work_dir = sandbox_dir.clone().unwrap_or_else(|| base_work_dir.clone());
+
+    let turn = AskTurn {
+        ask_store: Arc::clone(&ask_store),
+        mission_store: Arc::clone(&control.mission_store),
+        workspace_exec: crate::workspace_exec::WorkspaceExec::new(workspace),
+        work_dir,
+        llm: AskClient::new(state.http_client.clone(), cfg),
+        mission_id,
+        thread_id: thread.id,
+        sandbox: used_sandbox,
+    };
+
+    let content = req.content.clone();
+    let thread_id = thread.id;
+    let title_store = Arc::clone(&ask_store);
+    let cleanup_base = base_work_dir.clone();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<super::AskStreamEvent>();
+    tokio::spawn(async move {
+        let ok = run_ask_turn_streaming(&turn, &content, tx).await;
+        // Only title a new thread if the turn actually produced an answer
+        // (matches the synchronous path, which titles after success).
+        if ok && is_new_thread {
+            let _ = title_store
+                .set_thread_title(thread_id, &derive_title(&content))
+                .await;
+        }
+        if let Some(dir) = &sandbox_dir {
+            super::cleanup_sandbox(&setup_exec, &cleanup_base, dir).await;
+        }
+    });
+
+    let sse = async_stream::stream! {
+        while let Some(ev) = rx.recv().await {
+            // On the (practically impossible) serialize failure, emit a real
+            // error event so the client still receives a terminal frame rather
+            // than a payload-less comment that leaves it hanging.
+            let event = Event::default().event("ask").json_data(&ev).unwrap_or_else(|_| {
+                Event::default()
+                    .event("ask")
+                    .data(r#"{"type":"error","message":"serialize error"}"#)
+            });
+            yield Ok::<Event, Infallible>(event);
+        }
+    };
+
+    Ok(Sse::new(sse).keep_alive(KeepAlive::default()))
 }
 
 /// GET /api/control/missions/:id/ask/threads — list Ask threads for a mission.

@@ -367,6 +367,24 @@ async fn cancel_deferred_request(
     .into_response()
 }
 
+/// Parse a direct `provider/model` id (e.g. `xai/grok-4.3`) into a single
+/// synthetic chain entry, when the prefix is a known provider type. Returns
+/// `None` for ids that aren't `provider/model` with a real provider prefix, so
+/// the caller can reject them (chain-ish ids like `builtin/smart` are matched
+/// as chains before this is tried).
+fn parse_direct_model_entry(model: &str) -> Option<crate::provider_health::ChainEntry> {
+    let (provider, rest) = model.split_once('/')?;
+    if provider.is_empty() || rest.is_empty() {
+        return None;
+    }
+    // Only treat as passthrough when the prefix is a real provider type.
+    crate::ai_providers::ProviderType::from_id(provider)?;
+    Some(crate::provider_health::ChainEntry {
+        provider_id: provider.to_string(),
+        model_id: rest.to_string(),
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Handler
 // ─────────────────────────────────────────────────────────────────────────────
@@ -407,43 +425,61 @@ async fn chat_completions(
     }
     let requested_model = req.model.clone();
 
-    // 2. Check if the model name maps to a chain ID.
-    //    The @ai-sdk/openai-compatible adapter strips the provider prefix, so
-    //    a model override "builtin/smart" arrives as just "smart".  We try:
-    //      1. Exact match (e.g. "builtin/smart")
-    //      2. "builtin/{model}" prefix (e.g. "smart" → "builtin/smart")
-    //    Unknown models return an error — no silent fallback to the default
-    //    chain, so typos and misconfigurations surface immediately.
-    let chain_id = if state.chain_store.get(&requested_model).await.is_some() {
-        requested_model.clone()
+    // 2. Resolve the requested model to chain entries:
+    //    (a) A known chain id — exact, or "builtin/{model}" (the
+    //        @ai-sdk/openai-compatible adapter strips the provider prefix, so
+    //        "builtin/smart" can arrive as "smart").
+    //    (b) Otherwise a direct "provider/model" id (e.g. "xai/grok-4.3"):
+    //        passthrough to that provider's first healthy configured account,
+    //        no stored chain required. This lets clients reach ANY supported
+    //        model, not just the predefined fallback chains.
+    //    Anything else errors — no silent fallback, so typos surface.
+    let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
+
+    let resolved_chain_id = if state.chain_store.get(&requested_model).await.is_some() {
+        Some(requested_model.clone())
     } else {
         let prefixed = format!("builtin/{}", requested_model);
         if state.chain_store.get(&prefixed).await.is_some() {
-            prefixed
+            Some(prefixed)
         } else {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Model '{}' is not a known chain. Available chains can be listed at /api/model-routing/chains",
-                    requested_model
-                ),
-                "model_not_found",
-            );
+            None
         }
     };
 
-    // 3. Resolve chain → expanded entries with health filtering
-    let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
-
-    let entries = state
-        .chain_store
-        .resolve_chain(
-            &chain_id,
-            &state.ai_providers,
-            &standard_accounts,
-            &state.health_tracker,
-        )
-        .await;
+    let (chain_id, entries) = if let Some(id) = resolved_chain_id {
+        let entries = state
+            .chain_store
+            .resolve_chain(
+                &id,
+                &state.ai_providers,
+                &standard_accounts,
+                &state.health_tracker,
+            )
+            .await;
+        (id, entries)
+    } else if let Some(direct) = parse_direct_model_entry(&requested_model) {
+        // Direct provider/model passthrough (single synthetic entry).
+        let entries = state
+            .chain_store
+            .resolve_entries(
+                std::slice::from_ref(&direct),
+                &state.ai_providers,
+                &standard_accounts,
+                &state.health_tracker,
+            )
+            .await;
+        (requested_model.clone(), entries)
+    } else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Model '{}' is not a known chain or a 'provider/model' id. List chains at /api/model-routing/chains and all supported models at /api/providers/catalog.",
+                requested_model
+            ),
+            "model_not_found",
+        );
+    };
 
     if entries.is_empty() {
         if defer_on_rate_limit {
@@ -4115,6 +4151,28 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::StreamExt;
+
+    #[test]
+    fn parse_direct_model_entry_accepts_known_provider_prefix() {
+        let e = parse_direct_model_entry("xai/grok-4.3").expect("known provider");
+        assert_eq!(e.provider_id, "xai");
+        assert_eq!(e.model_id, "grok-4.3");
+        // Model ids may themselves contain slashes (kept after the first split).
+        let e2 = parse_direct_model_entry("openai/codex-mini/latest").expect("known provider");
+        assert_eq!(e2.provider_id, "openai");
+        assert_eq!(e2.model_id, "codex-mini/latest");
+    }
+
+    #[test]
+    fn parse_direct_model_entry_rejects_non_provider_or_bare_ids() {
+        // Unknown prefix (chain-ish / typo) → not a direct passthrough.
+        assert!(parse_direct_model_entry("builtin/smart").is_none());
+        // Bare model id with no provider prefix.
+        assert!(parse_direct_model_entry("grok-4.3").is_none());
+        // Empty halves.
+        assert!(parse_direct_model_entry("xai/").is_none());
+        assert!(parse_direct_model_entry("/grok-4.3").is_none());
+    }
 
     #[test]
     fn parse_duration_simple_seconds() {

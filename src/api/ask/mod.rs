@@ -20,7 +20,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -31,7 +33,10 @@ pub use client::AskClient;
 pub use store::{AskMessage, AskStore, AskThread, OperatorNote};
 
 /// Hard cap on tool-calling iterations per turn — keeps cost/latency bounded.
-const MAX_ITERATIONS: usize = 6;
+/// When the cap is hit mid-investigation, a final tools-disabled pass still
+/// forces a synthesized answer (see the loops below), so this bounds *tool*
+/// rounds rather than guaranteeing a dead end.
+const MAX_ITERATIONS: usize = 10;
 /// Max bytes of any single tool result fed back to the model.
 const MAX_TOOL_RESULT_BYTES: usize = 8_000;
 /// Number of recent mission events seeded into the system prompt.
@@ -158,8 +163,21 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
     }
 
     if final_answer.is_empty() {
-        final_answer =
-            "(The assistant reached the tool-call limit without a final answer.)".to_string();
+        // The loop ended on a tool-calling turn — the model never volunteered a
+        // final answer. Give it one more pass with tools disabled so it must
+        // synthesize from the results it already gathered, rather than bailing
+        // with a canned "tool-call limit" message.
+        match turn.llm.complete(&messages, &[]).await {
+            Ok(c) => {
+                total_tokens += c.total_tokens.unwrap_or(0);
+                final_answer = c.content.unwrap_or_default();
+            }
+            Err(e) => tracing::warn!("[Ask] forced final-answer pass failed: {e}"),
+        }
+        if final_answer.is_empty() {
+            final_answer =
+                "(The assistant reached the tool-call limit without a final answer.)".to_string();
+        }
     }
 
     turn.ask_store
@@ -174,6 +192,192 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
         .await?;
 
     Ok(final_answer)
+}
+
+/// An incremental event from the streaming Ask loop, serialized into SSE.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AskStreamEvent {
+    /// A fragment of the assistant's visible answer.
+    Delta { content: String },
+    /// The assistant invoked a tool.
+    ToolCall {
+        tool_call_id: String,
+        name: String,
+        args: String,
+    },
+    /// A tool returned a result.
+    ToolResult {
+        tool_call_id: String,
+        name: String,
+        result: String,
+    },
+    /// Terminal: the turn finished. Carries the thread id (new threads) and the
+    /// final answer so the client can reconcile.
+    Done { thread_id: Uuid, answer: String },
+    /// Terminal error.
+    Error { message: String },
+}
+
+/// Streaming variant of [`run_ask_turn`]: drives the same agentic loop but emits
+/// [`AskStreamEvent`]s on `tx` as tokens, tool calls, and results arrive.
+/// Returns `true` if the turn completed successfully (a `done` event was sent),
+/// `false` if it failed (an `error` event was sent instead).
+pub async fn run_ask_turn_streaming(
+    turn: &AskTurn,
+    user_content: &str,
+    tx: UnboundedSender<AskStreamEvent>,
+) -> bool {
+    match run_ask_turn_streaming_inner(turn, user_content, &tx).await {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = tx.send(AskStreamEvent::Error { message: e });
+            false
+        }
+    }
+}
+
+async fn run_ask_turn_streaming_inner(
+    turn: &AskTurn,
+    user_content: &str,
+    tx: &UnboundedSender<AskStreamEvent>,
+) -> Result<(), String> {
+    turn.ask_store
+        .append_message(turn.thread_id, "user", user_content, None, None, None)
+        .await?;
+
+    let system = build_system_prompt(turn).await;
+    let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
+    let prior = turn.ask_store.list_messages(turn.thread_id).await?;
+    for m in &prior {
+        match m.role.as_str() {
+            "user" => messages.push(json!({ "role": "user", "content": m.content })),
+            "assistant" => messages.push(json!({ "role": "assistant", "content": m.content })),
+            _ => {}
+        }
+    }
+
+    let tools = tool_definitions();
+    let mut final_answer = String::new();
+    let mut total_tokens: u64 = 0;
+
+    for _ in 0..MAX_ITERATIONS {
+        let txc = tx.clone();
+        let completion = turn
+            .llm
+            .complete_stream(&messages, &tools, |frag| {
+                let _ = txc.send(AskStreamEvent::Delta {
+                    content: frag.to_string(),
+                });
+            })
+            .await?;
+        total_tokens += completion.total_tokens.unwrap_or(0);
+
+        if completion.tool_calls.is_empty() {
+            final_answer = completion.content.unwrap_or_default();
+            break;
+        }
+
+        let assistant_tool_calls: Vec<Value> = completion
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": { "name": tc.name, "arguments": tc.arguments },
+                })
+            })
+            .collect();
+        messages.push(json!({
+            "role": "assistant",
+            "content": completion.content.clone().unwrap_or_default(),
+            "tool_calls": assistant_tool_calls,
+        }));
+
+        for tc in &completion.tool_calls {
+            let _ = tx.send(AskStreamEvent::ToolCall {
+                tool_call_id: tc.id.clone(),
+                name: tc.name.clone(),
+                args: tc.arguments.clone(),
+            });
+            turn.ask_store
+                .append_message(
+                    turn.thread_id,
+                    "tool_call",
+                    &tc.arguments,
+                    Some(tc.name.clone()),
+                    Some(tc.id.clone()),
+                    None,
+                )
+                .await?;
+
+            let result = execute_tool(turn, &tc.name, &tc.arguments).await;
+            let result = truncate(&result, MAX_TOOL_RESULT_BYTES);
+            let _ = tx.send(AskStreamEvent::ToolResult {
+                tool_call_id: tc.id.clone(),
+                name: tc.name.clone(),
+                result: result.clone(),
+            });
+            turn.ask_store
+                .append_message(
+                    turn.thread_id,
+                    "tool_result",
+                    &result,
+                    Some(tc.name.clone()),
+                    Some(tc.id.clone()),
+                    None,
+                )
+                .await?;
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            }));
+        }
+    }
+
+    if final_answer.is_empty() {
+        // Same forced synthesis as the non-streaming path: one more pass with
+        // tools disabled, streamed so the operator sees the answer arrive.
+        let txc = tx.clone();
+        match turn
+            .llm
+            .complete_stream(&messages, &[], |frag| {
+                let _ = txc.send(AskStreamEvent::Delta {
+                    content: frag.to_string(),
+                });
+            })
+            .await
+        {
+            Ok(c) => {
+                total_tokens += c.total_tokens.unwrap_or(0);
+                final_answer = c.content.unwrap_or_default();
+            }
+            Err(e) => tracing::warn!("[Ask] forced final-answer pass (stream) failed: {e}"),
+        }
+        if final_answer.is_empty() {
+            final_answer =
+                "(The assistant reached the tool-call limit without a final answer.)".to_string();
+        }
+    }
+
+    turn.ask_store
+        .append_message(
+            turn.thread_id,
+            "assistant",
+            &final_answer,
+            None,
+            None,
+            Some(json!({ "model": turn.llm.model(), "total_tokens": total_tokens })),
+        )
+        .await?;
+
+    let _ = tx.send(AskStreamEvent::Done {
+        thread_id: turn.thread_id,
+        answer: final_answer,
+    });
+    Ok(())
 }
 
 async fn build_system_prompt(turn: &AskTurn) -> String {
@@ -210,11 +414,16 @@ async fn build_system_prompt(turn: &AskTurn) -> String {
         }
     }
 
+    let cwd = turn.work_dir.display();
     format!(
         "You are the Ask co-pilot for an autonomous coding mission. A separate \
          \"working agent\" is doing the real work in this same workspace; you are a \
          read-mostly assistant helping the operator understand and occasionally nudge \
          what's happening.\n\n\
+         Your bash tool runs in `{cwd}` — this is the mission's workspace and the \
+         working agent's project root. Commands start there and relative paths \
+         resolve against it, so you can `ls`, `cat`, or `git log` directly without \
+         hunting for the project first.\n\n\
          Prefer reading (history, files, logs) over writing. You MAY write to the \
          workspace with the bash tool, but anything you change is reported to the \
          working agent, so keep writes minimal and intentional. The full mission \

@@ -728,6 +728,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             post(crate::api::ask::http::ask_send),
         )
         .route(
+            "/api/control/missions/:id/ask/stream",
+            post(crate::api::ask::http::ask_send_stream),
+        )
+        .route(
             "/api/control/missions/:id/ask/threads",
             get(crate::api::ask::http::list_ask_threads),
         )
@@ -989,6 +993,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/providers/backend-models",
             get(super::providers::list_backend_model_options),
+        )
+        .route(
+            "/api/providers/catalog",
+            get(super::providers::list_full_model_catalog),
+        )
+        .route(
+            "/api/monitoring/memory-health",
+            get(super::monitoring::memory_health_handler),
         )
         // Library management endpoints
         .nest("/api/library", library_api::routes())

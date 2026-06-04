@@ -543,6 +543,108 @@ export async function askSend(
   );
 }
 
+export interface AskStreamHandlers {
+  onDelta: (text: string) => void;
+  onToolCall: (t: { tool_call_id: string; name: string; args: string }) => void;
+  onToolResult: (t: {
+    tool_call_id: string;
+    name: string;
+    result: string;
+  }) => void;
+  onDone: (d: { thread_id: string; answer: string }) => void;
+  onError: (message: string) => void;
+}
+
+/** Streaming variant of {@link askSend}: POSTs to the SSE endpoint and invokes
+ * handlers as token/tool events arrive. */
+export async function askSendStream(
+  missionId: string,
+  content: string,
+  opts: { threadId?: string; sandbox?: boolean },
+  handlers: AskStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const body: { content: string; thread_id?: string; sandbox?: boolean } = {
+    content,
+  };
+  if (opts.threadId) body.thread_id = opts.threadId;
+  if (opts.sandbox) body.sandbox = true;
+
+  const res = await apiFetch(`/api/control/missions/${missionId}/ask/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (res.status === 404) {
+    const fallback = await askSend(missionId, content, opts.threadId, opts.sandbox);
+    handlers.onDelta(fallback.answer);
+    handlers.onDone({ thread_id: fallback.thread_id, answer: fallback.answer });
+    return;
+  }
+  if (!res.ok || !res.body) {
+    handlers.onError(res.ok ? "No response stream" : `Ask failed (${res.status})`);
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let sawTerminal = false;
+
+  const handleFrame = (frame: string) => {
+    const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
+    if (!dataLine) return;
+    const payload = dataLine.slice(5).trim();
+    if (!payload) return;
+    try {
+      const ev = JSON.parse(payload);
+      switch (ev.type) {
+        case "delta":
+          // Guard against a malformed frame missing `content` (avoid appending
+          // the string "undefined").
+          if (typeof ev.content === "string") handlers.onDelta(ev.content);
+          break;
+        case "tool_call":
+          handlers.onToolCall(ev);
+          break;
+        case "tool_result":
+          handlers.onToolResult(ev);
+          break;
+        case "done":
+          sawTerminal = true;
+          handlers.onDone(ev);
+          break;
+        case "error":
+          sawTerminal = true;
+          handlers.onError(ev.message);
+          break;
+      }
+    } catch {
+      /* ignore malformed frame */
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep: number;
+    // SSE frames are separated by a blank line.
+    while ((sep = buf.indexOf("\n\n")) >= 0) {
+      handleFrame(buf.slice(0, sep));
+      buf = buf.slice(sep + 2);
+    }
+  }
+  // Flush any trailing frame the server didn't terminate with a blank line
+  // (e.g. a final `done`), then validate that the stream actually completed.
+  buf += decoder.decode();
+  if (buf.trim()) handleFrame(buf);
+  if (!sawTerminal) {
+    handlers.onError("Stream ended before completion");
+  }
+}
+
 export async function listAskThreads(missionId: string): Promise<AskThread[]> {
   return apiGet<AskThread[]>(
     `/api/control/missions/${missionId}/ask/threads`,
@@ -567,30 +669,6 @@ export async function deleteAskThread(
   return apiDel(
     `/api/control/missions/${missionId}/ask/threads/${threadId}`,
     "Failed to delete Ask thread",
-  );
-}
-
-// Agent tree snapshot (for refresh resilience)
-export interface AgentTreeNode {
-  id: string;
-  node_type: string;
-  name: string;
-  description: string;
-  status: string;
-  budget_allocated: number;
-  budget_spent: number;
-  complexity?: number;
-  selected_model?: string;
-  children: AgentTreeNode[];
-}
-
-// Get tree for a specific mission (either live from memory or saved from database)
-export async function getMissionTree(
-  missionId: string,
-): Promise<AgentTreeNode | null> {
-  return apiGet(
-    `/api/control/missions/${missionId}/tree`,
-    "Failed to fetch mission tree",
   );
 }
 
@@ -1692,6 +1770,8 @@ export async function listLibraryCommands(): Promise<CommandSummary[]> {
 export interface BuiltinCommandsResponse {
   opencode: CommandSummary[];
   claudecode: CommandSummary[];
+  /** Grok builtin commands (sandboxed.sh-driven /goal). */
+  grok?: CommandSummary[];
   /** Codex builtin commands (codex 0.128.0+ — empty on older binaries). */
   codex?: CommandSummary[];
 }
@@ -1701,12 +1781,13 @@ export async function getBuiltinCommands(): Promise<BuiltinCommandsResponse> {
   const res = await apiFetch("/api/library/builtin-commands");
   if (!res.ok) {
     // Fallback to empty if endpoint not available
-    return { opencode: [], claudecode: [], codex: [] };
+    return { opencode: [], claudecode: [], codex: [], grok: [] };
   }
   const json = await res.json();
   return {
     opencode: json.opencode ?? [],
     claudecode: json.claudecode ?? [],
+    grok: json.grok ?? [],
     codex: json.codex ?? [],
   };
 }
@@ -2682,6 +2763,8 @@ export type DesktopSessionStatus =
 
 export interface DesktopSessionDetail {
   display: string;
+  display_server?: "wayland" | "x11" | string;
+  compositor?: string;
   status: DesktopSessionStatus;
   mission_id?: string;
   mission_title?: string;

@@ -3483,10 +3483,16 @@ async fn run_mission_turn(
         "opencode" => {
             // Use per-workspace CLI execution for all workspace types to ensure
             // native bash + correct filesystem scope.
+            let opencode_message_owned: String = if user_message.trim_start().starts_with("/goal ")
+            {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
             run_opencode_turn(
                 &workspace,
                 &mission_work_dir,
-                &convo,
+                &opencode_message_owned,
                 config.default_model.as_deref(),
                 model_effort.as_deref(),
                 effective_agent.as_deref(),
@@ -7168,6 +7174,31 @@ fn package_base(spec: &str) -> &str {
     split_package_spec(spec).0
 }
 
+fn parse_opencode_goal_objective(message: &str) -> Option<String> {
+    let objective = message.trim_start().strip_prefix("/goal ")?.trim();
+    if objective.is_empty() {
+        None
+    } else {
+        Some(objective.to_string())
+    }
+}
+
+fn opencode_goal_terminal_status(final_result: &str) -> Option<&'static str> {
+    let marker = final_result
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim()
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .to_ascii_lowercase();
+
+    match marker.as_str() {
+        "goal:complete" => Some("complete"),
+        "goal:blocked" => Some("blocked"),
+        _ => None,
+    }
+}
+
 fn plugin_module_path(node_modules_dir: &std::path::Path, base: &str) -> std::path::PathBuf {
     if let Some(stripped) = base.strip_prefix('@') {
         if let Some((scope, name)) = stripped.split_once('/') {
@@ -10294,6 +10325,19 @@ pub async fn run_opencode_turn(
     // When no agent is requested, default to vanilla opencode's primary "build" agent.
     let default_agent = if agent.is_none() { Some("build") } else { None };
     let agent = agent.or(default_agent);
+    let opencode_goal_objective = parse_opencode_goal_objective(message);
+    if let Some(objective) = opencode_goal_objective.as_deref() {
+        let _ = events_tx.send(AgentEvent::GoalStatus {
+            status: "active".to_string(),
+            objective: objective.to_string(),
+            mission_id: Some(mission_id),
+        });
+        let _ = events_tx.send(AgentEvent::GoalIteration {
+            iteration: 1,
+            objective: objective.to_string(),
+            mission_id: Some(mission_id),
+        });
+    }
 
     // Use the OpenCode CLI directly for per-workspace execution.
     let workspace_exec = WorkspaceExec::new(workspace.clone());
@@ -10489,6 +10533,16 @@ pub async fn run_opencode_turn(
             ensure_opencode_provider_for_model(&opencode_config_dir_host, app_working_dir, am);
         }
     }
+    let goal_plugin = "opencode-goal-plugin";
+    ensure_opencode_plugin_specs(&opencode_config_dir_host, &[goal_plugin]);
+    ensure_opencode_plugin_installed(
+        &workspace_exec,
+        work_dir,
+        &opencode_config_dir_host,
+        &opencode_config_dir_env,
+        goal_plugin,
+    )
+    .await;
     if needs_google {
         if let Some(project_id) = detect_google_project_id() {
             ensure_opencode_google_project_id(&opencode_config_dir_host, &project_id);
@@ -11917,6 +11971,16 @@ pub async fn run_opencode_turn(
         result_len = final_result.len(),
         "OpenCode CLI execution completed"
     );
+
+    if let Some(objective) = opencode_goal_objective.as_deref() {
+        if let Some(status) = opencode_goal_terminal_status(&final_result) {
+            let _ = events_tx.send(AgentEvent::GoalStatus {
+                status: status.to_string(),
+                objective: objective.to_string(),
+                mission_id: Some(mission_id),
+            });
+        }
+    }
 
     let mut result = if had_error {
         // Use RateLimited terminal reason when rate limit was detected
@@ -14602,8 +14666,9 @@ mod tests {
         is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
         is_success_path_auth_error, is_success_path_provider_payload_error,
         is_success_path_rate_limited_error, is_tool_call_only_output,
-        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
-        opencode_session_token_from_line, parse_opencode_session_token, parse_opencode_sse_event,
+        opencode_goal_terminal_status, opencode_idle_timeout_result_message,
+        opencode_output_needs_fallback, opencode_session_token_from_line,
+        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
         parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
@@ -14758,6 +14823,36 @@ mod tests {
         assert!(codex_is_goal_request("   /goal finish the task"));
         assert!(!codex_is_goal_request("/goal"));
         assert!(!codex_is_goal_request("please run /goal literally"));
+    }
+
+    #[test]
+    fn opencode_goal_objective_requires_slash_goal_prefix() {
+        assert_eq!(
+            parse_opencode_goal_objective("/goal finish the task").as_deref(),
+            Some("finish the task")
+        );
+        assert_eq!(
+            parse_opencode_goal_objective("   /goal finish the task").as_deref(),
+            Some("finish the task")
+        );
+        assert_eq!(parse_opencode_goal_objective("/goal"), None);
+        assert_eq!(
+            parse_opencode_goal_objective("please run /goal literally"),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_goal_terminal_status_reads_final_marker_line() {
+        assert_eq!(
+            opencode_goal_terminal_status("done\n[goal:complete]"),
+            Some("complete")
+        );
+        assert_eq!(
+            opencode_goal_terminal_status("blocked\ngoal:blocked"),
+            Some("blocked")
+        );
+        assert_eq!(opencode_goal_terminal_status("goal complete"), None);
     }
 
     #[test]

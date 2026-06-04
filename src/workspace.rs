@@ -1125,6 +1125,7 @@ async fn write_opencode_config(
             "$schema".to_string(),
             json!("https://opencode.ai/config.json"),
         );
+        ensure_opencode_goal_plugin(base_obj);
         base_obj.insert("mcp".to_string(), serde_json::Value::Object(mcp_map));
         base_obj.insert(
             "permission".to_string(),
@@ -1256,6 +1257,47 @@ async fn write_opencode_config(
     }
 
     Ok(())
+}
+
+fn ensure_opencode_goal_plugin(base_obj: &mut serde_json::Map<String, serde_json::Value>) {
+    const GOAL_PLUGIN: &str = "opencode-goal-plugin";
+
+    let plugin_entry = base_obj
+        .entry("plugin".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !plugin_entry.is_array() {
+        *plugin_entry = serde_json::Value::Array(Vec::new());
+    }
+    if let Some(plugins) = plugin_entry.as_array_mut() {
+        let has_goal_plugin = plugins.iter().any(|entry| match entry {
+            serde_json::Value::String(spec) => spec == GOAL_PLUGIN,
+            serde_json::Value::Array(items) => items
+                .first()
+                .and_then(|value| value.as_str())
+                .map(|spec| spec == GOAL_PLUGIN)
+                .unwrap_or(false),
+            _ => false,
+        });
+        if !has_goal_plugin {
+            plugins.push(json!(GOAL_PLUGIN));
+        }
+    }
+
+    let command_entry = base_obj
+        .entry("command".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !command_entry.is_object() {
+        *command_entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(commands) = command_entry.as_object_mut() {
+        commands.entry("goal".to_string()).or_insert_with(|| {
+            json!({
+                "description": "Set a session-scoped goal and auto-continue until complete.",
+                "template": "$ARGUMENTS",
+                "agent": "build"
+            })
+        });
+    }
 }
 
 /// Write Claude Code `PreToolUse` hooks for workspace execution.
@@ -1778,6 +1820,14 @@ async fn write_codex_config(
     }
 
     let config_payload = update_codex_mcp_config(&existing, &entries);
+    // Codex only streams reasoning summaries when the request asks for them.
+    // The CLI default (`model_reasoning_summary = "auto"`) yields zero
+    // summaries on ChatGPT-OAuth gpt-5.5 turns (verified 2026-06-04: 2770
+    // reasoning items across one day of rollouts, all `summary: []`), so no
+    // `item/reasoning/*` notifications stream, no Thinking events are
+    // emitted, and the Thoughts panel has nothing to persist or replay.
+    // Pin "detailed" unless the profile/operator already set a value.
+    let config_payload = ensure_codex_reasoning_summary(&config_payload);
     tokio::fs::write(&config_path, config_payload).await?;
 
     // Write skills to ~/.codex/skills using Codex's native skills format
@@ -1911,6 +1961,27 @@ fn codex_entry_from_mcp(
             })
         }
     }
+}
+
+/// Ensure the Codex config requests reasoning summaries. TOML top-level keys
+/// must precede the first `[section]`, so the key is prepended. A
+/// `model_reasoning_summary` already present in the top-level prelude (from a
+/// config profile or operator edit) wins — we only add the default when the
+/// key is absent.
+fn ensure_codex_reasoning_summary(config: &str) -> String {
+    let has_key = config
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .any(|line| {
+            line.split('=')
+                .next()
+                .map(|key| key.trim() == "model_reasoning_summary")
+                .unwrap_or(false)
+        });
+    if has_key {
+        return config.to_string();
+    }
+    format!("model_reasoning_summary = \"detailed\"\n\n{}", config)
 }
 
 fn update_codex_mcp_config(existing: &str, entries: &[CodexMcpEntry]) -> String {
@@ -4600,5 +4671,40 @@ mod tests {
         let result = update_codex_mcp_config("", &[]);
         assert!(!result.contains("[otel]"));
         assert!(!result.contains("[mcp_servers"));
+    }
+
+    #[test]
+    fn test_codex_reasoning_summary_added_before_sections() {
+        let config = "[mcp_servers.workspace]\ncommand = \"x\"\n";
+        let result = ensure_codex_reasoning_summary(config);
+        assert!(result.starts_with("model_reasoning_summary = \"detailed\"\n"));
+        // Top-level key must precede the first [section] header.
+        let key_pos = result.find("model_reasoning_summary").unwrap();
+        let section_pos = result.find('[').unwrap();
+        assert!(key_pos < section_pos);
+        assert!(result.contains("[mcp_servers.workspace]"));
+    }
+
+    #[test]
+    fn test_codex_reasoning_summary_respects_profile_override() {
+        let config =
+            "model_reasoning_summary = \"concise\"\n\n[mcp_servers.workspace]\ncommand = \"x\"\n";
+        let result = ensure_codex_reasoning_summary(config);
+        assert_eq!(result, config);
+        assert!(!result.contains("detailed"));
+    }
+
+    #[test]
+    fn test_codex_reasoning_summary_ignores_key_inside_sections() {
+        // A same-named key inside an MCP env table is not a top-level override.
+        let config = "[mcp_servers.workspace.env]\nmodel_reasoning_summary = \"none\"\n";
+        let result = ensure_codex_reasoning_summary(config);
+        assert!(result.starts_with("model_reasoning_summary = \"detailed\"\n"));
+    }
+
+    #[test]
+    fn test_codex_reasoning_summary_on_empty_config() {
+        let result = ensure_codex_reasoning_summary("");
+        assert!(result.starts_with("model_reasoning_summary = \"detailed\"\n"));
     }
 }

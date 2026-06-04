@@ -3173,6 +3173,10 @@ pub struct DesktopSessionInfo {
     pub display: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compositor: Option<String>,
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<String>,
@@ -11224,7 +11228,7 @@ async fn control_actor_loop(
                                 // Desktop session detection from ToolCall.
                                 // Claude Code does not emit ToolResult for MCP tools,
                                 // so we detect the session start from the ToolCall and
-                                // spawn a background task to attribute Xvfb processes.
+                                // spawn a background task to attribute Wayland compositor processes.
                                 let is_desktop_start = matches!(
                                     name.as_str(),
                                     "desktop_start_session"
@@ -11234,16 +11238,16 @@ async fn control_actor_loop(
                                 if is_desktop_start {
                                     let store = mission_store.clone();
                                     let mid = *mid;
+                                    let working_dir = config.working_dir.clone();
                                     tokio::spawn(async move {
-                                        // Wait for Xvfb to start
+                                        // Wait for the compositor to start.
                                         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
 
-                                        // Scan for running Xvfb displays
                                         let displays =
-                                            super::desktop::get_running_xvfb_displays().await;
+                                            super::desktop::get_running_wayland_displays(&working_dir).await;
                                         if displays.is_empty() {
                                             tracing::debug!(
-                                                "No Xvfb displays found for desktop attribution"
+                                                "No Wayland displays found for desktop attribution"
                                             );
                                             return;
                                         }
@@ -11263,6 +11267,8 @@ async fn control_actor_loop(
                                                 sessions.push(DesktopSessionInfo {
                                                     display: disp.clone(),
                                                     resolution: None,
+                                                    display_server: Some("wayland".to_string()),
+                                                    compositor: Some("sway-headless".to_string()),
                                                     started_at: now_string(),
                                                     stopped_at: None,
                                                     screenshots_dir: None,
@@ -11416,6 +11422,16 @@ async fn control_actor_loop(
                                 .get("screenshots_dir")
                                 .and_then(|v| v.as_str())
                                 .map(|v| v.to_string());
+                            let display_server = obj
+                                .get("display_server")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string())
+                                .or_else(|| Some("wayland".to_string()));
+                            let compositor = obj
+                                .get("compositor")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v.to_string())
+                                .or_else(|| Some("sway-headless".to_string()));
                             let browser = obj
                                 .get("browser")
                                 .and_then(|v| v.as_str())
@@ -11431,6 +11447,8 @@ async fn control_actor_loop(
                                 .find(|session| session.display == display && session.stopped_at.is_none())
                             {
                                 existing.resolution = resolution;
+                                existing.display_server = display_server;
+                                existing.compositor = compositor;
                                 existing.screenshots_dir = screenshots_dir;
                                 existing.browser = browser;
                                 existing.url = url;
@@ -11439,6 +11457,8 @@ async fn control_actor_loop(
                                 sessions.push(DesktopSessionInfo {
                                     display,
                                     resolution,
+                                    display_server,
+                                    compositor,
                                     started_at: now.clone(),
                                     stopped_at: None,
                                     screenshots_dir,

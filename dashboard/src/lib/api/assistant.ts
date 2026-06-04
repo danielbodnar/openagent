@@ -167,6 +167,18 @@ export async function searchAssistantGatewayMemory(
   );
 }
 
+export async function sendAssistantGatewayTestMessage(
+  gatewayId: string,
+  chatId: number,
+  text = "✅ Test message from the sandboxed.sh dashboard."
+): Promise<void> {
+  await apiPost(
+    "/api/control/telegram/send",
+    { channel_id: gatewayId, chat_id: chatId, text },
+    "Failed to send test message"
+  );
+}
+
 export async function adoptHermesAssistant(
   input: AdoptHermesAssistantInput
 ): Promise<AdoptHermesAssistantResult> {
@@ -181,5 +193,27 @@ export async function getHermesAssistantStatus(): Promise<HermesAssistantStatus>
   return apiGet<HermesAssistantStatus>(
     "/api/system/hermes-assistant/status",
     "Failed to fetch Hermes assistant status"
+  );
+}
+
+export interface HermesSkill {
+  name: string;
+  description: string | null;
+  category: string | null;
+  version: string | null;
+  path: string;
+}
+
+export interface HermesSkillsResponse {
+  root: string;
+  available: boolean;
+  skills: HermesSkill[];
+}
+
+/** Skills the Hermes runtime installed for itself (agentskills.io / skills.sh). */
+export async function listHermesAssistantSkills(): Promise<HermesSkillsResponse> {
+  return apiGet<HermesSkillsResponse>(
+    "/api/system/hermes-assistant/skills",
+    "Failed to fetch Hermes assistant skills"
   );
 }

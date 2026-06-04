@@ -3,8 +3,14 @@
 import { useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
 import { CheckCircle, XCircle, Loader, DollarSign, BarChart3 } from 'lucide-react';
-import { getStats, type Mission, type StatsResponse } from '@/lib/api';
-import { formatCents, cn } from '@/lib/utils';
+import {
+  getStats,
+  getUsageSummary,
+  type Mission,
+  type StatsResponse,
+  type UsageSummary,
+} from '@/lib/api';
+import { formatCentsCompact, cn } from '@/lib/utils';
 import { stableJsonCompare } from '@/lib/swr-config';
 
 interface LastDaySummaryProps {
@@ -33,6 +39,19 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
     },
   );
 
+  // Mission stats `total_cost_cents` is unpopulated (per-mission cost is
+  // never recorded), so "Spent" reads aggregated AI usage records — the
+  // same source as the Providers page — scoped to the rolling 24h window.
+  const { data: usage24h, isLoading: usageLoading } = useSWR<UsageSummary>(
+    ['usage-summary', '24h'],
+    () => getUsageSummary('24h'),
+    {
+      refreshInterval: 30_000,
+      revalidateOnFocus: false,
+      compare: stableJsonCompare,
+    },
+  );
+
   const activeCount = runningMissionIds.size;
 
   const updatedLast24h = useMemo(
@@ -52,7 +71,7 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
 
   const completed = dayStats?.completed_tasks ?? finishedLast24h;
   const failed = dayStats?.failed_tasks ?? failedLast24h;
-  const spent = dayStats?.total_cost_cents ?? 0;
+  const spent = usage24h?.totals.cost_cents ?? 0;
   const hourlyBuckets = useMemo(
     () => buildHourlyBuckets(updatedLast24h, cutoff),
     [updatedLast24h, cutoff],
@@ -95,9 +114,9 @@ export function LastDaySummary({ missions, runningMissionIds }: LastDaySummaryPr
         <SummaryTile
           icon={DollarSign}
           label="Spent"
-          value={formatCents(spent)}
+          value={formatCentsCompact(spent)}
           tone="muted"
-          loading={isLoading}
+          loading={usageLoading}
         />
       </div>
 

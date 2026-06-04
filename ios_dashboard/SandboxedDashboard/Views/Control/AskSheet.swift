@@ -18,6 +18,10 @@ struct AskSheet: View {
     @State private var input: String = ""
     @State private var isLoading = false
     @State private var errorText: String?
+    // Id of the assistant bubble currently being streamed into (nil between segments).
+    @State private var streamId: String?
+    // Bumped on send / thread switch so a stale post-stream sync can be skipped.
+    @State private var streamGen = 0
 
     private let api = APIService.shared
     private let copilot = Color.cyan
@@ -32,7 +36,19 @@ struct AskSheet: View {
             .navigationTitle("Ask")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { toolbarContent }
-            .task { await loadThreads() }
+            // Re-run when the mission changes while the sheet stays open: a
+            // bare `.task` would keep the old mission's threads (and let a
+            // superseded stream mutate the view). `id:` restarts it per mission.
+            .task(id: missionId) {
+                streamGen += 1
+                isLoading = false
+                streamId = nil
+                threadId = nil
+                messages = []
+                threads = []
+                errorText = nil
+                await loadThreads()
+            }
         }
     }
 
@@ -46,8 +62,14 @@ struct AskSheet: View {
                         emptyState
                     }
                     ForEach(messages) { message in
-                        AskBubble(message: message, copilot: copilot, onSendToAgent: onSendToAgent)
-                            .id(message.id)
+                        AskBubble(
+                            message: message,
+                            copilot: copilot,
+                            onSendToAgent: onSendToAgent,
+                            onRetry: message.sendState.isFailed
+                                ? { Task { await retry(message) } } : nil
+                        )
+                        .id(message.id)
                     }
                     if isLoading {
                         HStack(spacing: 6) {
@@ -176,16 +198,24 @@ struct AskSheet: View {
     }
 
     private func selectThread(_ id: String) async {
+        streamGen += 1
+        let gen = streamGen
+        isLoading = false
+        streamId = nil
         threadId = id
         do {
             let detail = try await api.getAskThread(missionId: missionId, threadId: id)
-            messages = detail.messages
+            // A later switch / send may have superseded this fetch.
+            if gen == streamGen { messages = detail.messages }
         } catch {
-            messages = []
+            if gen == streamGen { messages = [] }
         }
     }
 
     private func newThread() {
+        streamGen += 1
+        isLoading = false
+        streamId = nil
         threadId = nil
         messages = []
         input = ""
@@ -196,35 +226,179 @@ struct AskSheet: View {
         let content = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty, !isLoading else { return }
         input = ""
+        let userId = "u-\(UUID().uuidString)"
+        messages.append(
+            AskMessage(
+                id: userId,
+                threadId: threadId ?? "",
+                seq: messages.count + 1,
+                role: "user",
+                content: content,
+                toolName: nil,
+                toolCallId: nil,
+                createdAt: isoNow(),
+                sendState: .pending
+            )
+        )
+        await runTurn(userMessageId: userId, content: content)
+    }
+
+    /// Re-run a co-pilot turn for a user message whose send failed. Reuses the
+    /// existing bubble (no duplicate) with the same rollback semantics.
+    private func retry(_ message: AskMessage) async {
+        guard message.isUser, message.sendState.isFailed, !isLoading else { return }
+        await runTurn(userMessageId: message.id, content: message.content)
+    }
+
+    /// Drives one streamed co-pilot turn. The user bubble is **preserved**
+    /// across failures (flipped to `.failed` with a tap-to-retry) instead of
+    /// being rolled back — mirroring the main mission composer so a dropped
+    /// message never silently vanishes. Only this turn's streamed
+    /// assistant/tool bubbles roll back on failure.
+    private func runTurn(userMessageId: String, content: String) async {
         errorText = nil
         isLoading = true
+        streamId = nil
+        streamGen += 1
+        let gen = streamGen
+        if let i = messages.firstIndex(where: { $0.id == userMessageId }) {
+            messages[i].sendState = .pending
+        }
+        // Roll-back boundary: keep everything up to and including the user
+        // bubble; drop streamed bubbles appended during this turn on failure.
+        let baseCount =
+            messages.firstIndex(where: { $0.id == userMessageId }).map { $0 + 1 }
+            ?? messages.count
 
-        // Optimistic user bubble.
-        let optimistic = AskMessage(
-            id: "temp-\(UUID().uuidString)",
-            threadId: threadId ?? "",
-            seq: messages.count + 1,
-            role: "user",
-            content: content,
-            toolName: nil,
-            toolCallId: nil,
-            createdAt: ISO8601DateFormatter().string(from: Date())
-        )
-        messages.append(optimistic)
-
+        var failure: String?
         do {
-            let response = try await api.postAsk(missionId: missionId, content: content, threadId: threadId)
-            threadId = response.threadId
-            messages = response.messages
-            if let refreshed = try? await api.listAskThreads(missionId: missionId) {
-                threads = refreshed
+            for try await ev in api.askStream(
+                missionId: missionId,
+                content: content,
+                threadId: threadId
+            ) {
+                // A newer send / thread switch superseded this turn.
+                if gen != streamGen { return }
+                // First event back means the backend accepted the message.
+                if let i = messages.firstIndex(where: { $0.id == userMessageId }),
+                    messages[i].sendState.isPending
+                {
+                    messages[i].sendState = .sent
+                }
+                handleStreamEvent(ev)
             }
         } catch {
-            errorText = error.localizedDescription
-            messages.removeAll { $0.id == optimistic.id }
-            input = content
+            if gen == streamGen { failure = error.localizedDescription }
+        }
+
+        // Superseded — a newer turn owns the list and the loading flag now.
+        if gen != streamGen { return }
+
+        if let failure {
+            // Preserve the user bubble (failed + retry); drop streamed bubbles.
+            if messages.count > baseCount {
+                messages = Array(messages.prefix(baseCount))
+            }
+            if let i = messages.firstIndex(where: { $0.id == userMessageId }) {
+                messages[i].sendState = .failed(reason: failure)
+            }
+        } else if let i = messages.firstIndex(where: { $0.id == userMessageId }) {
+            messages[i].sendState = .sent
         }
         isLoading = false
+        streamId = nil
+    }
+
+    private func isoNow() -> String {
+        ISO8601DateFormatter().string(from: Date())
+    }
+
+    private func handleStreamEvent(_ ev: AskStreamEvent) {
+        switch ev.type {
+        case "delta":
+            guard let text = ev.content else { return }
+            if let id = streamId,
+                let idx = messages.firstIndex(where: { $0.id == id })
+            {
+                let m = messages[idx]
+                messages[idx] = AskMessage(
+                    id: m.id,
+                    threadId: m.threadId,
+                    seq: m.seq,
+                    role: m.role,
+                    content: m.content + text,
+                    toolName: nil,
+                    toolCallId: nil,
+                    createdAt: m.createdAt
+                )
+            } else {
+                let id = "a-\(UUID().uuidString)"
+                streamId = id
+                messages.append(
+                    AskMessage(
+                        id: id,
+                        threadId: threadId ?? "",
+                        seq: messages.count + 1,
+                        role: "assistant",
+                        content: text,
+                        toolName: nil,
+                        toolCallId: nil,
+                        createdAt: isoNow()
+                    )
+                )
+            }
+        case "tool_call":
+            streamId = nil
+            messages.append(
+                AskMessage(
+                    id: "tc-\(ev.toolCallId ?? UUID().uuidString)",
+                    threadId: threadId ?? "",
+                    seq: messages.count + 1,
+                    role: "tool_call",
+                    content: ev.args ?? "",
+                    toolName: ev.name,
+                    toolCallId: ev.toolCallId,
+                    createdAt: isoNow()
+                )
+            )
+        case "tool_result":
+            messages.append(
+                AskMessage(
+                    id: "tr-\(ev.toolCallId ?? UUID().uuidString)",
+                    threadId: threadId ?? "",
+                    seq: messages.count + 1,
+                    role: "tool_result",
+                    content: ev.result ?? "",
+                    toolName: ev.name,
+                    toolCallId: ev.toolCallId,
+                    createdAt: isoNow()
+                )
+            )
+        case "done":
+            streamId = nil
+            let tid = ev.threadId
+            if let tid { threadId = tid }
+            let gen = streamGen
+            Task {
+                if let refreshed = try? await api.listAskThreads(missionId: missionId),
+                    gen == streamGen
+                {
+                    threads = refreshed
+                }
+                // Reconcile the streamed bubbles with the canonical persisted
+                // messages, unless a newer send / thread switch superseded this.
+                if let tid,
+                    let detail = try? await api.getAskThread(missionId: missionId, threadId: tid),
+                    gen == streamGen, threadId == tid
+                {
+                    messages = detail.messages
+                }
+            }
+        // "error" events are surfaced via the throw path in askStream, so they
+        // flow through send()'s catch (gen-guarded rollback + restore).
+        default:
+            break
+        }
     }
 
     private func clearThread() async {
@@ -243,18 +417,62 @@ private struct AskBubble: View {
     let message: AskMessage
     let copilot: Color
     var onSendToAgent: ((String) -> Void)?
+    var onRetry: (() -> Void)? = nil
 
     var body: some View {
         if message.isUser {
             HStack {
                 Spacer(minLength: 40)
-                Text(message.content)
-                    .font(.subheadline)
-                    .foregroundStyle(Theme.textPrimary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Theme.card)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(message.content)
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.textPrimary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            message.sendState.isFailed
+                                ? Theme.error.opacity(0.18) : Theme.card
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .stroke(
+                                    message.sendState.isFailed ? Theme.error : Color.clear,
+                                    lineWidth: 1
+                                )
+                        )
+                        // Dim + spinner while awaiting backend ack; this is the
+                        // co-pilot peer of the main composer's pending bubble.
+                        .opacity(message.sendState.isPending ? 0.55 : 1)
+                        .overlay(alignment: .bottomTrailing) {
+                            if message.sendState.isPending {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .padding(6)
+                            } else if message.sendState.isFailed {
+                                Image(systemName: "exclamationmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(Theme.error)
+                                    .padding(6)
+                            }
+                        }
+                        .animation(.easeOut(duration: 0.15), value: message.sendState.isPending)
+                        .animation(.easeOut(duration: 0.15), value: message.sendState.isFailed)
+                    // Inline "Not sent · Tap to retry" — preserves the message
+                    // on screen instead of dropping it on a failed turn.
+                    if message.sendState.isFailed {
+                        Button { onRetry?() } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.clockwise.circle.fill")
+                                    .font(.caption2)
+                                Text("Not sent · Tap to retry")
+                                    .font(.caption2.weight(.medium))
+                            }
+                            .foregroundStyle(Theme.error)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
             }
         } else if message.isTool {
             HStack(alignment: .top, spacing: 6) {

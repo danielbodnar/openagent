@@ -9,6 +9,16 @@ export function formatCents(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
 }
 
+/** Compact cost for tight stat tiles: $0.42, $12.34, $1.2k, $105k. */
+export function formatCentsCompact(cents: number): string {
+  const dollars = cents / 100;
+  if (dollars >= 1000) {
+    const k = dollars / 1000;
+    return `$${k >= 100 ? Math.round(k) : k.toFixed(1)}k`;
+  }
+  return formatCents(cents);
+}
+
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;

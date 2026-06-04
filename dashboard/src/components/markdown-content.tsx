@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect, useMemo, useRef, memo } from "react";
+import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef, memo } from "react";
 import { createRoot } from "react-dom/client";
 import Markdown, { Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -138,6 +138,16 @@ function releaseImageUrl(path: string): void {
     imageUrlCache.delete(path);
   }
 }
+
+// Rendered dimensions of inline images, keyed by resolved path. Inline
+// previews live inside a virtualized timeline: rows unmount as the user
+// scrolls away and remount on the way back, and every remount that paints
+// a placeholder whose height differs from the final image shifts all rows
+// below it (the virtualizer re-measures both states). Recording the
+// laid-out size on first load lets remounts (and the loading skeleton)
+// reserve the exact final box, so re-measures are no-ops and the scroll
+// position stays put.
+const imageDimsCache = new Map<string, { width: number; height: number }>();
 
 function isFilePath(str: string): boolean {
   const hasExtension = FILE_EXTENSIONS.some(ext => str.toLowerCase().endsWith(ext));
@@ -736,8 +746,17 @@ function InlineImagePreview({
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Bumped in `onLoad` after recording the image's dimensions so the
+  // render below re-reads `imageDimsCache` and swaps the pre-decode
+  // reservation for the exact final box.
+  const [, setDimsVersion] = useState(0);
 
-  useEffect(() => {
+  // Layout effect (not useEffect): the cached-URL path is synchronous, so
+  // running before paint means a remounted preview (virtualized row
+  // scrolled back into view) commits the real `<img>` without ever
+  // painting the loading skeleton — the timeline virtualizer never sees
+  // the intermediate (shorter) box and rows below don't jump.
+  useLayoutEffect(() => {
     // Reset between effect runs so a previous error/blob doesn't leak when
     // `resolvedPath` changes (e.g. `basePath` resolves after first paint).
     setImageUrl(null);
@@ -807,9 +826,19 @@ function InlineImagePreview({
   // the skeleton. `<span>` (not `<div>`) keeps this valid inside the `<p>`
   // that react-markdown wraps around `![alt](url)` so hydration doesn't
   // tear the subtree.
+  //
+  // When this image has rendered before, reserve its exact laid-out box so
+  // the skeleton → image swap is layout-neutral (critical inside the
+  // virtualized timeline — see `imageDimsCache`). Otherwise default to
+  // 300px: `max-h-[300px]` makes that the final height for any screenshot
+  // taller than 300px, which is the overwhelmingly common case, so the
+  // first-load shift is usually zero instead of +100px per image.
+  const knownDims = resolvedPath ? imageDimsCache.get(resolvedPath) : undefined;
   const placeholderClass =
     "my-2 block rounded-xl overflow-hidden border border-white/[0.06] bg-white/[0.03]";
-  const placeholderStyle = { maxWidth: 400, height: 200 } as const;
+  const placeholderStyle = knownDims
+    ? { width: knownDims.width, height: knownDims.height, maxWidth: "100%" as const }
+    : ({ maxWidth: 400, height: 300 } as const);
 
   if (error) {
     return (
@@ -837,6 +866,33 @@ function InlineImagePreview({
         src={imageUrl}
         alt={alt}
         className="max-h-[300px] rounded-xl border border-white/[0.06] cursor-pointer hover:border-white/[0.12] transition-colors"
+        // Pin the box to the remembered size so the row's height is stable
+        // from the very first commit, even before the blob is decoded
+        // (an `<img>` has no intrinsic size until decode completes, which
+        // is async even for cached blob URLs). Without remembered dims —
+        // e.g. the URL is cached but the row unmounted before `onLoad`
+        // ever fired — reserve the 300px fallback height instead of
+        // letting the box collapse to its (zero) pre-decode size; `onLoad`
+        // then records the real dims and re-renders with the exact box.
+        style={
+          knownDims
+            ? { width: knownDims.width, height: knownDims.height, maxWidth: "100%" }
+            : { height: 300, maxWidth: "100%" }
+        }
+        onLoad={(e) => {
+          const img = e.currentTarget;
+          // Derive the final box from the intrinsic size and the
+          // max-h-[300px] rule rather than offsetWidth/offsetHeight: the
+          // pre-decode `height: 300` pin is still applied at this point,
+          // so the laid-out box of a shorter image would read as
+          // (stretched) 300px and get cached wrong.
+          if (resolvedPath && img.naturalWidth > 0 && img.naturalHeight > 0) {
+            const height = Math.min(300, img.naturalHeight);
+            const width = Math.round((img.naturalWidth / img.naturalHeight) * height);
+            imageDimsCache.set(resolvedPath, { width, height });
+            setDimsVersion((v) => v + 1);
+          }
+        }}
         onClick={() => showFilePreviewModal(path, resolvedPath ?? path, workspaceId, missionId)}
       />
     </span>

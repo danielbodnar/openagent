@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(:root[data-theme="dark"] *));
+
 /* Terminal font (JetBrainsMono Nerd Font Mono) */
 @font-face {
   font-family: "JetBrainsMono Nerd Font Mono";
@@ -340,6 +342,7 @@ select:focus-visible {
   [class~="text-indigo-400/70"],
   [class~="text-indigo-400/60"],
   [class~="text-indigo-400/50"],
+  [class~="text-indigo-300/80"],
   [class~="text-indigo-300/60"] {
     color: rgb(79 70 229 / 0.86);
   }
@@ -360,7 +363,8 @@ select:focus-visible {
   }
 
   [class~="text-emerald-400/80"],
-  [class~="text-emerald-400/60"] {
+  [class~="text-emerald-400/60"],
+  [class~="text-emerald-500/70"] {
     color: rgb(4 120 87 / 0.88);
   }
 
@@ -368,6 +372,16 @@ select:focus-visible {
   [class~="text-amber-300"],
   [class~="text-amber-200"] {
     color: rgb(180 83 9);
+  }
+
+  [class~="text-amber-400/80"],
+  [class~="text-amber-400/70"],
+  [class~="text-amber-400/60"],
+  [class~="text-amber-300/80"],
+  [class~="text-amber-200/80"],
+  [class~="text-amber-500/70"],
+  [class~="text-amber-500/50"] {
+    color: rgb(180 83 9 / 0.9);
   }
 
   [class~="text-orange-400"],
@@ -379,13 +393,18 @@ select:focus-visible {
     color: rgb(185 28 28);
   }
 
-  [class~="text-red-400/70"] {
+  [class~="text-red-400/80"],
+  [class~="text-red-400/70"],
+  [class~="text-red-400/60"],
+  [class~="text-red-400/50"] {
     color: rgb(185 28 28 / 0.85);
   }
 
   [class~="text-red-300"],
   [class~="text-red-200"],
-  [class~="text-red-300/80"] {
+  [class~="text-red-300/80"],
+  [class~="text-red-300/70"],
+  [class~="text-red-300/50"] {
     color: rgb(185 28 28 / 0.9);
   }
 
@@ -402,6 +421,46 @@ select:focus-visible {
   [class~="text-violet-300"],
   [class~="text-violet-400"] {
     color: rgb(109 40 217);
+  }
+
+  [class~="text-sky-300"],
+  [class~="text-sky-400"] {
+    color: rgb(3 105 161);
+  }
+
+  [class~="text-sky-400/60"] {
+    color: rgb(3 105 161 / 0.85);
+  }
+
+  [class~="text-blue-400"] {
+    color: rgb(29 78 216);
+  }
+
+  [class~="text-blue-400/80"],
+  [class~="text-blue-400/60"],
+  [class~="text-blue-400/50"] {
+    color: rgb(29 78 216 / 0.85);
+  }
+
+  [class~="text-purple-300"],
+  [class~="text-purple-400"] {
+    color: rgb(126 34 206);
+  }
+
+  [class~="text-purple-400/60"] {
+    color: rgb(126 34 206 / 0.85);
+  }
+
+  [class~="text-yellow-400"] {
+    color: rgb(161 98 7);
+  }
+
+  [class~="text-teal-400"] {
+    color: rgb(15 118 110);
+  }
+
+  [class~="text-pink-400"] {
+    color: rgb(190 24 93);
   }
 
   /* Tinted surfaces beyond indigo — let the soft fills render with light-theme
@@ -544,11 +603,15 @@ select:focus-visible {
     border-color: rgb(17 24 39 / 0.16);
   }
 
+  [class~="bg-black/10"],
   [class~="bg-black/20"],
+  [class~="bg-black/30"],
   [class~="bg-black/40"],
   [class~="bg-black/50"],
   [class~="bg-black/60"],
-  [class~="bg-black/80"] {
+  [class~="bg-black/70"],
+  [class~="bg-black/80"],
+  [class~="bg-black/85"] {
     background-color: rgb(255 255 255 / 0.82);
   }
 
@@ -557,6 +620,7 @@ select:focus-visible {
   [class~="bg-[#1a1a1f]"],
   [class~="bg-[#1a1a2e]"],
   [class~="bg-[#1c1c1e]/95"],
+  [class~="bg-[#161618]"],
   [class~="bg-[#121214]"],
   [class~="bg-[#111113]"],
   [class~="bg-[#0f0f11]"] {
@@ -580,6 +644,7 @@ select:focus-visible {
   [class*="bg-emerald-"][class*="text-white"],
   [class*="bg-green-"][class*="text-white"],
   [class*="bg-blue-"][class*="text-white"],
+  [class*="bg-sky-"][class*="text-white"],
   [class*="bg-cyan-"][class*="text-white"],
   [class*="bg-amber-"][class*="text-white"],
   [class*="bg-orange-"][class*="text-white"] {

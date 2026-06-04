@@ -6187,7 +6187,7 @@ async fn check_provider_health(
             (
                 "https://api.minimax.io/v1/chat/completions",
                 serde_json::json!({
-                    "model": "MiniMax-M2",
+                    "model": "MiniMax-M3",
                     "messages": [{"role": "user", "content": "test"}],
                     "max_tokens": 1
                 }),
@@ -6872,7 +6872,7 @@ async fn get_provider_usage(
                         .header("Authorization", format!("Bearer {}", key))
                         .header("Content-Type", "application/json")
                         .json(&serde_json::json!({
-                            "model": "MiniMax-M2",
+                            "model": "MiniMax-M3",
                             "max_tokens": 1,
                             "messages": [{"role": "user", "content": "hi"}]
                         }))
