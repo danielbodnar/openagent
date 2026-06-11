@@ -144,9 +144,9 @@ struct QueueItemRow: View {
 #Preview("With Items") {
     QueueSheet(
         items: [
-            QueuedMessage(id: "1", content: "Can you also fix the login bug?", agent: nil),
-            QueuedMessage(id: "2", content: "Run the tests after that", agent: "claude"),
-            QueuedMessage(id: "3", content: "This is a much longer message that should get truncated at some point to prevent it from taking up too much space in the queue list view", agent: nil)
+            QueuedMessage(id: "1", content: "Can you also fix the login bug?", agent: nil, missionId: nil),
+            QueuedMessage(id: "2", content: "Run the tests after that", agent: "claude", missionId: nil),
+            QueuedMessage(id: "3", content: "This is a much longer message that should get truncated at some point to prevent it from taking up too much space in the queue list view", agent: nil, missionId: nil)
         ],
         onRemove: { _ in },
         onClearAll: {},

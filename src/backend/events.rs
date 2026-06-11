@@ -48,6 +48,10 @@ pub enum ExecutionEvent {
     /// Carries the canonical status string from codex's `thread/goal/updated`
     /// notification. UI renders this as a goal-state pill.
     GoalStatus { status: String, objective: String },
+    /// Backend acknowledged caller-initiated cancellation. This stays separate
+    /// from a generic error so mission_runner can preserve interrupted
+    /// semantics while still flushing any prior output.
+    Cancelled,
     /// Message execution completed.
     MessageComplete { session_id: String },
     /// Error occurred.

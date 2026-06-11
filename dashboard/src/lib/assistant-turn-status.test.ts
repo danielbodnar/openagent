@@ -72,4 +72,21 @@ describe("deriveAssistantTurnStatus", () => {
     expect(status.label).toBe("Failed");
     expect(status.showResume).toBe(true);
   });
+
+  it("renders InfiniteLoop as 'cut short' (model emitted a degenerate loop)", () => {
+    // ab260b2e incident: Claude Code streamed "Yielding pending your
+    // choice." for 50 minutes, costing $110.99, before the model hit
+    // max_tokens. The backend's degenerate-stream detector now kills the
+    // CLI and emits TerminalReason::InfiniteLoop with a partial output
+    // summary. The user should see an amber 'cut short' pill (distinct
+    // from generic red 'Failed') and a resume button — the next turn can
+    // proceed without the loop.
+    const status = deriveAssistantTurnStatus({
+      success: false,
+      terminalReason: "InfiniteLoop",
+    });
+    expect(status.label).toBe("Model entered a repetitive loop — cut short");
+    expect(status.iconClass).toBe("text-amber-400");
+    expect(status.showResume).toBe(true);
+  });
 });

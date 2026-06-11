@@ -9,12 +9,42 @@
 
 ## Backend Services (Thomas)
 
-Thomas's server runs two instances:
+Thomas's server runs two sandboxed.sh instances plus the Hermes assistant stack:
 
 | Service | Port | Domain | Binary |
 |---------|------|--------|--------|
 | `sandboxed-sh-prod` | 3000 | agent-backend.thomas.md | `/usr/local/bin/sandboxed-sh-prod` |
 | `sandboxed-sh-dev` | 3002 | agent-backend-dev.thomas.md | `/usr/local/bin/sandboxed-sh-dev` |
+| `hermes-assistant` | 8642 (loopback) | agent-backend.thomas.md `/hermes-remote` | `/usr/local/bin/hermes` (gateway) |
+| `hermes-dashboard` | 9130 (loopback) | agent-backend.thomas.md `/hermes-desktop` | `/usr/local/bin/hermes` (dashboard) |
+
+**Hermes endpoints** (nginx config in
+`/etc/nginx/sites-enabled/agent-backend.thomas.md` — NOT tracked in git):
+
+- `/hermes-remote` → the gateway's OpenAI-compatible API server (loopback 8642),
+  re-exposed by the sandboxed.sh backend itself (`hermes_remote_proxy` in
+  `src/api/system.rs`). `/v1/*` + SSE only, no WebSocket. Used for *split mode*
+  (a local Hermes sets `GATEWAY_PROXY_URL`/`GATEWAY_PROXY_KEY` and delegates
+  agent work). Key = `API_SERVER_KEY` in `/etc/sandboxed-sh/hermes-assistant.env`,
+  readable via `GET /api/system/hermes-assistant/remote`.
+- `/hermes-desktop` → the full Hermes dashboard backend (loopback 9130) for the
+  desktop app's **native Remote-gateway mode** (`/api/status` + `wss /api/ws`).
+  Unit: `/etc/systemd/system/hermes-dashboard.service` (`hermes dashboard
+  --no-open --host 127.0.0.1 --port 9130 --skip-build`, same `HERMES_HOME`
+  `/var/lib/hermes-assistant` as the gateway so sessions/memory are shared,
+  auth via `HERMES_DASHBOARD_SESSION_TOKEN` = same key, stub web dist at
+  `/var/lib/hermes-assistant/web_dist`). The nginx location pins
+  `Host 127.0.0.1:9130` (host-header check) and must NOT add `X-Forwarded-For`
+  (the WS gate requires a loopback peer).
+
+Hermes gotchas:
+
+- After a prod deploy, `systemctl restart hermes-assistant` so the gateway
+  respawns the freshly installed `/usr/local/bin/assistant-mcp`.
+- When testing the WS handshake with curl, force `--http1.1` — ALPN negotiates
+  h2, which has no `Upgrade` header, and the resulting 401 is a red herring.
+- When rotating the `hsk_` key, update `API_SERVER_KEY`,
+  `HERMES_DASHBOARD_SESSION_TOKEN`, and the desktop's `connection.json` together.
 
 ```bash
 # Production

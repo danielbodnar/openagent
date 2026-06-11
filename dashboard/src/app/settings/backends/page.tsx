@@ -16,6 +16,7 @@ import { Save, Loader, Check, Gauge, Bot } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
 import { ServerConnectionCard } from '@/components/server-connection-card';
+import { ModelRoutingDebug } from '@/components/model-routing-debug';
 import { useBackendConfigs } from '@/lib/use-backend-configs';
 
 const SETTINGS_BACKEND_IDS = ['opencode', 'claudecode', 'grok'] as const;
@@ -610,6 +611,8 @@ export default function BackendsPage() {
             </div>
           ) : null}
         </section>
+
+        <ModelRoutingDebug />
       </div>
     </div>
   );

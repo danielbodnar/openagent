@@ -143,6 +143,10 @@ pub struct AppState {
     /// `/api/ai/providers/:id/usage` and refreshed in the background so the
     /// dashboard sees fresh values without paying a round-trip latency cost.
     pub provider_usage_cache: Arc<super::provider_usage_cache::ProviderUsageCache>,
+    /// Per-account Codex (ChatGPT subscription) usage snapshots — populated by
+    /// an active probe on dashboard demand and by passive `model_cooldown`
+    /// capture on the proxy path. See [`super::codex_usage`].
+    pub codex_usage: Arc<super::codex_usage::CodexUsageStore>,
 }
 
 /// Start the HTTP server.
@@ -502,6 +506,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         fido_hub: Arc::new(super::fido::FidoSigningHub::new()),
         control_metrics: Arc::new(super::control_metrics::ControlMetrics::new()),
         provider_usage_cache: super::provider_usage_cache::ProviderUsageCache::new(),
+        codex_usage: super::codex_usage::CodexUsageStore::new(),
     });
 
     // Start background refresh of provider rate-limit / usage info so the
@@ -512,8 +517,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     {
         super::metadata_llm::init_metadata_llm(state.http_client.clone());
         let ai_providers = Arc::clone(&state.ai_providers);
+        let chain_store = Arc::clone(&state.chain_store);
+        let settings_store = Arc::clone(&state.settings);
         tokio::spawn(async move {
-            super::metadata_llm::refresh_metadata_llm_config(&ai_providers).await;
+            super::metadata_llm::refresh_metadata_llm_config(
+                &ai_providers,
+                &chain_store,
+                settings_store.get().await.metadata_model,
+            )
+            .await;
             // Store the AI providers reference for self-refresh (picks up new OAuth tokens)
             if let Some(client) = super::metadata_llm::metadata_llm() {
                 client.set_ai_providers(ai_providers).await;
@@ -615,6 +627,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // WebSocket system monitoring uses subprotocol-based auth
         .route("/api/monitoring/ws", get(monitoring::monitoring_ws))
+        // Hermes remote access: pass-through to the host Hermes API server so
+        // a desktop Hermes can connect via GATEWAY_PROXY_URL/GATEWAY_PROXY_KEY.
+        // Auth is the API_SERVER_KEY bearer token enforced by Hermes itself.
+        .route(
+            "/hermes-remote/*path",
+            axum::routing::any(system_api::hermes_remote_proxy)
+                .layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        )
         // OpenAI-compatible proxy endpoint (bearer token auth via SANDBOXED_PROXY_SECRET).
         // LLM payloads with tool outputs and long contexts can exceed the default 2MB
         // body limit, so set a generous 50MB limit for proxy routes.
@@ -681,6 +701,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/control/missions/:id/events",
             get(control::get_mission_events),
+        )
+        .route(
+            "/api/control/missions/:id/tool-calls/:tool_call_id",
+            get(control::get_mission_tool_call_events),
         )
         .route(
             "/api/control/missions/:id/snapshot",
@@ -1530,6 +1554,78 @@ async fn get_ai_usage_summary(
     } else {
         Vec::new()
     };
+
+    // Merge in OpenAI-compatible /v1 router usage (external clients: assistant
+    // gateways, IDEs with proxy keys). It lives in a dedicated table because
+    // those requests have no mission to attach events to.
+    let mut rows = rows;
+    {
+        let proxy_rows = control_state
+            .mission_store
+            .get_proxy_usage_by_model(since.as_deref())
+            .await
+            .unwrap_or_default();
+        for p in proxy_rows {
+            if let Some(existing) = rows.iter_mut().find(|r| r.model == p.model) {
+                existing.requests = existing.requests.saturating_add(p.requests);
+                existing.input_tokens = existing.input_tokens.saturating_add(p.input_tokens);
+                existing.output_tokens = existing.output_tokens.saturating_add(p.output_tokens);
+                existing.cache_creation_tokens = existing
+                    .cache_creation_tokens
+                    .saturating_add(p.cache_creation_tokens);
+                existing.cache_read_tokens = existing
+                    .cache_read_tokens
+                    .saturating_add(p.cache_read_tokens);
+                existing.cost_cents = existing.cost_cents.saturating_add(p.cost_cents);
+            } else {
+                rows.push(p);
+            }
+        }
+    }
+    let mut daily = daily;
+    {
+        let proxy_daily = control_state
+            .mission_store
+            .get_proxy_usage_by_day(since.as_deref())
+            .await
+            .unwrap_or_default();
+        for p in proxy_daily {
+            if let Some(existing) = daily.iter_mut().find(|d| d.day == p.day) {
+                existing.requests = existing.requests.saturating_add(p.requests);
+                existing.input_tokens = existing.input_tokens.saturating_add(p.input_tokens);
+                existing.output_tokens = existing.output_tokens.saturating_add(p.output_tokens);
+                existing.cache_read_tokens = existing
+                    .cache_read_tokens
+                    .saturating_add(p.cache_read_tokens);
+                existing.cost_cents = existing.cost_cents.saturating_add(p.cost_cents);
+            } else {
+                daily.push(p);
+            }
+        }
+        daily.sort_by(|a, b| a.day.cmp(&b.day));
+    }
+    let mut hourly = hourly;
+    if matches!(window, "24h" | "7d") {
+        let proxy_hourly = control_state
+            .mission_store
+            .get_proxy_usage_by_hour(since.as_deref())
+            .await
+            .unwrap_or_default();
+        for p in proxy_hourly {
+            if let Some(existing) = hourly.iter_mut().find(|h| h.hour == p.hour) {
+                existing.requests = existing.requests.saturating_add(p.requests);
+                existing.input_tokens = existing.input_tokens.saturating_add(p.input_tokens);
+                existing.output_tokens = existing.output_tokens.saturating_add(p.output_tokens);
+                existing.cache_read_tokens = existing
+                    .cache_read_tokens
+                    .saturating_add(p.cache_read_tokens);
+                existing.cost_cents = existing.cost_cents.saturating_add(p.cost_cents);
+            } else {
+                hourly.push(p);
+            }
+        }
+        hourly.sort_by(|a, b| a.hour.cmp(&b.hour));
+    }
 
     let mut totals = UsageSummaryTotals {
         requests: 0,

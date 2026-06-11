@@ -55,7 +55,11 @@ test.describe('Mission backend configs', () => {
     });
     expect(updateRes.ok()).toBeTruthy();
 
-    const agentsRes = await request.get(`${API_BASE}/api/opencode/agents`);
+    // Use the same profile-aware endpoint the dialog uses, so the test fails
+    // if profile-specific agents stop appearing in the UI.
+    const agentsRes = await request.get(
+      `${API_BASE}/api/backends/opencode/agents?profile=spark-local`,
+    );
     expect(agentsRes.ok()).toBeTruthy();
     const agents = (await agentsRes.json()) as unknown[];
     const agentNames = agents

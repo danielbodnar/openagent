@@ -32,6 +32,14 @@ secrets.json
 .open_agent_calibration/
 /tmp/
 /dashboard/console.log
+/.playwright-console.log
+/automations-*.png
+/control-bubbles.png
+/lifetime-cost-fixed.png
+/msg-feedback-failed.png
+/stats-responsive-*.png
+/thoughts-history-*.png
+/unified-bubbles.png
 
 # Claude Code per-project session state
 .claude/

@@ -27,6 +27,8 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::api::mission_store::MissionStore;
+use crate::api::proxy_keys::SharedProxyApiKeyStore;
+use crate::workspace::SharedWorkspaceStore;
 use crate::workspace_exec::WorkspaceExec;
 
 pub use client::AskClient;
@@ -41,6 +43,9 @@ const MAX_ITERATIONS: usize = 10;
 const MAX_TOOL_RESULT_BYTES: usize = 8_000;
 /// Number of recent mission events seeded into the system prompt.
 const SEED_EVENT_COUNT: usize = 40;
+/// How far back to scan when looking for the latest goal_status event. One
+/// fetch serves both this scan and the [`SEED_EVENT_COUNT`] seed.
+const GOAL_SCAN_EVENT_COUNT: usize = 200;
 
 static ASK_STORE: OnceCell<Arc<AskStore>> = OnceCell::const_new();
 
@@ -71,6 +76,21 @@ pub struct AskTurn {
     /// When true, `work_dir` is an isolated sandbox copy of the workspace, so
     /// writes are throwaway and we skip the operator-note bridge entirely.
     pub sandbox: bool,
+    /// Workspace store + the mission's workspace id, for the workspace-env
+    /// tools (list/set env vars that get injected into the harness).
+    pub workspaces: SharedWorkspaceStore,
+    pub workspace_id: Uuid,
+    /// Proxy API key store, for answering "is the key the operator issued
+    /// actually being used?" with `last_used_at` facts.
+    pub proxy_keys: SharedProxyApiKeyStore,
+    /// Command channel into the user's control session, for the steering tools
+    /// (`stop_agent` / `send_to_agent`). Same channel the dashboard's Stop
+    /// button and composer use.
+    pub control_cmd_tx: tokio::sync::mpsc::Sender<crate::api::control::ControlCommand>,
+    /// Event broadcast for the control session. Events sent here reach live
+    /// viewers AND the persistent event logger — used to leave a durable audit
+    /// record when the Copilot stops the working agent.
+    pub events_tx: tokio::sync::broadcast::Sender<crate::api::control::AgentEvent>,
 }
 
 /// Run one Ask turn: persist the operator message, drive the tool loop, persist
@@ -82,7 +102,7 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
         .await?;
 
     // Assemble the OpenAI message array: system + prior turns + this message.
-    let system = build_system_prompt(turn).await;
+    let system = build_system_prompt(turn, user_content).await;
     let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
 
     // Replay prior user/assistant turns for continuity (tool details are kept in
@@ -141,7 +161,7 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
                 .await?;
 
             let result = execute_tool(turn, &tc.name, &tc.arguments).await;
-            let result = truncate(&result, MAX_TOOL_RESULT_BYTES);
+            let result = truncate_tool_result(&result);
 
             turn.ask_store
                 .append_message(
@@ -246,7 +266,7 @@ async fn run_ask_turn_streaming_inner(
         .append_message(turn.thread_id, "user", user_content, None, None, None)
         .await?;
 
-    let system = build_system_prompt(turn).await;
+    let system = build_system_prompt(turn, user_content).await;
     let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": system })];
     let prior = turn.ask_store.list_messages(turn.thread_id).await?;
     for m in &prior {
@@ -313,7 +333,7 @@ async fn run_ask_turn_streaming_inner(
                 .await?;
 
             let result = execute_tool(turn, &tc.name, &tc.arguments).await;
-            let result = truncate(&result, MAX_TOOL_RESULT_BYTES);
+            let result = truncate_tool_result(&result);
             let _ = tx.send(AskStreamEvent::ToolResult {
                 tool_call_id: tc.id.clone(),
                 name: tc.name.clone(),
@@ -380,39 +400,69 @@ async fn run_ask_turn_streaming_inner(
     Ok(())
 }
 
-async fn build_system_prompt(turn: &AskTurn) -> String {
+async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut seed = String::new();
     if let Ok(Some(mission)) = turn.mission_store.get_mission(turn.mission_id).await {
         if let Some(title) = &mission.title {
             seed.push_str(&format!("Mission title: {title}\n"));
         }
+        seed.push_str(&format!(
+            "Mission status: {:?} (last updated {})\n",
+            mission.status, mission.updated_at
+        ));
         if let Some(desc) = &mission.short_description {
-            seed.push_str(&format!("Mission status: {desc}\n"));
+            seed.push_str(&format!("Mission summary: {desc}\n"));
         }
         seed.push_str(&format!("Mission backend: {}\n", mission.backend));
     }
 
+    // One slightly deeper fetch serves both the goal-status scan and the seed.
     if let Ok(events) = turn
         .mission_store
-        .get_latest_events(turn.mission_id, SEED_EVENT_COUNT)
+        .get_latest_events(turn.mission_id, GOAL_SCAN_EVENT_COUNT)
         .await
     {
+        if let Some(goal) = events
+            .iter()
+            .rev()
+            .find(|ev| ev.event_type == "goal_status")
+        {
+            seed.push_str(&format!(
+                "\nLatest goal status [{} {}]: {}\n",
+                goal.sequence,
+                goal.timestamp,
+                truncate(&goal.content, 600)
+            ));
+        }
+        let start = events.len().saturating_sub(SEED_EVENT_COUNT);
         seed.push_str("\nRecent mission events (newest last):\n");
-        for ev in &events {
+        for ev in &events[start..] {
             let tool = ev
                 .tool_name
                 .as_deref()
                 .map(|t| format!(" {t}"))
                 .unwrap_or_default();
             seed.push_str(&format!(
-                "[{}] {}{}: {}\n",
+                "[{} {}] {}{}: {}\n",
                 ev.sequence,
+                ev.timestamp,
                 ev.event_type,
                 tool,
-                truncate(&ev.content, 240)
+                truncate(&ev.content, 300)
             ));
         }
     }
+
+    let secret_note = if message_mentions_secret(user_content) {
+        "\n\n⚠ The operator's latest message contains what looks like a credential \
+         (API key / token). Persist it NOW with set_workspace_env under the variable \
+         name the mission's tooling expects (check its scripts/docs, or ask), then \
+         refer to it only by variable name. Never echo the full value back: chat \
+         context does not survive compaction, workspace env vars do."
+    } else {
+        ""
+    };
 
     let cwd = turn.work_dir.display();
     format!(
@@ -420,6 +470,17 @@ async fn build_system_prompt(turn: &AskTurn) -> String {
          \"working agent\" is doing the real work in this same workspace; you are a \
          read-mostly assistant helping the operator understand and occasionally nudge \
          what's happening.\n\n\
+         Current UTC time: {now}. Mission events and files carry timestamps — compare \
+         them against the current time and date your claims (\"as of 14:32Z\"); never \
+         present a snapshot from hours ago as the present state.\n\n\
+         Recency first: when asked where the mission stands, check the newest data \
+         before summarizing — `ls -lt` on results/output dirs, `tail` on logs and \
+         journals, `git log --oneline -10`, and read_history. Research logs and \
+         journals are append-only: the END of the file is the current state, the \
+         beginning is history.\n\n\
+         Tool results are capped at 8KB; a truncation notice reports the full size. \
+         For big files use read_file with offset/limit or tail/sed line ranges — \
+         never assume you saw the whole file.\n\n\
          Your bash tool runs in `{cwd}` — this is the mission's workspace and the \
          working agent's project root. Commands start there and relative paths \
          resolve against it, so you can `ls`, `cat`, or `git log` directly without \
@@ -429,8 +490,25 @@ async fn build_system_prompt(turn: &AskTurn) -> String {
          working agent, so keep writes minimal and intentional. The full mission \
          history may be large — retrieve what you need with read_history / bash \
          (grep, rg, cat) rather than assuming it is all provided.\n\n\
+         Secrets: if the operator shares a credential, persist it immediately with \
+         set_workspace_env — workspace env vars are injected into the working \
+         agent's process environment from its next turn onward and survive restarts \
+         and context compaction, unlike anything pasted in chat. Confirm by variable \
+         name and never repeat the value. Use list_workspace_env and \
+         proxy_key_status to answer \"is the key set / is it being used?\" with \
+         facts instead of guesses.\n\n\
+         Steering authority: you can stop the working agent (stop_agent) and send \
+         it steering messages (send_to_agent) — the same controls the operator has. \
+         These are interventions, not observations: use them when the operator asks \
+         you to stop/steer/redirect the agent, or when it is burning resources in a \
+         clearly harmful loop. Otherwise, propose the steering message and let the \
+         operator decide. When you do steer, make the message self-contained and \
+         bounded (what to stop, what to do instead, when to stop doing it) — the \
+         working agent has no access to this conversation.\n\n\
          Be concise and concrete. Cite event sequence numbers or file paths when \
-         relevant.\n\n\
+         relevant. When you identify a blocker the operator could fix through \
+         configuration (missing env var, unused key), propose the concrete fix — \
+         and apply it with your tools when the operator asks.{secret_note}\n\n\
          === Mission context ===\n{seed}"
     )
 }
@@ -455,7 +533,7 @@ fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_history",
-                "description": "Fetch the most recent mission events (the working agent's transcript: messages, tool calls/results, errors).",
+                "description": "Fetch the most recent mission events (the working agent's transcript: messages, tool calls/results, errors). Each event carries its timestamp.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -468,13 +546,75 @@ fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file from the mission workspace by path.",
+                "description": "Read a file from the mission workspace by path. Always reports total lines/bytes first. For big files pass offset/limit to read a line range (e.g. the tail of a long log).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Path to the file (absolute or relative to the workspace root)." }
+                        "path": { "type": "string", "description": "Path to the file (absolute or relative to the workspace root)." },
+                        "offset": { "type": "integer", "description": "1-based line number to start reading from (omit to start at the top)." },
+                        "limit": { "type": "integer", "description": "Number of lines to read (omit to read to the end)." }
                     },
                     "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_workspace_env",
+                "description": "List the workspace environment variables injected into the working agent's process environment (names + masked values). Use to check whether a credential or config var is already set.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "set_workspace_env",
+                "description": "Persist a workspace environment variable. It is injected into the working agent's environment from its next turn onward and survives restarts — the durable channel for credentials the operator shares in chat. The working agent is notified by name (never by value).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "POSIX env var name (e.g. DEFAULT_HARNESS_API_KEY)." },
+                        "value": { "type": "string", "description": "The value to store." }
+                    },
+                    "required": ["name", "value"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "proxy_key_status",
+                "description": "List the gateway's proxy API keys (name, prefix, created_at, last_used_at). Use to answer whether a key the operator issued is valid/actually being used.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "stop_agent",
+                "description": "Interrupt the working agent's current turn (same as the operator's Stop button). The mission becomes interrupted/awaiting until resumed or steered. Use only when the operator asked you to stop it, or when it is clearly stuck in a harmful loop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": { "type": "string", "description": "One-line reason, recorded for the operator." }
+                    },
+                    "required": ["reason"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "send_to_agent",
+                "description": "Send a steering message to the working agent, exactly as if the operator typed it in the mission composer. If the agent is mid-turn the message is queued and picked up at the next turn boundary — set interrupt=true to cancel the current turn first so it takes effect immediately. If the agent is idle this STARTS a new turn. Use only when the operator asked you to steer/redirect the agent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string", "description": "The steering instructions for the working agent. Be specific: what to stop doing, what to do instead, and any bounds." },
+                        "interrupt": { "type": "boolean", "description": "Cancel the agent's current turn before delivering, so the steer applies now instead of after the turn ends. Default false." }
+                    },
+                    "required": ["message"]
                 }
             }
         }),
@@ -505,7 +645,24 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
             if path.trim().is_empty() {
                 return "Error: empty path".to_string();
             }
-            run_bash(turn, &format!("cat -- {}", single_quote(path))).await
+            let offset = args["offset"].as_u64().map(|v| v.max(1));
+            let limit = args["limit"].as_u64().filter(|v| *v > 0);
+            let read_cmd = match (offset, limit) {
+                (Some(o), Some(l)) => {
+                    format!("sed -n '{o},{}p' -- \"$f\"", o.saturating_add(l - 1))
+                }
+                (Some(o), None) => format!("tail -n +{o} -- \"$f\""),
+                (None, Some(l)) => format!("head -n {l} -- \"$f\""),
+                (None, None) => "cat -- \"$f\"".to_string(),
+            };
+            // Lead with the file's true size so the model knows what fraction
+            // it is seeing (the 8KB tool-result cap truncates silently otherwise).
+            let cmd = format!(
+                "f={path}; if [ ! -f \"$f\" ]; then echo \"Error: no such file: $f\" >&2; exit 1; fi; \
+                 printf '[%s: %s lines, %s bytes total]\\n' \"$f\" \"$(wc -l < \"$f\")\" \"$(wc -c < \"$f\")\"; {read_cmd}",
+                path = single_quote(path),
+            );
+            run_bash(turn, &cmd).await
         }
         "read_history" => {
             let limit = args["limit"].as_u64().unwrap_or(60).clamp(1, 300) as usize;
@@ -523,8 +680,9 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                             .map(|t| format!(" {t}"))
                             .unwrap_or_default();
                         out.push_str(&format!(
-                            "[{}] {}{}: {}\n",
+                            "[{} {}] {}{}: {}\n",
                             ev.sequence,
+                            ev.timestamp,
                             ev.event_type,
                             tool,
                             truncate(&ev.content, 400)
@@ -539,8 +697,243 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                 Err(e) => format!("Error reading history: {e}"),
             }
         }
+        "list_workspace_env" => match turn.workspaces.get(turn.workspace_id).await {
+            Some(ws) => {
+                if ws.env_vars.is_empty() {
+                    "(no workspace env vars configured)".to_string()
+                } else {
+                    let mut entries: Vec<_> = ws.env_vars.iter().collect();
+                    entries.sort_by(|a, b| a.0.cmp(b.0));
+                    entries
+                        .into_iter()
+                        .map(|(k, v)| format!("{k} = {}", mask_value(v)))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            }
+            None => "Error: workspace not found".to_string(),
+        },
+        "set_workspace_env" => {
+            if turn.sandbox {
+                return "Error: set_workspace_env is disabled in sandbox mode (it would \
+                        change the live workspace configuration)."
+                    .to_string();
+            }
+            let env_name = args["name"].as_str().unwrap_or("").trim().to_string();
+            let value = args["value"].as_str().unwrap_or("").to_string();
+            if env_name.is_empty() || value.is_empty() {
+                return "Error: name and value are required".to_string();
+            }
+            if !crate::api::workspaces::is_valid_env_name(&env_name) {
+                return format!(
+                    "Error: '{env_name}' is not a valid POSIX env var name \
+                     (letters, digits, underscores; cannot start with a digit)"
+                );
+            }
+            if value.contains('\0') {
+                return "Error: value contains a NUL byte".to_string();
+            }
+            match turn.workspaces.get(turn.workspace_id).await {
+                Some(mut ws) => {
+                    let replaced = ws
+                        .env_vars
+                        .insert(env_name.clone(), value.clone())
+                        .is_some();
+                    if !turn.workspaces.update(ws).await {
+                        return "Error: failed to persist the workspace env var".to_string();
+                    }
+                    // Tell the working agent the variable exists — by name only,
+                    // so the value never lands in mission history.
+                    let note = format!(
+                        "The operator configured the workspace environment variable \
+                         `{env_name}` via the Ask assistant (value withheld). It is \
+                         injected into your process environment from your next turn \
+                         onward — read it from the environment by name instead of \
+                         asking for the value or inlining it in commands."
+                    );
+                    if let Err(e) = turn
+                        .ask_store
+                        .enqueue_operator_note(turn.mission_id, &note, Some(turn.thread_id))
+                        .await
+                    {
+                        tracing::warn!("[Ask] failed to enqueue env-var operator note: {e}");
+                    }
+                    format!(
+                        "{} workspace env var `{env_name}` ({} chars). It is injected into \
+                         the working agent's environment from its next turn onward; an \
+                         operator note was queued so the agent knows it is available.",
+                        if replaced { "Updated" } else { "Set" },
+                        value.chars().count()
+                    )
+                }
+                None => "Error: workspace not found".to_string(),
+            }
+        }
+        "stop_agent" => {
+            let reason = args["reason"].as_str().unwrap_or("").trim().to_string();
+            if reason.is_empty() {
+                return "Error: a reason is required".to_string();
+            }
+            match cancel_working_agent(turn).await {
+                Ok(()) => {
+                    record_copilot_stop(turn, &reason).await;
+                    format!(
+                        "Interrupted the working agent's current turn (reason: {reason}). \
+                         The reason was recorded in the mission transcript. The mission \
+                         will settle as interrupted/awaiting; use send_to_agent to \
+                         redirect it, or the operator can resume it from the dashboard."
+                    )
+                }
+                Err(e) => format!("Error stopping the agent: {e}"),
+            }
+        }
+        "send_to_agent" => {
+            let message = args["message"].as_str().unwrap_or("").trim().to_string();
+            if message.is_empty() {
+                return "Error: message is empty".to_string();
+            }
+            let interrupt = args["interrupt"].as_bool().unwrap_or(false);
+            // Track whether the requested interrupt actually landed — a failed
+            // cancel (timeout, control error) must not be reported as "delivered
+            // after interrupting" when the agent may still be mid-turn.
+            let mut interrupt_error: Option<String> = None;
+            if interrupt {
+                if let Err(e) = cancel_working_agent(turn).await {
+                    tracing::info!(
+                        mission_id = %turn.mission_id,
+                        "[Ask] interrupt before steer did not cancel anything: {e}"
+                    );
+                    interrupt_error = Some(e);
+                } else {
+                    record_copilot_stop(turn, &format!("steering: {message}")).await;
+                }
+            }
+            let content = format_steer_message(&message);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let send = turn
+                .control_cmd_tx
+                .send(crate::api::control::ControlCommand::UserMessage {
+                    id: Uuid::new_v4(),
+                    content,
+                    agent: None,
+                    target_mission_id: Some(turn.mission_id),
+                    respond: tx,
+                })
+                .await;
+            if send.is_err() {
+                return "Error: the control session is unavailable".to_string();
+            }
+            use crate::api::control::UserMessageAck;
+            match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+                Ok(Ok(UserMessageAck::Queued)) => match (interrupt, &interrupt_error) {
+                    (true, None) => {
+                        "Steering message delivered after interrupting the current turn — \
+                         the agent will act on it as soon as the cancellation settles."
+                            .to_string()
+                    }
+                    (true, Some(err)) => format!(
+                        "Steering message queued, but the requested interrupt FAILED \
+                         ({err}) — the agent may still be mid-turn and will only act on \
+                         the message at the next turn boundary. Verify with read_history; \
+                         retry stop_agent if it must stop now."
+                    ),
+                    (false, _) => {
+                        "Steering message queued — the working agent is mid-turn and will \
+                         act on it at the next turn boundary. Pass interrupt=true if it \
+                         must take effect immediately."
+                            .to_string()
+                    }
+                },
+                Ok(Ok(UserMessageAck::Delivered)) => {
+                    "Steering message delivered — a turn is starting on it now.".to_string()
+                }
+                Ok(Ok(UserMessageAck::Dropped)) => {
+                    "Error: the steering message was DROPPED — it never reached the \
+                     working agent (parallel mission cap, mission load failure, or a \
+                     rejected goal kickoff). Check read_history for the error event, \
+                     resolve the cause, then retry."
+                        .to_string()
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // The control loop accepted the command but never confirmed —
+                    // the message is most likely in flight; don't claim failure.
+                    "Steering message submitted (no delivery confirmation received). \
+                     Check read_history shortly to confirm the agent saw it."
+                        .to_string()
+                }
+            }
+        }
+        "proxy_key_status" => {
+            let keys = turn.proxy_keys.list().await;
+            if keys.is_empty() {
+                "(no proxy API keys)".to_string()
+            } else {
+                keys.iter()
+                    .map(|k| {
+                        format!(
+                            "{} ({}…) created {} — last used: {}",
+                            k.name,
+                            k.key_prefix,
+                            k.created_at
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            k.last_used_at
+                                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                                .unwrap_or_else(|| "never".to_string())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
         other => format!("Error: unknown tool '{other}'"),
     }
+}
+
+/// Cancel the working agent's current turn through the control session — the
+/// same `CancelMission` path the dashboard's Stop button uses.
+async fn cancel_working_agent(turn: &AskTurn) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    turn.control_cmd_tx
+        .send(crate::api::control::ControlCommand::CancelMission {
+            mission_id: turn.mission_id,
+            min_idle: None,
+            respond: tx,
+        })
+        .await
+        .map_err(|_| "the control session is unavailable".to_string())?;
+    match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the control session dropped the request".to_string()),
+        Err(_) => Err("timed out waiting for the cancellation to be acknowledged".to_string()),
+    }
+}
+
+/// Leave a durable audit record of a Copilot-initiated stop in the mission
+/// transcript. Broadcast on `events_tx` so live viewers see it AND the
+/// persistent event logger writes it to mission events.
+async fn record_copilot_stop(turn: &AskTurn, reason: &str) {
+    let _ = turn.events_tx.send(crate::api::control::AgentEvent::Error {
+        message: format!(
+            "⏹ The Copilot stopped the working agent's turn (operator-authorized). \
+                 Reason: {}",
+            truncate(reason, 400)
+        ),
+        mission_id: Some(turn.mission_id),
+        resumable: true,
+    });
+}
+
+/// Wrap a Copilot steering message so the working agent (and the mission
+/// transcript) can tell it came through the co-pilot acting on the operator's
+/// behalf, not from the operator typing directly.
+fn format_steer_message(message: &str) -> String {
+    format!("[Steering from the operator via the Copilot]\n{message}")
+}
+
+/// Mask an env var value for display: short prefix + length, never the value.
+fn mask_value(v: &str) -> String {
+    let prefix: String = v.chars().take(4).collect();
+    format!("{prefix}… ({} chars)", v.chars().count())
 }
 
 async fn run_bash(turn: &AskTurn, command: &str) -> String {
@@ -783,6 +1176,50 @@ fn truncate(s: &str, max_bytes: usize) -> String {
     format!("{}… (truncated)", &s[..end])
 }
 
+/// Truncate a tool result at [`MAX_TOOL_RESULT_BYTES`], appending an explicit
+/// notice with the full size so the model knows it saw a partial view and how
+/// to fetch the rest (instead of silently mistaking the prefix for the whole).
+fn truncate_tool_result(s: &str) -> String {
+    if s.len() <= MAX_TOOL_RESULT_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_TOOL_RESULT_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n… [truncated: showing first {} of {} bytes — use read_file with \
+         offset/limit, or tail/sed line ranges, to view the rest]",
+        &s[..end],
+        end,
+        s.len()
+    )
+}
+
+/// Heuristic detection of credential-shaped tokens in an operator message, used
+/// to nudge the model into persisting them via `set_workspace_env` instead of
+/// letting them live (and die) in chat context.
+fn message_mentions_secret(text: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?x)
+            \b(
+                sk-[A-Za-z0-9_-]{12,}                       # OpenAI / proxy-style keys
+              | (ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}      # GitHub tokens
+              | github_pat_[A-Za-z0-9_]{20,}
+              | AKIA[0-9A-Z]{16}                            # AWS access key id
+              | xox[abprs]-[A-Za-z0-9-]{10,}                # Slack tokens
+              | AIza[0-9A-Za-z_-]{30,}                      # Google API keys
+              | eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,} # JWT
+            )",
+        )
+        .expect("static secret-detection regex must compile")
+    });
+    re.is_match(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,5 +1254,50 @@ mod tests {
         let (msg, n) = prepend_pending_operator_notes(&store, mission, "Continue.".into()).await;
         assert_eq!(n, 0);
         assert_eq!(msg, "Continue.");
+    }
+
+    #[test]
+    fn tool_result_truncation_reports_full_size() {
+        let small = "ok";
+        assert_eq!(truncate_tool_result(small), "ok");
+
+        let big = "x".repeat(MAX_TOOL_RESULT_BYTES + 500);
+        let out = truncate_tool_result(&big);
+        assert!(out.contains(&format!(
+            "showing first {} of {} bytes",
+            MAX_TOOL_RESULT_BYTES,
+            big.len()
+        )));
+        assert!(out.contains("read_file with"));
+    }
+
+    #[test]
+    fn secret_detection_matches_common_token_shapes() {
+        // Synthetic values only — shaped like real tokens, never actual ones.
+        assert!(message_mentions_secret(
+            "try sk-proxy-0123456789abcdef0123456789abcdef and tell me"
+        ));
+        assert!(message_mentions_secret(
+            "token: ghp_0123456789abcdefghijABCDEFGHIJ0123"
+        ));
+        assert!(message_mentions_secret("AKIAIOSFODNN7EXAMPLE"));
+        // Plain prose, short ids, and tactic punctuation must not trip it.
+        assert!(!message_mentions_secret("what is the mission status?"));
+        assert!(!message_mentions_secret("the sk-learn library"));
+        assert!(!message_mentions_secret("commit 381a865f is on master"));
+    }
+
+    #[test]
+    fn steer_messages_carry_a_copilot_attribution() {
+        let msg = format_steer_message("Stop rewriting orchestrator-state.json.");
+        assert!(msg.starts_with("[Steering from the operator via the Copilot]"));
+        assert!(msg.ends_with("Stop rewriting orchestrator-state.json."));
+    }
+
+    #[test]
+    fn env_value_masking_never_leaks() {
+        let masked = mask_value("sk-proxy-0123456789abcdef0123456789abcdef");
+        assert_eq!(masked, "sk-p… (41 chars)");
+        assert!(!masked.contains("0123456789"));
     }
 }

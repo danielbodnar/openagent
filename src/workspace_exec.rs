@@ -69,6 +69,36 @@ fn environ_has_keepalive_marker(environ: &[u8]) -> bool {
         .any(|entry| entry == expected.as_bytes())
 }
 
+/// Stable container identity for a workspace, derived from its path. Every
+/// transient scope a workspace spawns (mission boot, per-exec attach, and the
+/// one-shot nspawn wrapper in `nspawn.rs`) embeds this token, so scope
+/// discovery (`list_workspace_scope_units`) can match them all by substring.
+/// Keep all scope-naming sites in sync with this — a divergent token makes a
+/// scope invisible to live stats, retune, and the OOM watchdog.
+pub fn machine_name_for_path(path: &Path) -> Option<String> {
+    let base = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+    let sanitized: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    let suffix = format!("{:08x}", hasher.finish() as u32);
+
+    Some(format!("sandboxed-{}-{}", sanitized, suffix))
+}
+
 /// Build a valid transient systemd scope unit name for a mission container.
 /// systemd unit names allow `[A-Za-z0-9:._-]`; replace anything else with `_`.
 fn mission_scope_unit(machine_name: &str) -> String {
@@ -83,6 +113,103 @@ fn mission_scope_unit(machine_name: &str) -> String {
         })
         .collect();
     format!("sandboxed-mission-{sanitized}.scope")
+}
+
+/// systemd slice that hosts every mission scope. Putting all mission scopes
+/// under one slice makes them cgroup *siblings* of the API service instead of
+/// children, and lets ops pin an **aggregate** memory cap on the slice so the
+/// sum of missions can never starve the host or the API — the per-mission cap
+/// alone doesn't protect against N missions × cap > RAM.
+///
+/// Override with `MISSION_SLICE` (empty / `none` / `off` disables the slice
+/// assignment for rollback). systemd auto-creates the slice on first use; a
+/// unit file or `systemctl set-property missions.slice MemoryHigh=…` pins the
+/// aggregate limits.
+fn missions_slice() -> Option<String> {
+    match std::env::var("MISSION_SLICE") {
+        Ok(v) => {
+            let v = v.trim().to_string();
+            if v.is_empty() || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        Err(_) => Some("missions.slice".to_string()),
+    }
+}
+
+/// Memory caps applied to a mission's transient scopes.
+///
+/// Resolution order (per key): workspace `env_vars` override → API process
+/// env. The workspace override is what makes "boost this one workspace"
+/// possible without touching the global env file or restarting anything.
+#[derive(Debug, Clone, Default)]
+pub struct MissionMemoryCaps {
+    pub max: Option<String>,
+    pub high: Option<String>,
+    pub swap_max: Option<String>,
+}
+
+impl MissionMemoryCaps {
+    /// `true` when no MemoryMax is configured — scope wrapping is skipped
+    /// entirely (Docker installs without systemd PID 1, dev hosts, …).
+    pub fn is_disabled(&self) -> bool {
+        self.max.is_none()
+    }
+
+    /// `systemd-run` arguments for a transient scope carrying these caps.
+    /// Returns `None` when caps are disabled.
+    pub(crate) fn scope_run_args(&self, unit: &str) -> Option<Vec<String>> {
+        let max = self.max.as_ref()?;
+        let mut args = vec![
+            "--scope".to_string(),
+            "--quiet".to_string(),
+            "--collect".to_string(),
+            format!("--unit={unit}"),
+        ];
+        if let Some(slice) = missions_slice() {
+            args.push(format!("--slice={slice}"));
+        }
+        args.push(format!("--property=MemoryMax={max}"));
+        if let Some(high) = &self.high {
+            args.push(format!("--property=MemoryHigh={high}"));
+        }
+        if let Some(swap) = &self.swap_max {
+            args.push(format!("--property=MemorySwapMax={swap}"));
+        }
+        Some(args)
+    }
+}
+
+/// Build [`MissionMemoryCaps`] from an arbitrary env map (workspace env vars,
+/// `NspawnConfig::env`, …) with process-env fallback.
+pub(crate) fn mission_memory_caps_from_env(env: &HashMap<String, String>) -> MissionMemoryCaps {
+    MissionMemoryCaps {
+        max: resolve_memory_var(env, "MISSION_MEMORY_MAX"),
+        high: resolve_memory_var(env, "MISSION_MEMORY_HIGH"),
+        swap_max: resolve_memory_var(env, "MISSION_MEMORY_SWAP_MAX"),
+    }
+}
+
+/// Resolve one memory-cap key: workspace env override first, then process env.
+/// An empty workspace value is treated as "no override" and falls back to the
+/// process default — same as removing the key — so clearing a cap via the raw
+/// env editor and via the Resources "Reset to defaults" button behave
+/// identically, and neither silently drops the mission out of its cgroup scope.
+/// To run a single workspace genuinely uncapped, set the value to `"infinity"`
+/// (which still wraps the mission in a discoverable scope).
+fn resolve_memory_var(workspace_env: &HashMap<String, String>, key: &str) -> Option<String> {
+    if let Some(v) = workspace_env.get(key) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn select_container_resolv_conf() -> Option<PathBuf> {
@@ -523,29 +650,27 @@ impl WorkspaceExec {
     }
 
     fn machine_name(&self) -> Option<String> {
-        let base = self
-            .workspace
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())?;
-        let sanitized: String = base
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
+        machine_name_for_path(&self.workspace.path)
+    }
 
-        let mut hasher = DefaultHasher::new();
-        self.workspace.path.hash(&mut hasher);
-        let suffix = format!("{:08x}", hasher.finish() as u32);
+    /// Memory caps for this workspace's mission scopes (workspace env
+    /// override → process env; see [`resolve_memory_var`]).
+    pub fn mission_memory_caps(&self) -> MissionMemoryCaps {
+        mission_memory_caps_from_env(&self.workspace.env_vars)
+    }
 
-        Some(format!("sandboxed-{}-{}", sanitized, suffix))
+    /// The boot scope unit name for this workspace's container, when one can
+    /// be derived. Public so the API layer (live cap adjustment, memory
+    /// stats, OOM watchdog) can address the same unit this module creates.
+    pub fn mission_boot_scope_unit(&self) -> Option<String> {
+        self.machine_name().map(|name| mission_scope_unit(&name))
+    }
+
+    /// Token shared by every transient scope this workspace spawns (boot +
+    /// per-exec attach scopes). Used by the API layer to `systemctl
+    /// set-property` all of a workspace's scopes at once.
+    pub fn mission_scope_match_token(&self) -> Option<String> {
+        self.machine_name()
     }
 
     async fn running_container_leader(&self) -> Option<String> {
@@ -617,29 +742,22 @@ impl WorkspaceExec {
             .filter(|name| !name.trim().is_empty())
             .context("Container workspace has no machine name")?;
 
-        // Per-mission isolation (Layer 1). When `MISSION_MEMORY_MAX` is set,
-        // boot the container inside its own transient systemd scope with a
-        // memory cap so one mission's runaway build (e.g. a 46G Lean
-        // compilation) can't starve the host or the API process, and so
-        // `systemctl stop <scope>` reliably kills the whole build tree on
-        // cancel/teardown. Unset (default) = unchanged direct nspawn boot, so
-        // shipping this binary is a no-op until the env is enabled (dev first).
-        let mission_mem_max = std::env::var("MISSION_MEMORY_MAX")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        let mission_mem_high = std::env::var("MISSION_MEMORY_HIGH")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        let mut cmd = if let Some(mem_max) = &mission_mem_max {
-            let scope_unit = mission_scope_unit(&name);
+        // Per-mission isolation (Layer 1). When `MISSION_MEMORY_MAX` is set
+        // (workspace env override → process env), boot the container inside
+        // its own transient systemd scope — under `missions.slice` so the
+        // aggregate of all missions is capped separately from the API
+        // service — with memory + swap caps so one mission's runaway build
+        // (e.g. a 46G Lean compilation) can't starve the host or the API
+        // process, and so `systemctl stop <scope>` reliably kills the whole
+        // build tree on cancel/teardown. Unset (default) = unchanged direct
+        // nspawn boot, so shipping this binary is a no-op until the env is
+        // enabled (Docker installs without systemd PID 1 stay on the direct
+        // path).
+        let caps = self.mission_memory_caps();
+        let scope_args = caps.scope_run_args(&mission_scope_unit(&name));
+        let mut cmd = if let Some(scope_args) = scope_args {
             let mut c = Command::new("systemd-run");
-            c.arg("--scope")
-                .arg(format!("--unit={scope_unit}"))
-                .arg("--collect")
-                .arg(format!("--property=MemoryMax={mem_max}"));
-            if let Some(mem_high) = &mission_mem_high {
-                c.arg(format!("--property=MemoryHigh={mem_high}"));
-            }
+            c.args(&scope_args);
             // systemd-nspawn's own scope-creation is disabled below via
             // --register=no/--keep-unit, so it joins this scope's cgroup.
             c.arg("systemd-nspawn");
@@ -800,7 +918,30 @@ impl WorkspaceExec {
             let env_ref = if env.is_empty() { None } else { Some(&env) };
             Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
         };
-        let mut cmd = Command::new(nsenter);
+        // Per-mission isolation, nsenter edition. `nsenter` only enters the
+        // container's *namespaces* — the spawned process stays in the
+        // caller's cgroup (the API service's), so without this wrapper a
+        // runaway build attached to an already-running container bypasses
+        // the boot-path mission scope entirely (observed live: a 47 GiB
+        // Lean build throttling the whole service cgroup while the
+        // container's own scope sat at 24G/2MB). Wrap each attach in its
+        // own capped transient scope when `MISSION_MEMORY_MAX` is set.
+        // The unit embeds the machine name so the API layer can find and
+        // retune every scope belonging to one workspace at runtime.
+        let caps = self.mission_memory_caps();
+        let exec_unit = format!(
+            "sandboxed-exec-{}-{}",
+            self.machine_name().unwrap_or_else(|| "unknown".to_string()),
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut cmd = if let Some(scope_args) = caps.scope_run_args(&exec_unit) {
+            let mut c = Command::new("systemd-run");
+            c.args(&scope_args);
+            c.arg(nsenter);
+            c
+        } else {
+            Command::new(nsenter)
+        };
         cmd.args([
             "--target", leader, "--mount", "--uts", "--ipc", "--net", "--pid",
         ]);
@@ -1221,6 +1362,27 @@ impl WorkspaceExec {
             "-lc".to_string(),
             shell_cmd,
         ];
+
+        // Same cgroup-escape hatch as build_nsenter_command, PTY edition:
+        // this invocation is what launches harness CLIs (claude/codex/…) for
+        // missions, and without the scope wrapper the harness — and every
+        // build it spawns — lands in the API service's cgroup. That is
+        // exactly how a 45 GiB `lean` run throttled the whole prod service
+        // on 2026-06-07 despite boot-path caps being deployed. systemd-run
+        // --scope keeps the payload as its own foreground child, so PTY
+        // semantics and group-kill teardown are preserved.
+        let caps = self.mission_memory_caps();
+        let exec_unit = format!(
+            "sandboxed-exec-{}-{}",
+            self.machine_name().unwrap_or_else(|| "unknown".to_string()),
+            uuid::Uuid::new_v4().simple()
+        );
+        if let Some(scope_args) = caps.scope_run_args(&exec_unit) {
+            let mut args = scope_args;
+            args.push(nsenter);
+            args.extend(nsenter_args);
+            return Ok(("systemd-run".to_string(), args));
+        }
 
         Ok((nsenter, nsenter_args))
     }

@@ -9,7 +9,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::backend::events::ExecutionEvent;
-use crate::backend::shared::convert_cli_event;
 use crate::backend::{AgentInfo, Backend, Session, SessionConfig};
 
 use client::{ClaudeCodeClient, ClaudeCodeConfig};
@@ -199,12 +198,17 @@ impl Backend for ClaudeCodeBackend {
             // Track pending tool calls for name lookup AND completion tracking
             let mut pending_tools: HashMap<String, String> = HashMap::new();
             let mut saw_terminal_result = false;
+            let mut thinking_audit = crate::backend::shared::ThinkingDeltaAudit::default();
 
             while let Some(event) = claude_rx.recv().await {
                 if matches!(event, client::ClaudeEvent::Result(_)) {
                     saw_terminal_result = true;
                 }
-                let exec_events = convert_cli_event(event, &mut pending_tools);
+                let exec_events = crate::backend::shared::convert_cli_event_audited(
+                    event,
+                    &mut pending_tools,
+                    &mut thinking_audit,
+                );
 
                 for exec_event in exec_events {
                     // Track tool completion to know when it's safe to send MessageComplete
@@ -222,6 +226,18 @@ impl Backend for ClaudeCodeBackend {
                         break;
                     }
                 }
+            }
+
+            // Surface encrypted/undecoded thinking instead of leaving the
+            // thoughts panel silently empty (and warn about unknown delta
+            // types once per stream).
+            if let Some(marker) = thinking_audit.finish_turn() {
+                let _ = tx
+                    .send(ExecutionEvent::Thinking {
+                        content: marker,
+                        item_id: None,
+                    })
+                    .await;
             }
 
             match classify_claude_stream_end(saw_terminal_result, &pending_tools) {

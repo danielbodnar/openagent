@@ -34,7 +34,13 @@ Cerebras title fix (#489), `metadata_llm.rs` provider ladder.
 - No worktree / sandbox-copy mode (usage is read-dominant).
 - No destructive-write confirmation gate. Full bash, no friction; a visual
   "agent idle/working" indicator is informational only.
-- Ask never **starts** a main-agent turn. Strictly non-interrupting.
+- ~~Ask never **starts** a main-agent turn. Strictly non-interrupting.~~
+  **Superseded (v1.1):** the Copilot now has explicit steering tools —
+  `stop_agent` (CancelMission, same as the Stop button) and `send_to_agent`
+  (a real composer-equivalent UserMessage, optionally interrupting the
+  current turn first). The system prompt frames these as interventions to
+  use when the operator asks to stop/steer, or in clearly harmful loops;
+  the default posture stays read-mostly.
 - Not every harness *heeds* the operator-note identically — delivery is
   harness-agnostic, faithfulness is best-effort (§9).
 

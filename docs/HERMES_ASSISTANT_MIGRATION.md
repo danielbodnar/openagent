@@ -65,10 +65,15 @@ Tools:
 - `list_missions`
 - `get_mission`
 - `get_mission_events`
+- `get_mission_health` — diagnose stalls/loops/errors + a one-line recommendation
+- `get_mission_diagnostics` — tool-call timeline, repeated calls, error events
 - `start_mission`
 - `send_message_to_mission`
+- `update_mission_settings` — switch backend/model/effort/agent for the next turn (between-turns)
+- `resume_mission` — restart an interrupted/blocked/failed mission, optionally with a steering hint
 - `cancel_mission`
 - `list_workspaces`
+- `workspace_bash`
 
 Configuration:
 

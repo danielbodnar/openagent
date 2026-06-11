@@ -18,7 +18,6 @@ import {
   Download,
   Upload,
   Archive,
-  Sparkles,
   Trash2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -48,36 +47,6 @@ export default function DataSettingsPage() {
     getSettings,
     { revalidateOnFocus: false }
   );
-
-  const [askModelValue, setAskModelValue] = useState<string | null>(null);
-  const [savingAskModel, setSavingAskModel] = useState(false);
-  const handleSaveAskModel = async () => {
-    setSavingAskModel(true);
-    try {
-      // Use the effective displayed value, not just local edits: when the user
-      // hasn't typed, askModelValue is null and we must preserve the saved
-      // model rather than clear it. Clearing only happens when the user
-      // explicitly empties the field (askModelValue === "").
-      const trimmed = (
-        askModelValue ??
-        serverSettings?.ask_assistant_model ??
-        ''
-      ).trim();
-      // Send "" (not null) to clear: a present empty string is normalized to
-      // None server-side, whereas JSON null is treated as "no change".
-      await updateSettings({ ask_assistant_model: trimmed });
-      mutateSettings();
-      toast.success(
-        trimmed ? 'Assistant model updated' : 'Assistant model reset to default'
-      );
-    } catch (err) {
-      toast.error(
-        `Failed to save: ${err instanceof Error ? err.message : 'Unknown error'}`
-      );
-    } finally {
-      setSavingAskModel(false);
-    }
-  };
 
   const handleStartEditLibraryRemote = () => {
     setLibraryRemoteValue(serverSettings?.library_remote || '');
@@ -332,67 +301,8 @@ export default function DataSettingsPage() {
             </div>
           </div>
 
-          {/* Ask Assistant Model */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 flex-shrink-0">
-                <Sparkles className="h-5 w-5 text-sky-400" />
-              </div>
-              <div className="min-w-0">
-                <h2 className="text-sm font-medium text-white">Ask Assistant Model</h2>
-                <p className="text-xs text-white/40">
-                  Model for the non-interrupting Ask co-pilot. Leave blank for
-                  the default (gpt-oss-120b).
-                </p>
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Model ID
-              </label>
-              {settingsLoading ? (
-                <div className="flex items-center gap-2 py-2.5">
-                  <Loader className="h-4 w-4 animate-spin text-white/40" />
-                  <span className="text-sm text-white/40">Loading...</span>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <input
-                    type="text"
-                    value={askModelValue ?? serverSettings?.ask_assistant_model ?? ''}
-                    onChange={(e) => setAskModelValue(e.target.value)}
-                    placeholder="gpt-oss-120b"
-                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-sky-500/50"
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') handleSaveAskModel();
-                    }}
-                  />
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={handleSaveAskModel}
-                      disabled={savingAskModel}
-                      className="flex items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white hover:bg-indigo-600 transition-colors cursor-pointer disabled:opacity-50"
-                    >
-                      {savingAskModel ? (
-                        <Loader className="h-3 w-3 animate-spin" />
-                      ) : (
-                        <Check className="h-3 w-3" />
-                      )}
-                      Save
-                    </button>
-                    <span className="text-xs text-white/30">
-                      e.g. gpt-oss-120b (fast default), zai-glm-4.7 (larger,
-                      slower)
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-
           {/* sandboxed.sh Source */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col md:col-span-2">
+          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 flex flex-col">
             <div className="flex items-center gap-3 mb-4">
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 flex-shrink-0">
                 <Archive className="h-5 w-5 text-emerald-400" />

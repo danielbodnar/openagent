@@ -99,6 +99,12 @@ function fmtReset(v: string | undefined | null): string {
   return v;
 }
 
+/** Format a unix epoch-seconds reset time as a relative "in Xh" string. */
+function fmtResetEpoch(secs: number | undefined | null): string {
+  if (secs == null) return '-';
+  return fmtReset(new Date(secs * 1000).toISOString());
+}
+
 /** Usage bar: shows used/limit with a mini progress bar */
 function UsageBar({ used, limit, label }: { used?: number | null; limit?: number | null; label: string }) {
   if (limit == null && used == null) return null;
@@ -241,10 +247,56 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
         </div>
       )}
 
-      {/* OpenAI connected without rate limits (OAuth without API key) */}
-      {type === 'openai' && usage.status === 'connected' && usage.requests_limit == null && (
-        <div className="text-[11px] text-emerald-400/70">Connected via OAuth</div>
+      {/* Codex (OpenAI ChatGPT subscription) usage & limits */}
+      {type === 'openai' && usage.codex_primary_used_percent != null && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-3 flex-wrap text-[11px] text-white/50">
+            {usage.codex_plan_type && (
+              <span><span className="text-white/30">Plan:</span> {usage.codex_plan_type}</span>
+            )}
+            {usage.codex_active_limit && (
+              <span><span className="text-white/30">Tier:</span> {usage.codex_active_limit}</span>
+            )}
+            {usage.codex_source === 'passive' && (
+              <span className="text-amber-400/60">(from recent traffic)</span>
+            )}
+          </div>
+          {usage.codex_primary_used_percent != null && (
+            <UsageBar
+              used={Math.round(100 - usage.codex_primary_used_percent)}
+              limit={100}
+              label="5h window"
+            />
+          )}
+          {usage.codex_secondary_used_percent != null && (
+            <UsageBar
+              used={Math.round(100 - usage.codex_secondary_used_percent)}
+              limit={100}
+              label="Weekly window"
+            />
+          )}
+          <div className="flex gap-4 text-[10px] text-white/30 flex-wrap">
+            {usage.codex_primary_reset_at != null && (
+              <span>5h reset: {fmtResetEpoch(usage.codex_primary_reset_at)}</span>
+            )}
+            {usage.codex_secondary_reset_at != null && (
+              <span>Weekly reset: {fmtResetEpoch(usage.codex_secondary_reset_at)}</span>
+            )}
+            {usage.codex_credits_unlimited === false && usage.codex_credits_balance != null && (
+              <span>Credits: {usage.codex_credits_balance}</span>
+            )}
+            {usage.codex_credits_unlimited === true && <span>Credits: unlimited</span>}
+          </div>
+        </div>
       )}
+
+      {/* OpenAI connected without rate limits (OAuth without API key, no Codex data) */}
+      {type === 'openai' &&
+        usage.status === 'connected' &&
+        usage.requests_limit == null &&
+        usage.codex_primary_used_percent == null && (
+          <div className="text-[11px] text-emerald-400/70">Connected via OAuth</div>
+        )}
 
       {/* Cerebras style rate limits */}
       {type === 'cerebras' && (

@@ -8,6 +8,13 @@
  * indigo "Interrupted by deploy — auto-resumed" pill instead, and suppress
  * the Resume button.
  *
+ * `InfiniteLoop` means the backend's degenerate-stream detector killed the
+ * CLI because the model was emitting the same short phrase in a tight loop
+ * (the ab260b2e "Yielding pending your choice." incident). Render it as a
+ * distinct amber "Model entered a repetitive loop — cut short" pill so the
+ * user knows the model wasn't actually waiting on them and the cost was
+ * contained.
+ *
  * Pure function so the tests can verify the mapping without touching React.
  */
 export function deriveAssistantTurnStatus(item: {
@@ -35,6 +42,13 @@ export function deriveAssistantTurnStatus(item: {
       label: "Interrupted by deploy — auto-resumed",
       iconClass: "text-indigo-400",
       showResume: false,
+    };
+  }
+  if (item.terminalReason === "InfiniteLoop") {
+    return {
+      label: "Model entered a repetitive loop — cut short",
+      iconClass: "text-amber-400",
+      showResume: true,
     };
   }
   return {

@@ -1,378 +1,398 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
+import Link from 'next/link';
+import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
-  readLLMConfig,
-  writeLLMConfig,
-  LLM_PROVIDERS,
-  fetchLiveCerebrasModels,
-  type LLMConfig,
-} from '@/lib/llm-settings';
-import { generateMissionTitle, testLLMConnection } from '@/lib/llm';
+  getLlmRoles,
+  getSettings,
+  updateSettings,
+  listProviders,
+  type LlmRoleStatus,
+  type Provider,
+} from '@/lib/api';
+import { listModelChains, type ModelChain } from '@/lib/api/model-routing';
 import {
-  Sparkles,
-  Eye,
-  EyeOff,
+  ArrowUpRight,
   Check,
+  Key,
   Loader,
+  RotateCcw,
+  Sparkles,
   Type,
-  Zap,
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
 
-export default function LLMSettingsPage() {
-  const [config, setConfig] = useState<LLMConfig | null>(null);
-  const [providerModels, setProviderModels] = useState<Record<string, string[]>>(
-    () =>
-      Object.fromEntries(
-        Object.entries(LLM_PROVIDERS).map(([id, provider]) => [id, provider.models])
-      )
+const SOURCE_LABELS: Record<string, string> = {
+  settings: 'Custom',
+  env: 'Env override',
+  auto: 'Auto',
+};
+
+/** Compact resolved provider/model chip with a real availability state. */
+function RoleStatusChip({
+  role,
+  loading,
+}: {
+  role: LlmRoleStatus | undefined;
+  loading: boolean;
+}) {
+  if (loading) {
+    return (
+      <div className="inline-flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5">
+        <Loader className="h-3 w-3 animate-spin text-white/40" />
+        <span className="text-xs text-white/40">Resolving...</span>
+      </div>
+    );
+  }
+  if (!role?.available) {
+    return (
+      <div className="inline-flex items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-2.5 py-1.5">
+        <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+        <span className="text-xs text-amber-400/90">No provider available</span>
+      </div>
+    );
+  }
+  return (
+    <div className="inline-flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-1.5">
+      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+      <span className="text-xs text-white/70">{role.provider}</span>
+      <span className="text-white/20">/</span>
+      <span className="font-mono text-xs text-white/70">{role.model}</span>
+    </div>
   );
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<string | null>(null);
+}
 
-  useEffect(() => {
-    setConfig(readLLMConfig());
-  }, []);
+/**
+ * One backend LLM role: identity row, resolved status, and a model picker
+ * fed by Routing chains and configured provider models. Both cards on this
+ * page share this exact anatomy so the roles read as siblings.
+ */
+function RoleCard({
+  icon,
+  iconTint,
+  title,
+  subtitle,
+  role,
+  source,
+  rolesLoading,
+  settingsLoading,
+  savedValue,
+  defaultLabel,
+  extraOptions,
+  chains,
+  providers,
+  helpText,
+  onSave,
+}: {
+  icon: React.ReactNode;
+  iconTint: string;
+  title: string;
+  subtitle: string;
+  role: LlmRoleStatus | undefined;
+  source: string | undefined;
+  rolesLoading: boolean;
+  settingsLoading: boolean;
+  savedValue: string;
+  defaultLabel: string;
+  /** Extra fixed options between the default and the chains group. */
+  extraOptions?: { value: string; label: string }[];
+  chains: ModelChain[];
+  providers: Provider[];
+  helpText: React.ReactNode;
+  onSave: (value: string) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [customMode, setCustomMode] = useState(false);
+  const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadLiveCerebrasModels = async () => {
-      try {
-        const models = await fetchLiveCerebrasModels();
-        if (!cancelled) {
-          setProviderModels((prev) => ({ ...prev, cerebras: models }));
-        }
-      } catch {
-        // Keep static fallback list when live fetch fails.
-      }
-    };
+  const effectiveValue = draft ?? savedValue;
+  const dirty = draft !== null && draft.trim() !== savedValue;
 
-    void loadLiveCerebrasModels();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const chainIds = chains.map((c) => c.id);
+  const knownValues = new Set<string>([
+    '',
+    ...(extraOptions?.map((o) => o.value) ?? []),
+    ...chainIds,
+    ...providers.flatMap((p) => p.models.map((m) => `${p.id}/${m.id}`)),
+  ]);
+  const selectValue =
+    customMode || !knownValues.has(effectiveValue) ? '__custom__' : effectiveValue;
 
-  useEffect(() => {
-    if (!config) return;
-    const options = providerModels[config.provider];
-    if (!options || options.length === 0) return;
-    if (options.includes(config.model)) return;
-    const next = { ...config, model: options[0] };
-    setConfig(next);
-    writeLLMConfig(next);
-  }, [config, providerModels]);
-
-  if (!config) return null;
-
-  const save = (patch: Partial<LLMConfig>) => {
-    const next = { ...config, ...patch };
-    setConfig(next);
-    writeLLMConfig(next);
-  };
-
-  const handleProviderChange = (provider: string) => {
-    const preset = LLM_PROVIDERS[provider];
-    if (preset) {
-      const liveModels = providerModels[provider] ?? preset.models;
-      save({
-        provider,
-        baseUrl: preset.baseUrl,
-        model: liveModels[0] ?? preset.defaultModel,
-      });
-    } else {
-      save({ provider });
-    }
-  };
-
-  const handleTest = async () => {
-    setTesting(true);
-    setTestResult(null);
-    // Temporarily enable so generateMissionTitle reads an enabled config.
-    // Only toggle the `enabled` flag — don't snapshot/restore the full config
-    // to avoid clobbering edits the user makes while the async call is in flight.
-    const wasEnabled = config.enabled;
-    if (!wasEnabled) writeLLMConfig({ ...config, enabled: true });
+  const save = async (value: string) => {
+    setSaving(true);
     try {
-      const probe = await testLLMConnection();
-      if (!probe.ok) {
-        toast.error(`Connection failed: ${probe.error ?? 'Unknown error'}`);
-        return;
-      }
-
-      const title = await generateMissionTitle(
-        'Fix the authentication bug in the login page',
-        'I\'ll investigate the login flow and fix the session handling issue.'
-      );
-      const sample = title || probe.content || 'OK';
-      if (sample) {
-        setTestResult(sample);
-        toast.success('LLM connection working');
-      } else {
-        toast.error('No response from LLM. Check your API key and base URL');
-      }
-    } catch (err) {
-      toast.error(
-        `LLM request failed: ${err instanceof Error ? err.message : 'Unknown error'}`
-      );
+      await onSave(value.trim());
+      setDraft(null);
+      setCustomMode(false);
     } finally {
-      // Restore only the enabled flag we toggled, using the *current* config
-      // so any other edits the user made during the test are preserved.
-      if (!wasEnabled) {
-        const current = readLLMConfig();
-        writeLLMConfig({ ...current, enabled: wasEnabled });
-      }
-      setTesting(false);
+      setSaving(false);
     }
   };
-
-  const providerInfo = LLM_PROVIDERS[config.provider];
-  const modelOptions =
-    providerModels[config.provider] ?? providerInfo?.models ?? [];
 
   return (
-    <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
+    <div className="flex flex-col rounded-xl border border-white/[0.04] bg-white/[0.02] p-5">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <div
+            className={`flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl ${iconTint}`}
+          >
+            {icon}
+          </div>
+          <div className="min-w-0">
+            <h2 className="text-sm font-medium text-white">{title}</h2>
+            <p className="text-xs text-white/40">{subtitle}</p>
+          </div>
+        </div>
+        {!rolesLoading && source && (
+          <span className="flex-shrink-0 rounded-md bg-white/[0.04] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-white/40">
+            {SOURCE_LABELS[source] ?? source}
+          </span>
+        )}
+      </div>
+
+      <div className="mb-4">
+        <RoleStatusChip role={role} loading={rolesLoading} />
+      </div>
+
+      <div className="mt-auto">
+        <label className="mb-1.5 block text-xs font-medium text-white/60">
+          Model
+        </label>
+        {settingsLoading ? (
+          <div className="space-y-2">
+            <div className="h-9 animate-pulse rounded-lg bg-white/[0.04]" />
+            <div className="h-7 w-24 animate-pulse rounded-lg bg-white/[0.03]" />
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <select
+              value={selectValue}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === '__custom__') {
+                  setCustomMode(true);
+                  setDraft(effectiveValue);
+                } else {
+                  setCustomMode(false);
+                  setDraft(v);
+                }
+              }}
+              className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:border-indigo-500/50 focus:outline-none [&>optgroup]:bg-slate-900 [&>optgroup]:text-white/70 [&>option]:bg-slate-800 [&>option]:text-white"
+            >
+              <option value="">{defaultLabel}</option>
+              {extraOptions?.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+              {chainIds.length > 0 && (
+                <optgroup label="Routing chains (with fallbacks)">
+                  {chainIds.map((id) => (
+                    <option key={id} value={id}>
+                      {id}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {providers.map(
+                (p) =>
+                  p.models.length > 0 && (
+                    <optgroup key={p.id} label={p.name}>
+                      {p.models.map((m) => (
+                        <option key={`${p.id}/${m.id}`} value={`${p.id}/${m.id}`}>
+                          {p.id}/{m.id}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )
+              )}
+              <option value="__custom__">Custom...</option>
+            </select>
+            {selectValue === '__custom__' && (
+              <input
+                type="text"
+                value={effectiveValue}
+                onChange={(e) => setDraft(e.target.value)}
+                placeholder="chain id or provider/model"
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 font-mono text-sm text-white placeholder:text-white/20 focus:border-indigo-500/50 focus:outline-none"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') save(effectiveValue);
+                }}
+              />
+            )}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => save(effectiveValue)}
+                disabled={saving || !dirty}
+                className="flex cursor-pointer items-center gap-1.5 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs text-white transition-colors hover:bg-indigo-600 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving ? (
+                  <Loader className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Check className="h-3 w-3" />
+                )}
+                Save
+              </button>
+              {savedValue && (
+                <button
+                  onClick={() => save('')}
+                  disabled={saving}
+                  className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-white/[0.06] px-3 py-1.5 text-xs text-white/60 transition-colors hover:bg-white/[0.04] active:scale-[0.98] disabled:opacity-50"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  Reset
+                </button>
+              )}
+            </div>
+            <p className="text-xs leading-relaxed text-white/30">{helpText}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function LLMSettingsPage() {
+  const {
+    data: serverSettings,
+    isLoading: settingsLoading,
+    mutate: mutateSettings,
+  } = useSWR('settings', getSettings, { revalidateOnFocus: false });
+  const {
+    data: roles,
+    isLoading: rolesLoading,
+    mutate: mutateRoles,
+  } = useSWR('llm-roles', getLlmRoles, { revalidateOnFocus: false });
+  const { data: chains = [] } = useSWR<ModelChain[]>('model-chains', listModelChains, {
+    revalidateOnFocus: false,
+    dedupingInterval: 60000,
+  });
+  const { data: providersData } = useSWR(
+    'providers-all',
+    () => listProviders({ includeAll: true }),
+    { revalidateOnFocus: false, dedupingInterval: 60000 }
+  );
+  const providers = providersData?.providers ?? [];
+
+  const saveRole = async (
+    field: 'ask_assistant_model' | 'metadata_model',
+    label: string,
+    value: string
+  ) => {
+    try {
+      // "" (not null) clears: a present empty string is normalized to None
+      // server-side, whereas JSON null means "no change".
+      await updateSettings({ [field]: value });
+      mutateSettings();
+      mutateRoles();
+      toast.success(value ? `${label} model updated` : `${label} model reset to default`);
+    } catch (err) {
+      toast.error(
+        `Failed to save: ${err instanceof Error ? err.message : 'Unknown error'}`
+      );
+      throw err;
+    }
+  };
+
+  const anyUnavailable =
+    !rolesLoading && roles && (!roles.assistant.available || !roles.metadata.available);
+
+  return (
+    <div className="flex flex-1 flex-col items-center overflow-auto p-6">
       <div className="w-full max-w-4xl space-y-6">
         <header>
           <h1 className="text-xl font-semibold text-white">LLM</h1>
           <p className="mt-1 text-sm text-white/50">
-            Fast model used for dashboard features like mission titles
+            Server-side models powering the copilot and mission metadata
           </p>
         </header>
 
-        <div className="space-y-5">
-          <div className="grid gap-5 md:grid-cols-2">
-          {/* Enable toggle */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 flex-shrink-0">
-                  <Sparkles className="h-5 w-5 text-amber-400" />
-                </div>
-                <div>
-                  <h2 className="text-sm font-medium text-white">
-                    LLM Integration
-                  </h2>
-                  <p className="text-xs text-white/40">
-                    Powers mission titles and other dashboard AI features
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => save({ enabled: !config.enabled })}
-                className={cn(
-                  'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                  config.enabled ? 'bg-emerald-500' : 'bg-white/10'
-                )}
-              >
-                <span
-                  className={cn(
-                    'inline-block h-4 w-4 rounded-full bg-white transition-transform',
-                    config.enabled ? 'translate-x-6' : 'translate-x-1'
-                  )}
-                />
-              </button>
-            </div>
-          </div>
+        <div className="grid gap-5 md:grid-cols-2">
+          <RoleCard
+            icon={<Sparkles className="h-5 w-5 text-sky-400" />}
+            iconTint="bg-sky-500/10"
+            title="Copilot"
+            subtitle="Mission co-pilot (Ask panel)"
+            role={roles?.assistant}
+            source={roles?.assistant_source}
+            rolesLoading={rolesLoading}
+            settingsLoading={settingsLoading}
+            savedValue={serverSettings?.ask_assistant_model ?? ''}
+            defaultLabel="Default: Cerebras gpt-oss-120b"
+            extraOptions={[
+              { value: 'zai-glm-4.7', label: 'Cerebras zai-glm-4.7 (larger, slower)' },
+            ]}
+            chains={chains}
+            providers={providers}
+            helpText={
+              <>
+                Chains and provider picks route through /v1 with fallbacks and
+                usage accounting. Bare model ids stay on direct Cerebras.
+              </>
+            }
+            onSave={(v) => saveRole('ask_assistant_model', 'Copilot', v)}
+          />
 
-          {/* Features */}
-          <div
-            className={cn(
-              'rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 transition-opacity',
-              !config.enabled && 'opacity-60 dark:opacity-40 pointer-events-none'
-            )}
-          >
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 flex-shrink-0">
-                <Type className="h-5 w-5 text-sky-400" />
-              </div>
-              <div>
-                <h2 className="text-sm font-medium text-white">Features</h2>
-                <p className="text-xs text-white/40">
-                  What the dashboard uses this model for
-                </p>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-white/80">
-                  Auto-generate mission titles
-                </p>
-                <p className="text-xs text-white/40">
-                  Use the LLM to create meaningful titles from mission content
-                </p>
-              </div>
-              <button
-                onClick={() => save({ autoTitle: !config.autoTitle })}
-                className={cn(
-                  'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                  config.autoTitle ? 'bg-emerald-500' : 'bg-white/10'
-                )}
-              >
-                <span
-                  className={cn(
-                    'inline-block h-4 w-4 rounded-full bg-white transition-transform',
-                    config.autoTitle ? 'translate-x-6' : 'translate-x-1'
-                  )}
-                />
-              </button>
-            </div>
-          </div>
-          </div>
-
-          {/* Provider config */}
-          <div
-            className={cn(
-              'rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 space-y-4 transition-opacity',
-              !config.enabled && 'opacity-60 dark:opacity-40 pointer-events-none'
-            )}
-          >
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
-                <Zap className="h-5 w-5 text-indigo-400" />
-              </div>
-              <div>
-                <h2 className="text-sm font-medium text-white">Provider</h2>
-                <p className="text-xs text-white/40">
-                  Cerebras is the fastest option
-                </p>
-              </div>
-            </div>
-
-            {/* Provider selector */}
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Provider
-              </label>
-              <div className="flex flex-wrap gap-2">
-                {Object.entries(LLM_PROVIDERS).map(([id, p]) => (
-                  <button
-                    key={id}
-                    onClick={() => handleProviderChange(id)}
-                    className={cn(
-                      'px-3 py-1.5 rounded-lg text-xs font-medium transition-colors',
-                      config.provider === id
-                        ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
-                        : 'bg-white/[0.04] text-white/50 border border-transparent hover:bg-white/[0.06]'
-                    )}
-                  >
-                    {p.name}
-                  </button>
-                ))}
-                <button
-                  onClick={() => handleProviderChange('custom')}
-                  className={cn(
-                    'px-3 py-1.5 rounded-lg text-xs font-medium transition-colors',
-                    !LLM_PROVIDERS[config.provider]
-                      ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
-                      : 'bg-white/[0.04] text-white/50 border border-transparent hover:bg-white/[0.06]'
-                  )}
-                >
-                  Custom
-                </button>
-              </div>
-            </div>
-
-            {/* API Key */}
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                API Key
-              </label>
-              <div className="relative">
-                <input
-                  type={showApiKey ? 'text' : 'password'}
-                  value={config.apiKey}
-                  onChange={(e) => save({ apiKey: e.target.value })}
-                  placeholder="sk-..."
-                  className="w-full rounded-lg bg-white/[0.04] border border-white/[0.06] px-3 py-2 pr-10 text-sm text-white placeholder:text-white/20 focus:border-indigo-500/40 focus:outline-none"
-                />
-                <button
-                  onClick={() => setShowApiKey(!showApiKey)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60"
-                >
-                  {showApiKey ? (
-                    <EyeOff className="h-4 w-4" />
-                  ) : (
-                    <Eye className="h-4 w-4" />
-                  )}
-                </button>
-              </div>
-            </div>
-
-            {/* Base URL (shown for custom, or editable) */}
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Base URL
-              </label>
-              <input
-                type="text"
-                value={config.baseUrl}
-                onChange={(e) => save({ baseUrl: e.target.value })}
-                placeholder="https://api.cerebras.ai/v1"
-                className="w-full rounded-lg bg-white/[0.04] border border-white/[0.06] px-3 py-2 text-sm text-white placeholder:text-white/20 focus:border-indigo-500/40 focus:outline-none"
-              />
-            </div>
-
-            {/* Model */}
-            <div>
-              <label className="block text-xs font-medium text-white/60 mb-1.5">
-                Model
-              </label>
-              {modelOptions.length > 0 ? (
-                <select
-                  value={config.model}
-                  onChange={(e) => save({ model: e.target.value })}
-                  className="w-full rounded-lg bg-white/[0.04] border border-white/[0.06] px-3 py-2 text-sm text-white focus:border-indigo-500/40 focus:outline-none appearance-none"
-                >
-                  {modelOptions.map((m) => (
-                    <option key={m} value={m} className="bg-[#1a1a2e]">
-                      {m}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <input
-                  type="text"
-                  value={config.model}
-                  onChange={(e) => save({ model: e.target.value })}
-                  placeholder="model-name"
-                  className="w-full rounded-lg bg-white/[0.04] border border-white/[0.06] px-3 py-2 text-sm text-white placeholder:text-white/20 focus:border-indigo-500/40 focus:outline-none"
-                />
-              )}
-            </div>
-
-            {/* Test button */}
-            <div className="pt-2">
-              <button
-                onClick={handleTest}
-                disabled={!config.apiKey || testing}
-                className={cn(
-                  'flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
-                  config.apiKey && !testing
-                    ? 'bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30'
-                    : 'bg-white/[0.04] text-white/30 cursor-not-allowed'
-                )}
-              >
-                {testing ? (
-                  <Loader className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Check className="h-4 w-4" />
-                )}
-                Test Connection
-              </button>
-              {testResult && (
-                <p className="mt-2 text-xs text-emerald-400">
-                  Generated title: &ldquo;{testResult}&rdquo;
-                </p>
-              )}
-            </div>
-          </div>
-
+          <RoleCard
+            icon={<Type className="h-5 w-5 text-amber-400" />}
+            iconTint="bg-amber-500/10"
+            title="Mission Titles & Status"
+            subtitle="Summarizes missions after each turn"
+            role={roles?.metadata}
+            source={roles?.metadata_source}
+            rolesLoading={rolesLoading}
+            settingsLoading={settingsLoading}
+            savedValue={serverSettings?.metadata_model ?? ''}
+            defaultLabel="Auto: fastest configured provider"
+            chains={chains}
+            providers={providers}
+            helpText={
+              <>
+                Auto picks the cheapest fast provider and follows provider
+                changes without a restart. Overrides must be a chain or
+                provider/model.
+              </>
+            }
+            onSave={(v) => saveRole('metadata_model', 'Metadata', v)}
+          />
         </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-white/[0.04] bg-white/[0.02] px-5 py-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <Key className="h-4 w-4 flex-shrink-0 text-indigo-400" />
+            <p className="text-xs text-white/50">
+              Defaults need an OpenAI-compatible provider. Chains and models come
+              from Routing and Providers.
+            </p>
+          </div>
+          <div className="flex flex-shrink-0 items-center gap-2">
+            <Link
+              href="/model-routing"
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.04]"
+            >
+              Routing
+              <ArrowUpRight className="h-3 w-3" />
+            </Link>
+            <Link
+              href="/settings/providers"
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.04]"
+            >
+              Providers
+              <ArrowUpRight className="h-3 w-3" />
+            </Link>
+          </div>
+        </div>
+
+        {anyUnavailable && (
+          <p className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400/90">
+            {!roles?.assistant.available && !roles?.metadata.available
+              ? 'No usable provider found: the copilot and title generation are disabled until one is configured.'
+              : !roles?.assistant.available
+                ? 'No usable provider found for the copilot; it is disabled until one is configured.'
+                : 'No usable provider found for mission titles; they fall back to raw text until one is configured.'}
+          </p>
+        )}
       </div>
     </div>
   );

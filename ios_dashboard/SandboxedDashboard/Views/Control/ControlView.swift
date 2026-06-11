@@ -131,6 +131,11 @@ struct ControlView: View {
     @State private var pendingSendCount = 0
     @State private var queuedItems: [QueuedMessage] = []
     @State private var showQueueSheet = false
+    /// Bumped on every local queue mutation (remove / clear). In-flight
+    /// `getQueue()` responses captured under an older generation are
+    /// discarded — they may still contain a just-deleted message and would
+    /// resurrect it as a ghost row.
+    @State private var queueMutationGeneration = 0
     @State private var currentMission: Mission?
     @State private var viewingMission: Mission?
     @State private var isLoading = true
@@ -3187,7 +3192,20 @@ struct ControlView: View {
 
     private func loadQueueItems() async {
         do {
-            queuedItems = try await api.getQueue()
+            let generation = queueMutationGeneration
+            let allQueued = try await api.getQueue()
+            // A local remove/clear landed while this fetch was in flight —
+            // the snapshot may still contain the deleted message. Discard it.
+            guard generation == queueMutationGeneration else { return }
+            // GET /api/control/queue returns every mission's queued messages;
+            // scope the sheet to the mission being viewed so we never show
+            // (or delete) another mission's queue entries.
+            let missionId = viewingMissionId ?? currentMission?.id
+            if let missionId {
+                queuedItems = allQueued.filter { $0.missionId == missionId }
+            } else {
+                queuedItems = allQueued
+            }
         } catch {
             print("Failed to load queue: \(error)")
         }
@@ -3205,9 +3223,14 @@ struct ControlView: View {
             queuedItems.removeAll { $0.id == messageId }
             queueLength = max(0, queueLength - 1)
         }
+        queueMutationGeneration += 1
         Task {
             do {
                 try await api.removeFromQueue(messageId: messageId)
+            } catch APIError.httpError(404, _) {
+                // Already gone server-side (e.g. a stale snapshot had
+                // resurrected an already-deleted row) — the optimistic
+                // removal was correct; nothing to roll back.
             } catch {
                 print("Failed to remove from queue: \(error)")
                 // Reconcile with the server on error so the row reappears
@@ -3220,16 +3243,19 @@ struct ControlView: View {
     }
 
     /// Synchronous optimistic clear — same rationale as
-    /// `removeFromQueueOptimistic`.
+    /// `removeFromQueueOptimistic`. Scoped to the viewed mission so clearing
+    /// here doesn't wipe other missions' queues.
     private func clearQueueOptimistic() {
         withAnimation(.easeOut(duration: 0.2)) {
             queuedItems = []
             queueLength = 0
         }
+        queueMutationGeneration += 1
         showQueueSheet = false
+        let missionId = viewingMissionId ?? currentMission?.id
         Task {
             do {
-                _ = try await api.clearQueue()
+                _ = try await api.clearQueue(missionId: missionId)
                 HapticService.success()
             } catch {
                 print("Failed to clear queue: \(error)")

@@ -386,6 +386,53 @@ fn parse_direct_model_entry(model: &str) -> Option<crate::provider_health::Chain
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Usage accounting
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Persist one routed /v1 request's token usage into the single-tenant user's
+/// mission store so the providers usage page counts router traffic alongside
+/// mission usage. Cost is a list-price estimate from the upstream model id.
+async fn record_proxy_usage(
+    state: &Arc<super::routes::AppState>,
+    model_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) {
+    let model = crate::cost::normalized_model(model_id);
+    let usage = crate::cost::TokenUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    };
+    let cost_cents = crate::cost::cost_cents_from_usage(&model, &usage);
+    let user = super::auth::implicit_single_tenant_user(&state.config);
+    let control_state = state.control.get_or_spawn(&user).await;
+    if let Err(error) = control_state
+        .mission_store
+        .record_proxy_usage(&model, input_tokens, output_tokens, cost_cents)
+        .await
+    {
+        tracing::warn!(%error, model = %model, "Failed to record proxy usage");
+    }
+}
+
+/// Build the usage callback handed to [`track_stream_health`]: streaming
+/// responses only learn their token counts when the final SSE event arrives,
+/// inside the stream wrapper, where neither `state` nor the model are in
+/// scope.
+fn proxy_usage_sink(
+    state: Arc<super::routes::AppState>,
+    model_id: String,
+) -> Box<dyn FnOnce(u64, u64) + Send> {
+    Box::new(move |input_tokens, output_tokens| {
+        tokio::spawn(async move {
+            record_proxy_usage(&state, &model_id, input_tokens, output_tokens).await;
+        });
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Handler
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -398,7 +445,16 @@ async fn chat_completions(
     if let Err(resp) = verify_proxy_auth(&headers, &state).await {
         return resp;
     }
+    chat_completions_inner(state, headers, body).await
+}
 
+/// Chain-routed chat completion without proxy auth.  Callers must enforce
+/// their own authentication (e.g. the JWT-protected chain test endpoint).
+pub(crate) async fn chat_completions_inner(
+    state: Arc<super::routes::AppState>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
     // 1. Parse the request to extract the model name
     let req: ChatCompletionRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -424,6 +480,17 @@ async fn chat_completions(
         );
     }
     let requested_model = req.model.clone();
+
+    // Mission attribution for runner watchdogs: the per-workspace builtin
+    // provider sends this header so the proxy can report "this mission's LLM
+    // call is still streaming" while the harness CLI emits nothing.
+    let liveness_mission_id = headers
+        .get(crate::api::proxy_liveness::MISSION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| uuid::Uuid::parse_str(v.trim()).ok());
+    if let Some(id) = liveness_mission_id {
+        crate::api::proxy_liveness::note_activity(id);
+    }
 
     // 2. Resolve the requested model to chain entries:
     //    (a) A known chain id — exact, or "builtin/{model}" (the
@@ -480,6 +547,16 @@ async fn chat_completions(
             "model_not_found",
         );
     };
+
+    // Per-chain post-processing: strip `<think>` markup from responses for
+    // chains routed to models that leak reasoning into `content`. Direct
+    // provider/model passthrough ids aren't chains, so this resolves to false.
+    let strip_thinking = state
+        .chain_store
+        .get(&chain_id)
+        .await
+        .map(|c| c.strip_thinking)
+        .unwrap_or(false);
 
     if entries.is_empty() {
         if defer_on_rate_limit {
@@ -584,15 +661,19 @@ async fn chat_completions(
                     continue;
                 }
             };
-            let upstream_body =
-                match build_anthropic_upstream_request(&body, &entry.model_id, is_stream) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!("Failed to build Anthropic upstream request: {}", e);
-                        server_error_count += 1;
-                        continue;
-                    }
-                };
+            let upstream_body = match build_anthropic_upstream_request(
+                &body,
+                &entry.model_id,
+                is_stream,
+                entry.has_oauth,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("Failed to build Anthropic upstream request: {}", e);
+                    server_error_count += 1;
+                    continue;
+                }
+            };
             let headers = build_anthropic_proxy_headers(credential, entry.has_oauth);
             (
                 "https://api.anthropic.com/v1/messages".to_string(),
@@ -766,7 +847,12 @@ async fn chat_completions(
                 let base = if use_anthropic_oauth_cli_proxy_adapter {
                     rewrite_model_for_anthropic_cli_proxy(&body, &entry.model_id)
                 } else {
-                    build_anthropic_upstream_request(&body, &entry.model_id, is_stream)
+                    build_anthropic_upstream_request(
+                        &body,
+                        &entry.model_id,
+                        is_stream,
+                        entry.has_oauth,
+                    )
                 };
                 base.and_then(|b| anthropic_body_drop_thinking_and_disable(&b))
                     .map_err(
@@ -873,6 +959,8 @@ async fn chat_completions(
                     account_id,
                     None,
                     entry.subscription_key.clone(),
+                    Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
+                    liveness_mission_id,
                 );
 
                 let success_provider = entry.provider_id.clone();
@@ -1053,6 +1141,7 @@ async fn chat_completions(
                     .health_tracker
                     .record_token_usage(entry.account_id, input, output)
                     .await;
+                record_proxy_usage(&state, &entry.model_id, input, output).await;
             }
             let success_provider = entry.provider_id.clone();
             for evt in &mut pending_fallback_events {
@@ -1111,6 +1200,8 @@ async fn chat_completions(
                     account_id,
                     None,
                     entry.subscription_key.clone(),
+                    Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
+                    liveness_mission_id,
                 );
 
                 let success_provider = entry.provider_id.clone();
@@ -1280,6 +1371,7 @@ async fn chat_completions(
                     .health_tracker
                     .record_token_usage(entry.account_id, input, output)
                     .await;
+                record_proxy_usage(&state, &entry.model_id, input, output).await;
             }
             let success_provider = entry.provider_id.clone();
             for evt in &mut pending_fallback_events {
@@ -1310,6 +1402,26 @@ async fn chat_completions(
         if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
             let elapsed_ms = request_start.elapsed().as_millis() as u64;
             let retry_after = parse_rate_limit_headers(upstream_resp.headers(), provider_type);
+            // Passive Codex usage capture (B): a 429 from the local CLIProxyAPI
+            // on the Codex path carries a `model_cooldown` body with the weekly
+            // (secondary) window reset. The cli-proxy strips the rich x-codex-*
+            // headers, so this exhaustion signal is all we can glean from real
+            // traffic — fold it into the same store the active probe writes, so
+            // the providers panel reflects "weekly limit reached" without a
+            // probe. Keyed by entry.account_id == the provider UUID the usage
+            // probe stores under. Only the codex path reads the body here.
+            if use_openai_oauth_cli_proxy_adapter {
+                let store_key = entry.account_id.to_string();
+                let codex_store = state.codex_usage.clone();
+                if let Ok(body) = upstream_resp.bytes().await {
+                    let now_unix = chrono::Utc::now().timestamp();
+                    if let Some(reset_at) =
+                        crate::api::codex_usage::parse_cooldown_reset(&body, now_unix)
+                    {
+                        codex_store.put_passive_cooldown(store_key, reset_at).await;
+                    }
+                }
+            }
             let reason = if status.as_u16() == 529 {
                 CooldownReason::Overloaded
             } else {
@@ -1583,7 +1695,7 @@ async fn chat_completions(
                 Ok::<_, reqwest::Error>(bytes::Bytes::from(peek_buf))
             });
             let combined = peek_stream.chain(byte_stream);
-            let byte_stream = normalize_sse_stream(combined);
+            let byte_stream = normalize_sse_stream(combined, strip_thinking);
 
             // Wrap the stream to record success/failure on completion.
             let tracked_stream = track_stream_health(
@@ -1592,6 +1704,8 @@ async fn chat_completions(
                 account_id,
                 rate_limit_snapshot,
                 entry.subscription_key.clone(),
+                Some(proxy_usage_sink(state.clone(), entry.model_id.clone())),
+                liveness_mission_id,
             );
 
             return (status, response_headers, Body::from_stream(tracked_stream)).into_response();
@@ -1679,6 +1793,7 @@ async fn chat_completions(
                                     .health_tracker
                                     .record_token_usage(entry.account_id, input, output)
                                     .await;
+                                record_proxy_usage(&state, &entry.model_id, input, output).await;
                             }
                         }
                     }
@@ -1694,6 +1809,13 @@ async fn chat_completions(
                         state.health_tracker.record_fallback_event(evt).await;
                     }
                 }
+                // Strip `<think>` markup from the completion body when the
+                // chain opts in (only meaningful on successful responses).
+                let resp_body = if strip_thinking && status.is_success() {
+                    strip_thinking_from_completion(&resp_body)
+                } else {
+                    resp_body
+                };
                 let mut builder = Response::builder().status(status);
                 if let Some(ct) = response_headers.get(header::CONTENT_TYPE) {
                     builder = builder.header(header::CONTENT_TYPE, ct);
@@ -1865,7 +1987,9 @@ fn rewrite_model(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
 /// Newer Opus models reject explicit sampling params (`temperature`, `top_p`,
 /// `top_k`) when extended thinking is active, so we strip them for these IDs.
 fn anthropic_model_omits_sampling_params(model_id: &str) -> bool {
-    model_id.contains("claude-opus-4-8") || model_id.contains("claude-opus-4-7")
+    model_id.contains("claude-fable-5")
+        || model_id.contains("claude-opus-4-8")
+        || model_id.contains("claude-opus-4-7")
 }
 
 /// Drop `thinking`/`redacted_thinking` blocks from assistant messages.
@@ -2459,22 +2583,186 @@ fn classify_embedded_error(v: &serde_json::Value) -> CooldownReason {
     CooldownReason::ServerError
 }
 
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Incrementally strips model "thinking" markup from text: `<think>…</think>`
+/// blocks and stray orphan `</think>` tags. Some reasoning models prefill the
+/// opening `<think>` in the prompt template and emit only the closing tag, so
+/// orphan `</think>` must be dropped too. State persists across calls so a tag
+/// split across SSE deltas is handled correctly.
+#[derive(Default)]
+struct ThinkStripper {
+    /// True while inside an open `<think>` block.
+    inside: bool,
+    /// Trailing text held back because it may be the start of a tag that
+    /// continues in the next chunk.
+    pending: String,
+}
+
+impl ThinkStripper {
+    /// Feed a chunk of content; returns the text to emit. A partial tag at the
+    /// end is buffered until the next `feed`/`flush`.
+    fn feed(&mut self, input: &str) -> String {
+        let mut data = std::mem::take(&mut self.pending);
+        data.push_str(input);
+        let mut out = String::new();
+        loop {
+            if self.inside {
+                if let Some(pos) = data.find(THINK_CLOSE) {
+                    data.drain(..pos + THINK_CLOSE.len());
+                    self.inside = false;
+                    continue;
+                }
+                // No close yet — hold back a possible partial closing tag.
+                let keep = longest_tag_prefix_suffix(&data, &[THINK_CLOSE]);
+                self.pending = data.split_off(data.len() - keep);
+                return out;
+            }
+            // Outside a block: act on whichever of `<think>`/`</think>` is first.
+            match earliest_tag(data.find(THINK_OPEN), data.find(THINK_CLOSE)) {
+                Some((pos, true)) => {
+                    out.push_str(&data[..pos]);
+                    data.drain(..pos + THINK_OPEN.len());
+                    self.inside = true;
+                }
+                Some((pos, false)) => {
+                    // Orphan closing tag — emit preceding text, drop the tag.
+                    out.push_str(&data[..pos]);
+                    data.drain(..pos + THINK_CLOSE.len());
+                }
+                None => {
+                    let keep = longest_tag_prefix_suffix(&data, &[THINK_OPEN, THINK_CLOSE]);
+                    let emit_to = data.len() - keep;
+                    out.push_str(&data[..emit_to]);
+                    self.pending = data.split_off(emit_to);
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Flush buffered text at end of stream. Leftover `pending` that never
+    /// completed a tag is literal content; drop it if still inside a block
+    /// (unterminated reasoning).
+    fn flush(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        if self.inside {
+            String::new()
+        } else {
+            pending
+        }
+    }
+}
+
+/// Of two optional `<think>`/`</think>` byte positions, return (pos, is_open)
+/// for whichever appears first.
+fn earliest_tag(open: Option<usize>, close: Option<usize>) -> Option<(usize, bool)> {
+    match (open, close) {
+        (Some(o), Some(c)) => Some(if o <= c { (o, true) } else { (c, false) }),
+        (Some(o), None) => Some((o, true)),
+        (None, Some(c)) => Some((c, false)),
+        (None, None) => None,
+    }
+}
+
+/// Length (bytes) of the longest suffix of `data` that is a proper prefix of
+/// any tag — the slice to hold back at a chunk boundary in case the tag
+/// continues. Tags are ASCII, so suffix boundaries are always valid.
+fn longest_tag_prefix_suffix(data: &str, tags: &[&str]) -> usize {
+    let upper = tags
+        .iter()
+        .map(|t| t.len() - 1)
+        .max()
+        .unwrap_or(0)
+        .min(data.len());
+    for len in (1..=upper).rev() {
+        let start = data.len() - len;
+        if !data.is_char_boundary(start) {
+            continue;
+        }
+        let suffix = &data[start..];
+        if tags.iter().any(|t| t.len() > len && t.starts_with(suffix)) {
+            return len;
+        }
+    }
+    0
+}
+
+/// Strip `<think>` markup from a non-streaming chat-completion JSON body's
+/// `choices[].message.content`. Returns the original bytes on parse failure or
+/// when nothing changed.
+fn strip_thinking_from_completion(body: &bytes::Bytes) -> bytes::Bytes {
+    let mut v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return body.clone(),
+    };
+    let mut changed = false;
+    if let Some(choices) = v.get_mut("choices").and_then(|c| c.as_array_mut()) {
+        for choice in choices {
+            if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
+                if let Some(content) = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+                {
+                    let mut st = ThinkStripper::default();
+                    let mut stripped = st.feed(&content);
+                    stripped.push_str(&st.flush());
+                    if stripped != content {
+                        msg.insert("content".into(), serde_json::Value::String(stripped));
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if !changed {
+        return body.clone();
+    }
+    serde_json::to_vec(&v)
+        .map(bytes::Bytes::from)
+        .unwrap_or_else(|_| body.clone())
+}
+
 /// Normalize an SSE byte stream to fix provider-specific quirks.
 ///
 /// Processes `data:` lines, parses the JSON chunk, and strips fields that
 /// break OpenAI-compatible clients (e.g. MiniMax sending `delta.role: ""`).
+/// When `strip_thinking` is set, also removes `<think>…</think>` markup from
+/// streamed `delta.content` (state threaded across chunks).
 fn normalize_sse_stream(
     inner: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    strip_thinking: bool,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    // State carries the stream, the line buffer, the cross-chunk `<think>`
+    // stripper, a remembered chunk envelope (id/model/created — used to build a
+    // synthetic flush chunk for any text the stripper held back), and a flag so
+    // we flush that held-back text exactly once.
     futures::stream::unfold(
-        (Box::pin(inner), Vec::<u8>::new()),
-        |(mut stream, mut buf)| async move {
+        (
+            Box::pin(inner),
+            Vec::<u8>::new(),
+            ThinkStripper::default(),
+            Option::<serde_json::Value>::None,
+            false,
+        ),
+        move |(mut stream, mut buf, mut stripper, mut envelope, mut flushed)| async move {
             loop {
                 // Check if we have a complete line in the buffer
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let line = buf.drain(..=pos).collect::<Vec<u8>>();
-                    let normalized = normalize_sse_line(&line);
-                    return Some((Ok(bytes::Bytes::from(normalized)), (stream, buf)));
+                    let normalized = normalize_sse_line(
+                        &line,
+                        strip_thinking,
+                        &mut stripper,
+                        &mut envelope,
+                        &mut flushed,
+                    );
+                    return Some((
+                        Ok(bytes::Bytes::from(normalized)),
+                        (stream, buf, stripper, envelope, flushed),
+                    ));
                 }
 
                 // Need more data
@@ -2483,16 +2771,45 @@ fn normalize_sse_stream(
                         buf.extend_from_slice(&chunk);
                     }
                     Some(Err(e)) => {
-                        return Some((Err(std::io::Error::other(e.to_string())), (stream, buf)));
+                        return Some((
+                            Err(std::io::Error::other(e.to_string())),
+                            (stream, buf, stripper, envelope, flushed),
+                        ));
                     }
                     None => {
-                        // Stream ended — flush remaining buffer
-                        if buf.is_empty() {
-                            return None;
+                        // Stream ended — flush remaining buffer first.
+                        if !buf.is_empty() {
+                            let remaining = std::mem::take(&mut buf);
+                            let normalized = normalize_sse_line(
+                                &remaining,
+                                strip_thinking,
+                                &mut stripper,
+                                &mut envelope,
+                                &mut flushed,
+                            );
+                            return Some((
+                                Ok(bytes::Bytes::from(normalized)),
+                                (stream, buf, stripper, envelope, flushed),
+                            ));
                         }
-                        let remaining = std::mem::take(&mut buf);
-                        let normalized = normalize_sse_line(&remaining);
-                        return Some((Ok(bytes::Bytes::from(normalized)), (stream, buf)));
+                        // Fallback flush for providers that end the stream without
+                        // a `[DONE]` terminator (the `[DONE]` path flushes inline,
+                        // before the terminator, so it doesn't reach here).
+                        if strip_thinking && !flushed {
+                            flushed = true;
+                            let leftover = stripper.flush();
+                            if !leftover.is_empty() {
+                                if let Some(chunk_line) =
+                                    build_flush_chunk_line(envelope.as_ref(), &leftover, b"\n")
+                                {
+                                    return Some((
+                                        Ok(bytes::Bytes::from(chunk_line)),
+                                        (stream, buf, stripper, envelope, flushed),
+                                    ));
+                                }
+                            }
+                        }
+                        return None;
                     }
                 }
             }
@@ -2502,7 +2819,13 @@ fn normalize_sse_stream(
 
 /// Normalize a single SSE line.  If it's a `data: {...}` line, parse and
 /// fix known provider quirks; otherwise pass through unchanged.
-fn normalize_sse_line(line: &[u8]) -> Vec<u8> {
+fn normalize_sse_line(
+    line: &[u8],
+    strip_thinking: bool,
+    stripper: &mut ThinkStripper,
+    envelope: &mut Option<serde_json::Value>,
+    flushed: &mut bool,
+) -> Vec<u8> {
     let trimmed = line
         .strip_suffix(b"\r\n")
         .or_else(|| line.strip_suffix(b"\n"))
@@ -2515,12 +2838,27 @@ fn normalize_sse_line(line: &[u8]) -> Vec<u8> {
 
     let json_bytes = &trimmed[data_prefix.len()..];
 
-    // "data: [DONE]" — pass through
+    // "data: [DONE]" — terminator. Before passing it through, emit any literal
+    // text the stripper held back at the last chunk boundary (e.g. a reply
+    // ending in `<` or `</thi`), so it isn't lost. It must precede `[DONE]`
+    // because clients stop reading at the terminator.
     let json_trimmed: &[u8] = {
         let s = std::str::from_utf8(json_bytes).unwrap_or("");
         s.trim().as_bytes()
     };
     if json_trimmed == b"[DONE]" {
+        if strip_thinking && !*flushed {
+            *flushed = true;
+            let leftover = stripper.flush();
+            if !leftover.is_empty() {
+                if let Some(mut chunk_line) =
+                    build_flush_chunk_line(envelope.as_ref(), &leftover, line)
+                {
+                    chunk_line.extend_from_slice(line);
+                    return chunk_line;
+                }
+            }
+        }
         return line.to_vec();
     }
 
@@ -2531,7 +2869,8 @@ fn normalize_sse_line(line: &[u8]) -> Vec<u8> {
 
     let mut modified = false;
 
-    // Fix MiniMax: strip empty `delta.role` field
+    // Fix MiniMax: strip empty `delta.role` field, and (when enabled) strip
+    // `<think>` markup from streamed `delta.content`.
     if let Some(choices) = chunk.get_mut("choices").and_then(|v| v.as_array_mut()) {
         for choice in choices {
             if let Some(delta) = choice.get_mut("delta").and_then(|v| v.as_object_mut()) {
@@ -2539,8 +2878,33 @@ fn normalize_sse_line(line: &[u8]) -> Vec<u8> {
                     delta.remove("role");
                     modified = true;
                 }
+                if strip_thinking {
+                    if let Some(content) = delta
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                    {
+                        // Always feed so the stripper's cross-chunk state
+                        // advances, even when the chunk is unchanged.
+                        let stripped = stripper.feed(&content);
+                        if stripped != content {
+                            delta
+                                .insert("content".to_string(), serde_json::Value::String(stripped));
+                            modified = true;
+                        }
+                    }
+                }
             }
         }
+    }
+
+    // Remember the first envelope that has a `choices` array so an end-of-stream
+    // flush chunk can reuse its id/model/created framing.
+    if strip_thinking
+        && envelope.is_none()
+        && chunk.get("choices").and_then(|v| v.as_array()).is_some()
+    {
+        *envelope = Some(chunk.clone());
     }
 
     if !modified {
@@ -2561,6 +2925,44 @@ fn normalize_sse_line(line: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Build a synthetic `data: {...}` SSE event carrying `leftover` as the first
+/// choice's `delta.content`, reusing `envelope` (a remembered chunk) for the
+/// id/model/created framing. Used to emit text the [`ThinkStripper`] held back
+/// at the final chunk boundary. Returns `None` when there is no usable
+/// envelope. The event is terminated with a blank line so clients treat it as
+/// its own SSE event.
+fn build_flush_chunk_line(
+    envelope: Option<&serde_json::Value>,
+    leftover: &str,
+    ref_line: &[u8],
+) -> Option<Vec<u8>> {
+    let mut chunk = envelope?.clone();
+    let choices = chunk.get_mut("choices")?.as_array_mut()?;
+    let first = choices.first_mut()?.as_object_mut()?;
+    let mut delta = serde_json::Map::new();
+    delta.insert(
+        "content".to_string(),
+        serde_json::Value::String(leftover.to_string()),
+    );
+    first.insert("delta".to_string(), serde_json::Value::Object(delta));
+    // A leftover-content chunk is not a terminal chunk.
+    first.remove("finish_reason");
+    // Keep only the first choice — we only carry single-choice leftover text.
+    choices.truncate(1);
+
+    let suffix: &[u8] = if ref_line.ends_with(b"\r\n") {
+        b"\r\n"
+    } else {
+        b"\n"
+    };
+    let mut out = Vec::from(&b"data: "[..]);
+    serde_json::to_writer(&mut out, &chunk).ok()?;
+    // Event line terminator + blank line separating this from the next event.
+    out.extend_from_slice(suffix);
+    out.extend_from_slice(suffix);
+    Some(out)
+}
+
 /// Wrap a streaming response to defer health tracking until the stream finishes.
 ///
 /// Records `record_success` when the stream ends cleanly, or `record_failure`
@@ -2579,6 +2981,8 @@ fn track_stream_health(
     account_id: uuid::Uuid,
     rate_limit_snapshot: Option<crate::provider_health::RateLimitSnapshot>,
     subscription_key: Option<crate::provider_health::SubscriptionKey>,
+    usage_sink: Option<Box<dyn FnOnce(u64, u64) + Send>>,
+    liveness_mission_id: Option<uuid::Uuid>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = std::pin::pin!(inner);
@@ -2611,6 +3015,9 @@ fn track_stream_health(
                     received_any = true;
                     match &item {
                         Ok(chunk) => {
+                            if let Some(id) = liveness_mission_id {
+                                crate::api::proxy_liveness::note_activity(id);
+                            }
                             // Scan SSE data lines for usage in the final chunk.
                             // OpenAI-compatible providers include a `usage` object
                             // in the last `data:` event of the stream.
@@ -2657,6 +3064,9 @@ fn track_stream_health(
                 .await;
             if input_tokens > 0 || output_tokens > 0 {
                 health_tracker.record_token_usage(account_id, input_tokens, output_tokens).await;
+                if let Some(sink) = usage_sink {
+                    sink(input_tokens, output_tokens);
+                }
             }
             if let Some(snapshot) = rate_limit_snapshot {
                 health_tracker.record_rate_limits(account_id, snapshot).await;
@@ -2694,10 +3104,19 @@ fn build_anthropic_proxy_headers(credential: &str, has_oauth: bool) -> HeaderMap
     headers
 }
 
+/// First system block Anthropic requires on OAuth-subscription tokens. The
+/// `/v1/messages` endpoint rejects subscription (Claude Pro/Max) OAuth tokens
+/// with a misleading `429 rate_limit_error` unless the request identifies
+/// itself as Claude Code via this exact system line — even when the account
+/// has ample rate-limit budget. API-key requests don't need it. This mirrors
+/// what real Claude Code (and our own usage-probe in ai_providers.rs) sends.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 fn build_anthropic_upstream_request(
     body: &[u8],
     model_id: &str,
     is_stream: bool,
+    force_claude_code_identity: bool,
 ) -> Result<bytes::Bytes, String> {
     let req: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
@@ -2747,6 +3166,19 @@ fn build_anthropic_upstream_request(
     if model_changed {
         strip_thinking_blocks(&mut messages);
     }
+    // OAuth-subscription tokens require the Claude Code identity as the first
+    // system block, else Anthropic returns a misleading 429. Prepend it unless
+    // the caller's own system prompt already leads with it (idempotent so a
+    // retry can't double it).
+    let system = if force_claude_code_identity && !system.starts_with(CLAUDE_CODE_IDENTITY) {
+        if system.is_empty() {
+            CLAUDE_CODE_IDENTITY.to_string()
+        } else {
+            format!("{CLAUDE_CODE_IDENTITY}\n\n{system}")
+        }
+    } else {
+        system
+    };
     if !system.is_empty() {
         out.insert("system".to_string(), serde_json::Value::String(system));
     }
@@ -2873,6 +3305,14 @@ fn anthropic_content_blocks_from_openai(
         return Vec::new();
     };
     if let Some(text) = content.as_str() {
+        // Anthropic rejects empty/whitespace-only text blocks ("text content
+        // blocks must be non-empty"). An OpenAI assistant message commonly
+        // carries content:"" alongside tool_calls (MiniMax/most OpenAI-style
+        // models do this); emitting an empty text block next to the tool_use
+        // blocks 400s the whole replay. Drop it.
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
         return vec![serde_json::json!({ "type": "text", "text": text })];
     }
     let Some(parts) = content.as_array() else {
@@ -2883,7 +3323,10 @@ fn anthropic_content_blocks_from_openai(
         match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "text" => {
                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    out.push(serde_json::json!({ "type": "text", "text": text }));
+                    // Skip empty/whitespace-only text blocks (see above).
+                    if !text.trim().is_empty() {
+                        out.push(serde_json::json!({ "type": "text", "text": text }));
+                    }
                 }
             }
             "image_url" => {
@@ -3110,6 +3553,7 @@ fn transform_anthropic_sse_to_openai(
             0u32,
             false,
             false,
+            0u64,
         ),
         |(
             mut stream,
@@ -3122,6 +3566,7 @@ fn transform_anthropic_sse_to_openai(
             mut next_tool_idx,
             mut stream_ended,
             mut done_emitted,
+            mut input_tokens,
         )| async move {
             if stream_ended {
                 return None;
@@ -3155,6 +3600,19 @@ fn transform_anthropic_sse_to_openai(
                         sent_role = true;
                     }
                     match event_type {
+                        "message_start" => {
+                            // Capture input tokens so the finish chunk can
+                            // surface OpenAI-style usage (Anthropic reports
+                            // them here, not on message_delta).
+                            if let Some(n) = parsed
+                                .get("message")
+                                .and_then(|m| m.get("usage"))
+                                .and_then(|u| u.get("input_tokens"))
+                                .and_then(|v| v.as_u64())
+                            {
+                                input_tokens = n;
+                            }
+                        }
                         "content_block_start" => {
                             let block_index =
                                 parsed.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -3259,13 +3717,28 @@ fn transform_anthropic_sse_to_openai(
                                     .and_then(|d| d.get("stop_reason"))
                                     .and_then(|v| v.as_str()),
                             );
-                            let chunk = serde_json::json!({
+                            let mut chunk = serde_json::json!({
                                 "id": stream_id,
                                 "object": "chat.completion.chunk",
                                 "created": created,
                                 "model": model_id,
                                 "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
                             });
+                            // Anthropic reports cumulative output tokens here;
+                            // attach OpenAI-style usage to the finish chunk so
+                            // track_stream_health's scanner (and downstream
+                            // clients) see token counts for adapter streams.
+                            if let Some(out) = parsed
+                                .get("usage")
+                                .and_then(|u| u.get("output_tokens"))
+                                .and_then(|v| v.as_u64())
+                            {
+                                chunk["usage"] = serde_json::json!({
+                                    "prompt_tokens": input_tokens,
+                                    "completion_tokens": out,
+                                    "total_tokens": input_tokens + out,
+                                });
+                            }
                             chunks.push(format!("data: {}\n\n", chunk));
                         }
                         "message_stop" if !done_emitted => {
@@ -3313,6 +3786,7 @@ fn transform_anthropic_sse_to_openai(
                             next_tool_idx,
                             stream_ended,
                             done_emitted,
+                            input_tokens,
                         ),
                     ));
                 }
@@ -3333,6 +3807,7 @@ fn transform_anthropic_sse_to_openai(
                                 next_tool_idx,
                                 stream_ended,
                                 done_emitted,
+                                input_tokens,
                             ),
                         ));
                     }
@@ -3366,6 +3841,7 @@ fn transform_anthropic_sse_to_openai(
                                 next_tool_idx,
                                 stream_ended,
                                 done_emitted,
+                                input_tokens,
                             ),
                         ));
                     }
@@ -3861,6 +4337,7 @@ fn transform_google_sse_to_openai(
             stream_id,
             model_id,
             created,
+            None::<(u64, u64)>, // last seen usageMetadata (prompt, completion)
         ),
         |(
             mut stream,
@@ -3871,6 +4348,7 @@ fn transform_google_sse_to_openai(
             stream_id,
             model_id,
             created,
+            mut usage_seen,
         )| async move {
             loop {
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -3897,6 +4375,7 @@ fn transform_google_sse_to_openai(
                                     stream_id,
                                     model_id,
                                     created,
+                                    usage_seen,
                                 ),
                             ));
                         }
@@ -3907,6 +4386,27 @@ fn transform_google_sse_to_openai(
                         Err(_) => continue,
                     };
                     let resp = parsed.get("response").unwrap_or(&parsed);
+                    // Gemini reports usageMetadata on (at least) the final
+                    // chunk; remember the latest so the finish chunk can carry
+                    // OpenAI-style usage for the proxy usage scanner.
+                    if let Some(meta) = resp.get("usageMetadata") {
+                        let prompt = meta
+                            .get("promptTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let candidates = meta
+                            .get("candidatesTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let thoughts = meta
+                            .get("thoughtsTokenCount")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if prompt > 0 || candidates > 0 || thoughts > 0 {
+                            // Thinking tokens bill as output.
+                            usage_seen = Some((prompt, candidates + thoughts));
+                        }
+                    }
                     let candidate = resp
                         .get("candidates")
                         .and_then(|v| v.as_array())
@@ -3981,7 +4481,7 @@ fn transform_google_sse_to_openai(
                         if emitted_tool_call && finish_reason == "stop" {
                             finish_reason = "tool_calls".to_string();
                         }
-                        let finish_chunk = serde_json::json!({
+                        let mut finish_chunk = serde_json::json!({
                             "id": stream_id,
                             "object": "chat.completion.chunk",
                             "created": created,
@@ -3992,6 +4492,13 @@ fn transform_google_sse_to_openai(
                                 "finish_reason": finish_reason,
                             }],
                         });
+                        if let Some((prompt, completion)) = usage_seen {
+                            finish_chunk["usage"] = serde_json::json!({
+                                "prompt_tokens": prompt,
+                                "completion_tokens": completion,
+                                "total_tokens": prompt + completion,
+                            });
+                        }
                         chunks.push(format!("data: {}\n\n", finish_chunk));
                         if !emitted_done {
                             chunks.push("data: [DONE]\n\n".to_string());
@@ -4012,6 +4519,7 @@ fn transform_google_sse_to_openai(
                             stream_id,
                             model_id,
                             created,
+                            usage_seen,
                         ),
                     ));
                 }
@@ -4030,6 +4538,7 @@ fn transform_google_sse_to_openai(
                                 stream_id,
                                 model_id,
                                 created,
+                                usage_seen,
                             ),
                         ));
                     }
@@ -4048,6 +4557,7 @@ fn transform_google_sse_to_openai(
                                 stream_id,
                                 model_id,
                                 created,
+                                usage_seen,
                             ),
                         ));
                     }
@@ -4151,6 +4661,166 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::StreamExt;
+
+    /// Feed an input as a single chunk and flush; the full-content path.
+    fn strip_once(input: &str) -> String {
+        let mut s = ThinkStripper::default();
+        let mut out = s.feed(input);
+        out.push_str(&s.flush());
+        out
+    }
+
+    #[test]
+    fn think_stripper_removes_full_block() {
+        assert_eq!(strip_once("<think>reasoning here</think>Hello"), "Hello");
+    }
+
+    #[test]
+    fn think_stripper_removes_orphan_closing_tag() {
+        // MiniMax prefills `<think>` in the prompt, so only the closing tag is
+        // emitted — the symptom seen in the Hermes Telegram gateway.
+        assert_eq!(strip_once("</think>\n\nThe answer"), "\n\nThe answer");
+    }
+
+    #[test]
+    fn think_stripper_handles_repeated_orphans() {
+        assert_eq!(strip_once("</think>a</think>b</think>c"), "abc");
+    }
+
+    #[test]
+    fn think_stripper_passes_through_plain_text() {
+        assert_eq!(strip_once("just a normal answer"), "just a normal answer");
+    }
+
+    #[test]
+    fn think_stripper_handles_tag_split_across_chunks() {
+        let mut s = ThinkStripper::default();
+        // `</think>` arrives split: "</thi" then "nk>answer".
+        assert_eq!(s.feed("foo</thi"), "foo");
+        assert_eq!(s.feed("nk>answer"), "answer");
+        assert_eq!(s.flush(), "");
+    }
+
+    #[test]
+    fn think_stripper_block_split_across_chunks() {
+        let mut s = ThinkStripper::default();
+        assert_eq!(s.feed("<think>some "), "");
+        assert_eq!(s.feed("long reasoning"), "");
+        assert_eq!(s.feed("</think>visible"), "visible");
+        assert_eq!(s.flush(), "");
+    }
+
+    #[test]
+    fn think_stripper_drops_unterminated_block() {
+        // An open block with no close = trailing reasoning; drop it.
+        assert_eq!(strip_once("answer<think>cut off"), "answer");
+    }
+
+    #[test]
+    fn strip_thinking_from_completion_rewrites_message_content() {
+        let body = Bytes::from(
+            r#"{"choices":[{"message":{"role":"assistant","content":"</think>Hi there"}}]}"#,
+        );
+        let out = strip_thinking_from_completion(&body);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Hi there");
+    }
+
+    #[test]
+    fn strip_thinking_from_completion_noop_when_clean() {
+        let body = Bytes::from(r#"{"choices":[{"message":{"content":"plain answer"}}]}"#);
+        let out = strip_thinking_from_completion(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn normalize_sse_line_flushes_leftover_before_done() {
+        // Regression: a streamed reply whose final content delta ends in a
+        // tag-prefix char (`<`) had that char held back by the stripper and
+        // never emitted, because the stream-end flush ran after `[DONE]`.
+        let mut stripper = ThinkStripper::default();
+        let mut envelope = None;
+        let mut flushed = false;
+
+        // First content chunk — establishes the envelope, no tags to strip.
+        let l1 = b"data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n";
+        let out1 = normalize_sse_line(l1, true, &mut stripper, &mut envelope, &mut flushed);
+        assert_eq!(out1, l1.to_vec());
+
+        // Final content chunk ends with `<` — a tag-prefix, so it is held back.
+        let l2 = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a <\"}}]}\n";
+        let out2 = normalize_sse_line(l2, true, &mut stripper, &mut envelope, &mut flushed);
+        let s2 = String::from_utf8(out2).unwrap();
+        assert!(
+            s2.contains(r#""content":"a ""#),
+            "expected held-back `<`, got: {s2}"
+        );
+
+        // `[DONE]` — the held-back `<` must be emitted, and before the terminator.
+        let done = b"data: [DONE]\n";
+        let out3 = normalize_sse_line(done, true, &mut stripper, &mut envelope, &mut flushed);
+        let s3 = String::from_utf8(out3).unwrap();
+        let content_pos = s3
+            .find(r#""content":"<""#)
+            .unwrap_or_else(|| panic!("leftover `<` not flushed: {s3}"));
+        let done_pos = s3.find("[DONE]").unwrap();
+        assert!(content_pos < done_pos, "leftover must precede [DONE]: {s3}");
+    }
+
+    #[test]
+    fn normalize_sse_line_done_passthrough_when_nothing_held_back() {
+        // No leftover → `[DONE]` passes through untouched (no synthetic chunk).
+        let mut stripper = ThinkStripper::default();
+        let mut envelope = None;
+        let mut flushed = false;
+        let done = b"data: [DONE]\n";
+        let out = normalize_sse_line(done, true, &mut stripper, &mut envelope, &mut flushed);
+        assert_eq!(out, done.to_vec());
+    }
+
+    #[test]
+    fn anthropic_conversion_drops_empty_text_block_beside_tool_use() {
+        // OpenAI assistant turns routinely carry content:"" alongside
+        // tool_calls. Anthropic rejects empty text blocks, so the converted
+        // assistant message must contain ONLY the tool_use block — else the
+        // whole replay 400s (observed: MiniMax history replayed on Opus).
+        let messages = serde_json::json!([
+            { "role": "user", "content": "List files." },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "terminal", "arguments": "{\"cmd\":\"ls\"}" }
+                }]
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "file1.txt" },
+            { "role": "user", "content": "Reply: pong" }
+        ]);
+        let (_system, out) =
+            anthropic_messages_from_openai(messages.as_array().unwrap().as_slice());
+        // The assistant message: exactly one block, the tool_use (no empty text).
+        let assistant = out
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .expect("assistant message present");
+        let blocks = assistant["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "empty text block must be dropped");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["name"], "terminal");
+        // No message anywhere carries an empty text block.
+        for m in &out {
+            for b in m["content"].as_array().unwrap() {
+                if b.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    assert!(
+                        !b["text"].as_str().unwrap().trim().is_empty(),
+                        "no empty text blocks may survive conversion"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_direct_model_entry_accepts_known_provider_prefix() {
@@ -4482,6 +5152,85 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_stream_surfaces_usage_on_finish_chunk() {
+        // message_start carries input tokens; message_delta carries cumulative
+        // output tokens. The finish chunk must surface OpenAI-style usage so
+        // track_stream_health's scanner records /v1 usage for adapter streams.
+        let events = [
+            r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":100,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let sse = events
+            .iter()
+            .map(|e| format!("data: {}\n\n", e))
+            .collect::<String>();
+        let input = futures::stream::iter(vec![Ok(Bytes::from(sse))]);
+
+        let out = futures::executor::block_on(async move {
+            transform_anthropic_sse_to_openai(
+                input,
+                "chatcmpl-test".to_string(),
+                1,
+                "claude-opus-4-8".to_string(),
+            )
+            .collect::<Vec<_>>()
+            .await
+        });
+
+        let text = out
+            .into_iter()
+            .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(text.contains("\"prompt_tokens\":100"), "{text}");
+        assert!(text.contains("\"completion_tokens\":42"), "{text}");
+        assert!(text.contains("\"total_tokens\":142"), "{text}");
+    }
+
+    #[test]
+    fn google_stream_surfaces_usage_on_finish_chunk() {
+        // usageMetadata must be folded into OpenAI-style usage on the finish
+        // chunk (thinking tokens bill as output).
+        let sse_payload = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": { "parts": [{ "text": "hi" }] },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 5,
+                    "thoughtsTokenCount": 3
+                }
+            }
+        });
+        let sse_bytes = Bytes::from(format!("data: {}\n\n", sse_payload));
+        let input = futures::stream::iter(vec![Ok(sse_bytes)]);
+
+        let out = futures::executor::block_on(async move {
+            transform_google_sse_to_openai(
+                input,
+                "chatcmpl-test".to_string(),
+                1,
+                "gemini-2.5-pro".to_string(),
+            )
+            .collect::<Vec<_>>()
+            .await
+        });
+
+        let text = out
+            .into_iter()
+            .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(text.contains("\"prompt_tokens\":10"), "{text}");
+        assert!(text.contains("\"completion_tokens\":8"), "{text}");
+        assert!(text.contains("\"total_tokens\":18"), "{text}");
+    }
+
+    #[test]
     fn build_anthropic_request_maps_openai_tools_and_tool_choice() {
         let body = serde_json::json!({
             "model": "opus",
@@ -4513,6 +5262,7 @@ mod tests {
             serde_json::to_vec(&body).unwrap().as_slice(),
             "claude-opus-4-7",
             false,
+            false,
         )
         .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(payload_bytes.as_ref()).unwrap();
@@ -4530,6 +5280,86 @@ mod tests {
                 "name": "echo"
             })
         );
+    }
+
+    #[test]
+    fn anthropic_oauth_request_prepends_claude_code_identity() {
+        // OAuth path (force_claude_code_identity = true): the Claude Code
+        // identity must lead the system prompt, else Anthropic 429s the
+        // subscription token.
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [
+                { "role": "system", "content": "Be brief." },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 16,
+        });
+        let bytes = build_anthropic_upstream_request(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-opus-4-8",
+            false,
+            true,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(bytes.as_ref()).unwrap();
+        assert_eq!(
+            payload["system"],
+            "You are Claude Code, Anthropic's official CLI for Claude.\n\nBe brief."
+        );
+
+        // Idempotent: a system prompt already leading with the identity is not
+        // doubled (covers the thinking-strip retry re-running the builder).
+        let body2 = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [
+                { "role": "system", "content": "You are Claude Code, Anthropic's official CLI for Claude.\n\nBe brief." },
+                { "role": "user", "content": "hi" }
+            ],
+            "max_tokens": 16,
+        });
+        let bytes2 = build_anthropic_upstream_request(
+            serde_json::to_vec(&body2).unwrap().as_slice(),
+            "claude-opus-4-8",
+            false,
+            true,
+        )
+        .unwrap();
+        let payload2: serde_json::Value = serde_json::from_slice(bytes2.as_ref()).unwrap();
+        assert_eq!(
+            payload2["system"],
+            "You are Claude Code, Anthropic's official CLI for Claude.\n\nBe brief."
+        );
+
+        // Empty system + OAuth: identity becomes the whole system prompt.
+        let body3 = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "max_tokens": 16,
+        });
+        let bytes3 = build_anthropic_upstream_request(
+            serde_json::to_vec(&body3).unwrap().as_slice(),
+            "claude-opus-4-8",
+            false,
+            true,
+        )
+        .unwrap();
+        let payload3: serde_json::Value = serde_json::from_slice(bytes3.as_ref()).unwrap();
+        assert_eq!(
+            payload3["system"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+
+        // API-key path (force = false): system is untouched.
+        let bytes4 = build_anthropic_upstream_request(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "claude-opus-4-8",
+            false,
+            false,
+        )
+        .unwrap();
+        let payload4: serde_json::Value = serde_json::from_slice(bytes4.as_ref()).unwrap();
+        assert_eq!(payload4["system"], "Be brief.");
     }
 
     #[test]
@@ -4835,7 +5665,8 @@ mod tests {
             yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from("never sent"));
         };
 
-        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None);
+        let tracked =
+            track_stream_health(inner, tracker.clone(), account_id, None, None, None, None);
         let mut tracked = std::pin::pin!(tracked);
 
         // First chunk should pass through immediately.
@@ -4874,7 +5705,8 @@ mod tests {
             }
         };
 
-        let tracked = track_stream_health(inner, tracker.clone(), account_id, None, None);
+        let tracked =
+            track_stream_health(inner, tracker.clone(), account_id, None, None, None, None);
         let mut tracked = std::pin::pin!(tracked);
         let mut count = 0;
         while let Some(item) = tracked.next().await {

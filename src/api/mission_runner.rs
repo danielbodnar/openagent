@@ -25,10 +25,8 @@ use crate::agents::{
     AgentRef, AgentResult, CompletionConfidence, CompletionSignal, FailureClass, TerminalReason,
     TurnOutcome,
 };
-use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
-use crate::opencode::{extract_reasoning, extract_text};
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
 use crate::util::{auth_entry_has_credentials, build_history_context, env_var_bool, home_dir};
@@ -48,7 +46,7 @@ use super::library::SharedLibrary;
 /// friendlier "paused for restart" message and a `ServerShutdown` reason
 /// so the dashboard can render a Resume affordance instead of a
 /// user-cancel banner; otherwise behave as before.
-fn cancel_or_shutdown_failure() -> AgentResult {
+pub(crate) fn cancel_or_shutdown_failure() -> AgentResult {
     if super::routes::is_shutdown_initiated() {
         AgentResult::failure(
             "Server restart — paused. Click Resume to continue.".to_string(),
@@ -101,7 +99,7 @@ fn interrupted_turn_outcome(reason: TerminalReason) -> TurnOutcome {
     }
 }
 
-fn turn_outcome_for_result(
+pub(crate) fn turn_outcome_for_result(
     result: &AgentResult,
     success_signal: CompletionSignal,
     success_confidence: CompletionConfidence,
@@ -122,33 +120,33 @@ fn turn_outcome_for_result(
 }
 
 #[derive(Debug, Default)]
-struct OpencodeSseState {
-    message_roles: HashMap<String, String>,
-    part_buffers: HashMap<String, String>,
-    emitted_tool_calls: HashMap<String, ()>,
-    emitted_tool_results: HashMap<String, ()>,
-    response_tool_args: HashMap<String, String>,
-    response_tool_names: HashMap<String, String>,
-    last_emitted_thinking: Option<String>,
-    last_emitted_text: Option<String>,
+pub(crate) struct OpencodeSseState {
+    pub(crate) message_roles: HashMap<String, String>,
+    pub(crate) part_buffers: HashMap<String, String>,
+    pub(crate) emitted_tool_calls: HashMap<String, ()>,
+    pub(crate) emitted_tool_results: HashMap<String, ()>,
+    pub(crate) response_tool_args: HashMap<String, String>,
+    pub(crate) response_tool_names: HashMap<String, String>,
+    pub(crate) last_emitted_thinking: Option<String>,
+    pub(crate) last_emitted_text: Option<String>,
 }
 
-struct OpencodeSseParseResult {
-    event: Option<AgentEvent>,
-    extra_events: Vec<AgentEvent>,
-    message_complete: bool,
-    session_id: Option<String>,
-    model: Option<String>,
+pub(crate) struct OpencodeSseParseResult {
+    pub(crate) event: Option<AgentEvent>,
+    pub(crate) extra_events: Vec<AgentEvent>,
+    pub(crate) message_complete: bool,
+    pub(crate) session_id: Option<String>,
+    pub(crate) model: Option<String>,
     /// The SSE stream indicated the session became idle.  This is a weaker
     /// signal than `message_complete` — it means OpenCode is no longer
     /// processing, but not necessarily that a `response.completed` was sent
     /// (common with GLM models that emit `response.incomplete` instead).
-    session_idle: bool,
+    pub(crate) session_idle: bool,
     /// The SSE stream indicated the session entered a retry state, meaning
     /// the model API call failed and OpenCode is retrying automatically.
-    session_retry: bool,
+    pub(crate) session_retry: bool,
     /// Token usage extracted from response.completed events.
-    usage: Option<crate::cost::TokenUsage>,
+    pub(crate) usage: Option<crate::cost::TokenUsage>,
 }
 
 fn tool_result_text(result: &serde_json::Value) -> Option<String> {
@@ -170,7 +168,10 @@ fn tool_result_text(result: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn replace_filepath_artifact_with_tool_output(output: &str, tool_output: &str) -> Option<String> {
+pub(crate) fn replace_filepath_artifact_with_tool_output(
+    output: &str,
+    tool_output: &str,
+) -> Option<String> {
     let tool_output = tool_output.trim();
     if output.contains(tool_output)
         || output.len() > 600
@@ -213,7 +214,7 @@ fn replace_filepath_artifact_with_tool_output(output: &str, tool_output: &str) -
     changed.then_some(repaired)
 }
 
-fn remember_tool_result_text(event: &AgentEvent, slot: &Arc<StdMutex<Option<String>>>) {
+pub(crate) fn remember_tool_result_text(event: &AgentEvent, slot: &Arc<StdMutex<Option<String>>>) {
     if let AgentEvent::ToolResult { result, .. } = event {
         if let Some(text) = tool_result_text(result) {
             if let Ok(mut guard) = slot.lock() {
@@ -386,12 +387,29 @@ fn localhost_api_base_url(value: Option<&str>) -> Option<String> {
         .map(|port| format!("http://127.0.0.1:{}", port))
 }
 
-fn public_api_base_url_from_env() -> Option<String> {
+pub(crate) fn public_api_base_url_from_env() -> Option<String> {
     public_api_base_url(std::env::var("SANDBOXED_PUBLIC_URL").ok().as_deref())
 }
 
 pub(super) fn localhost_api_base_url_from_env() -> Option<String> {
     localhost_api_base_url(std::env::var("PORT").ok().as_deref())
+}
+
+/// API base URL reachable from *inside* the workspace's network namespace.
+/// Identical to [`localhost_api_base_url_from_env`] except for
+/// private-network containers, where the host is only reachable via the
+/// veth gateway address (see `Workspace::host_ip_from_workspace`).
+pub(crate) fn workspace_api_base_url(workspace: &Workspace) -> Option<String> {
+    let port = std::env::var("PORT").ok()?;
+    let port = port.trim();
+    if port.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "http://{}:{}",
+        workspace.host_ip_from_workspace(),
+        port
+    ))
 }
 
 /// Claude Code's built-in `ScheduleWakeup` tool ends the agent's turn with a
@@ -443,7 +461,7 @@ fn mint_internal_service_jwt() -> Option<String> {
     .ok()
 }
 
-fn spawn_claude_builtin_wakeup_automation(
+pub(crate) fn spawn_claude_builtin_wakeup_automation(
     mission_id: Uuid,
     delay_seconds: u64,
     prompt: String,
@@ -517,7 +535,7 @@ fn spawn_claude_builtin_wakeup_automation(
     });
 }
 
-fn write_telegram_action_cli_helpers(work_dir: &Path) {
+pub(crate) fn write_telegram_action_cli_helpers(work_dir: &Path) {
     let path = work_dir.join(".sandboxed-sh-telegram-action.py");
     let wrapper_path = work_dir.join("telegram-action");
     let bin_dir = work_dir.join(".sandboxed-sh-bin");
@@ -718,6 +736,58 @@ const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// Account-level cooldown memory: fingerprints of credentials that recently
+/// hit a usage/rate cap, mapped to when they may be tried again. Lets every
+/// codex path (initial dispatch, control-channel follow-ups) skip known-capped
+/// accounts instead of burning the first attempt on them. In-memory only —
+/// resets on restart, which is fine: the worst case is one wasted probe.
+static CODEX_ACCOUNT_COOLDOWNS: LazyLock<StdMutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// OpenAI usage caps reset on long windows (often hours); 15 minutes keeps a
+/// capped account out of the hot path while re-probing often enough to catch
+/// an early reset.
+const CODEX_RATE_LIMIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Capacity blips clear quickly; re-probe after 2 minutes.
+const CODEX_CAPACITY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2 * 60);
+/// Auth failures (refresh-token reuse) usually need a background token
+/// refresh to land; give it 10 minutes.
+const CODEX_AUTH_ERROR_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn codex_account_cooldown_remaining(fingerprint: &str) -> Option<std::time::Duration> {
+    let map = CODEX_ACCOUNT_COOLDOWNS
+        .lock()
+        .expect("Codex account cooldown mutex poisoned");
+    map.get(fingerprint)
+        .and_then(|until| until.checked_duration_since(std::time::Instant::now()))
+}
+
+pub(crate) fn set_codex_account_cooldown(fingerprint: &str, duration: std::time::Duration) {
+    let mut map = CODEX_ACCOUNT_COOLDOWNS
+        .lock()
+        .expect("Codex account cooldown mutex poisoned");
+    map.insert(
+        fingerprint.to_string(),
+        std::time::Instant::now() + duration,
+    );
+}
+
+pub(crate) fn clear_codex_account_cooldown(fingerprint: &str) {
+    let mut map = CODEX_ACCOUNT_COOLDOWNS
+        .lock()
+        .expect("Codex account cooldown mutex poisoned");
+    map.remove(fingerprint);
+}
+
+pub(crate) fn codex_cooldown_for_reason(reason: &TerminalReason) -> Option<std::time::Duration> {
+    match reason {
+        TerminalReason::RateLimited => Some(CODEX_RATE_LIMIT_COOLDOWN),
+        TerminalReason::CapacityLimited => Some(CODEX_CAPACITY_COOLDOWN),
+        TerminalReason::AuthError => Some(CODEX_AUTH_ERROR_COOLDOWN),
+        _ => None,
+    }
+}
+
 /// A codex auth credential — either a raw OpenAI API key (rotation slot keyed
 /// on the secret string) or a ChatGPT OAuth identity (rotation slot keyed on
 /// `chatgpt_account_id`, since that's what OpenAI's usage cap is keyed on).
@@ -735,7 +805,7 @@ impl CodexCredential {
     /// concurrency semaphore. API keys keep their previous fingerprint so
     /// existing pool entries stay hot; OAuth accounts use a prefixed
     /// `chatgpt_account_id` so they can't collide with an API key.
-    fn fingerprint(&self) -> String {
+    pub(crate) fn fingerprint(&self) -> String {
         match self {
             CodexCredential::ApiKey(k) => format!("apikey:{}", k),
             CodexCredential::OAuth(acc) => format!("oauth:{}", acc.chatgpt_account_id),
@@ -749,7 +819,7 @@ impl CodexCredential {
         }
     }
 
-    fn label_for_logs(&self) -> String {
+    pub(crate) fn label_for_logs(&self) -> String {
         match self {
             CodexCredential::ApiKey(k) => codex_key_fingerprint(k),
             CodexCredential::OAuth(acc) => {
@@ -777,9 +847,24 @@ impl CodexCredential {
     }
 }
 
-struct LeasedCodexAccount {
-    credential: CodexCredential,
-    _permit: OwnedSemaphorePermit,
+pub(crate) struct LeasedCodexAccount {
+    pub(crate) credential: CodexCredential,
+    pub(crate) _permit: OwnedSemaphorePermit,
+}
+
+/// Longest prefix of `s` that is at most `max_bytes` long without splitting
+/// a UTF-8 code point. A plain `&s[..n]` panics when byte `n` lands inside a
+/// multi-byte char (a user message with an em-dash at the boundary once took
+/// down the whole mission runner task before the turn started).
+fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn codex_key_fingerprint(key: &str) -> String {
@@ -854,10 +939,7 @@ fn codex_account_semaphore_for_credential(credential: &CodexCredential) -> Arc<S
         .clone()
 }
 
-/// Re-export the canonical cost resolver from the shared cost module.
-use crate::cost::resolve_cost_cents_and_source;
-
-fn preferred_model_for_cost<'a>(
+pub(crate) fn preferred_model_for_cost<'a>(
     requested_model: Option<&'a str>,
     observed_model: Option<&'a str>,
 ) -> Option<&'a str> {
@@ -867,7 +949,7 @@ fn preferred_model_for_cost<'a>(
         .or_else(|| observed_model.map(str::trim).filter(|m| !m.is_empty()))
 }
 
-fn actual_cost_cents_from_total_cost_usd(total_cost_usd: Option<f64>) -> Option<u64> {
+pub(crate) fn actual_cost_cents_from_total_cost_usd(total_cost_usd: Option<f64>) -> Option<u64> {
     total_cost_usd.and_then(|cost| {
         if cost.is_finite() {
             Some((cost.max(0.0) * 100.0) as u64)
@@ -890,7 +972,7 @@ fn truncate_diagnostic_snippet(value: &str, max_len: usize) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaudeTurnWaitState {
+pub(crate) enum ClaudeTurnWaitState {
     Startup,
     AwaitingClaude,
     AwaitingToolResults,
@@ -898,11 +980,17 @@ enum ClaudeTurnWaitState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaudeTransportFailureStage {
+pub(crate) enum ClaudeTransportFailureStage {
     Startup,
     AwaitingClaude,
     AwaitingToolResults,
     AwaitingTerminalResult,
+    /// The Claude Code stream emitted a long run of the same repeated
+    /// substring (e.g. "Yielding pending your choice." looped hundreds of
+    /// times) without ever producing a terminal result. The backend killed
+    /// the CLI to surface a clear failure to the user instead of waiting
+    /// for the model to hit max_tokens.
+    DegenerateStream,
 }
 
 fn claudecode_transport_failure_stage_for_wait_state(
@@ -920,7 +1008,7 @@ fn claudecode_transport_failure_stage_for_wait_state(
     }
 }
 
-fn claudecode_transport_failure_stage_for_incomplete_turn(
+pub(crate) fn claudecode_transport_failure_stage_for_incomplete_turn(
     saw_non_init_event: bool,
     wait_state: ClaudeTurnWaitState,
 ) -> ClaudeTransportFailureStage {
@@ -937,6 +1025,7 @@ fn claudecode_transport_failure_stage_label(stage: ClaudeTransportFailureStage) 
         ClaudeTransportFailureStage::AwaitingClaude => "awaiting_claude",
         ClaudeTransportFailureStage::AwaitingToolResults => "awaiting_tool_results",
         ClaudeTransportFailureStage::AwaitingTerminalResult => "awaiting_terminal_result",
+        ClaudeTransportFailureStage::DegenerateStream => "degenerate_stream",
     }
 }
 
@@ -948,11 +1037,12 @@ fn claudecode_transport_failure_stage_from_label(
         "awaiting_claude" => Some(ClaudeTransportFailureStage::AwaitingClaude),
         "awaiting_tool_results" => Some(ClaudeTransportFailureStage::AwaitingToolResults),
         "awaiting_terminal_result" => Some(ClaudeTransportFailureStage::AwaitingTerminalResult),
+        "degenerate_stream" => Some(ClaudeTransportFailureStage::DegenerateStream),
         _ => None,
     }
 }
 
-fn claudecode_transport_failure_data(
+pub(crate) fn claudecode_transport_failure_data(
     stage: ClaudeTransportFailureStage,
     idle_timeout_triggered: bool,
     process_exited_without_result: bool,
@@ -993,7 +1083,7 @@ fn claudecode_idle_timeout_for_state(
     }
 }
 
-fn claudecode_idle_deadline(
+pub(crate) fn claudecode_idle_deadline(
     state: ClaudeTurnWaitState,
     now: tokio::time::Instant,
     idle_timeout: Duration,
@@ -1016,17 +1106,17 @@ fn claudecode_idle_deadline(
     }
 }
 
-struct ClaudeIncompleteTurnContext<'a> {
-    partial_output: Option<&'a str>,
-    non_json_output: &'a [String],
-    malformed_json_output: &'a [String],
-    process_exited_without_result: bool,
-    idle_timeout_triggered: bool,
-    wait_state: ClaudeTurnWaitState,
-    pending_tools: &'a [String],
+pub(crate) struct ClaudeIncompleteTurnContext<'a> {
+    pub(crate) partial_output: Option<&'a str>,
+    pub(crate) non_json_output: &'a [String],
+    pub(crate) malformed_json_output: &'a [String],
+    pub(crate) process_exited_without_result: bool,
+    pub(crate) idle_timeout_triggered: bool,
+    pub(crate) wait_state: ClaudeTurnWaitState,
+    pub(crate) pending_tools: &'a [String],
 }
 
-fn claudecode_incomplete_turn_message(
+pub(crate) fn claudecode_incomplete_turn_message(
     exit_summary: &str,
     ctx: ClaudeIncompleteTurnContext<'_>,
 ) -> String {
@@ -1091,7 +1181,10 @@ fn claudecode_incomplete_turn_message(
     message
 }
 
-fn apply_terminal_result_text(final_result: &mut String, terminal_result: Option<String>) {
+pub(crate) fn apply_terminal_result_text(
+    final_result: &mut String,
+    terminal_result: Option<String>,
+) {
     if let Some(result) = terminal_result {
         if !result.trim().is_empty() || final_result.trim().is_empty() {
             *final_result = result;
@@ -1099,7 +1192,7 @@ fn apply_terminal_result_text(final_result: &mut String, terminal_result: Option
     }
 }
 
-fn use_thinking_only_fallback(
+pub(crate) fn use_thinking_only_fallback(
     final_result: &mut String,
     thinking_fallback: &str,
     pending_tools_empty: bool,
@@ -1112,7 +1205,7 @@ fn use_thinking_only_fallback(
     false
 }
 
-fn claudecode_malformed_startup_message(
+pub(crate) fn claudecode_malformed_startup_message(
     diagnostics: &[String],
     use_resume: bool,
     session_id: &str,
@@ -1133,7 +1226,7 @@ fn claudecode_malformed_startup_message(
     msg
 }
 
-fn claudecode_pre_turn_transport_message(
+pub(crate) fn claudecode_pre_turn_transport_message(
     exit_summary: &str,
     non_json_output: &[String],
     malformed_json_output: &[String],
@@ -1197,7 +1290,7 @@ pub(crate) fn collect_codex_credentials(working_dir: &std::path::Path) -> Vec<Co
     creds
 }
 
-async fn lease_codex_account(
+pub(crate) async fn lease_codex_account(
     working_dir: &std::path::Path,
     tried_fingerprints: &HashSet<String>,
     cancel: &CancellationToken,
@@ -1207,7 +1300,7 @@ async fn lease_codex_account(
         return None;
     }
 
-    let mut candidates: Vec<(CodexCredential, Arc<Semaphore>, usize)> = creds
+    let candidates: Vec<(CodexCredential, Arc<Semaphore>, usize)> = creds
         .into_iter()
         .filter(|cred| !tried_fingerprints.contains(&cred.fingerprint()))
         .map(|cred| {
@@ -1221,8 +1314,23 @@ async fn lease_codex_account(
         return None;
     }
 
-    // Prefer the currently least-loaded credential (highest available permits).
-    candidates.sort_by_key(|candidate| Reverse(candidate.2));
+    // Prefer credentials that aren't on a usage-cap cooldown; cooled ones stay
+    // in the list as a last resort so a single-account setup still retries
+    // instead of hard-failing. Within each group, prefer the least-loaded
+    // credential (highest available permits).
+    let (mut fresh, mut cooled): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|candidate| {
+        codex_account_cooldown_remaining(&candidate.0.fingerprint()).is_none()
+    });
+    fresh.sort_by_key(|candidate| Reverse(candidate.2));
+    cooled.sort_by_key(|candidate| Reverse(candidate.2));
+    for candidate in &cooled {
+        tracing::debug!(
+            credential = %candidate.0.label_for_logs(),
+            "Codex credential on usage-cap cooldown; deprioritized for lease"
+        );
+    }
+    let candidates: Vec<(CodexCredential, Arc<Semaphore>, usize)> =
+        fresh.into_iter().chain(cooled).collect();
 
     for (cred, sem, available) in &candidates {
         if let Ok(permit) = sem.clone().try_acquire_owned() {
@@ -1293,7 +1401,7 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
 /// Strip `<think>...</think>` tags from text output.
 /// Some models (e.g. Minimax, DeepSeek) emit internal reasoning inside inline
 /// `<think>` tags that should not be shown in the text output.
-fn strip_think_tags(text: &str) -> String {
+pub(crate) fn strip_think_tags(text: &str) -> String {
     // Case-insensitive search directly on the original text to avoid
     // byte-offset misalignment from to_lowercase() on non-ASCII input.
     fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -1340,11 +1448,72 @@ fn strip_think_tags(text: &str) -> String {
     result
 }
 
+/// Extract text inside `<think>...</think>` tags. Handles unclosed tags
+/// (the trailing unclosed opener is included verbatim) and multiple blocks
+/// (concatenated in order, separated by a single newline so callers can
+/// distinguish boundaries; trim will absorb the joiner's whitespace).
+pub(crate) fn extract_think_content(text: &str) -> Option<String> {
+    fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+        let needle_len = needle.len();
+        if haystack.len() < needle_len {
+            return None;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle_len)
+            .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+
+    const OPEN_TAG: &str = "<think>";
+    const CLOSE_TAG: &str = "</think>";
+
+    // Walk every `<think>` opener in order. For each one, take everything up
+    // to the next `</think>` (or to the end of the string if the close tag
+    // is missing — the model streamed the tag header but not the footer yet).
+    let mut combined = String::new();
+    let mut cursor = 0usize;
+    let mut found_any = false;
+    while let Some(open) = find_ci(&text[cursor..], OPEN_TAG) {
+        found_any = true;
+        let abs_open = cursor + open;
+        let after_open = abs_open + OPEN_TAG.len();
+        let scan_from = if after_open <= text.len() {
+            after_open
+        } else {
+            text.len()
+        };
+        match find_ci(&text[scan_from..], CLOSE_TAG) {
+            Some(rel_close) => {
+                let abs_close = scan_from + rel_close;
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&text[after_open..abs_close]);
+                cursor = abs_close + CLOSE_TAG.len();
+            }
+            None => {
+                // Unclosed trailing opener: include the rest of the string
+                // so the model can stream the closing tag in a later delta.
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&text[after_open..]);
+                break;
+            }
+        }
+    }
+
+    if !found_any {
+        return None;
+    }
+    Some(combined)
+}
+
 fn normalize_stream_comparison_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn thinking_overlaps_visible_answer(thinking: &str, assistant_message: &str) -> bool {
+pub(crate) fn thinking_overlaps_visible_answer(thinking: &str, assistant_message: &str) -> bool {
     const MIN_OVERLAP_LEN: usize = 40;
 
     let thinking = normalize_stream_comparison_text(thinking);
@@ -1362,7 +1531,7 @@ fn thinking_overlaps_visible_answer(thinking: &str, assistant_message: &str) -> 
         || assistant_message.len() >= MIN_OVERLAP_LEN && thinking.starts_with(&assistant_message)
 }
 
-async fn set_control_state_for_mission(
+pub(crate) async fn set_control_state_for_mission(
     status: &Arc<RwLock<ControlStatus>>,
     events_tx: &broadcast::Sender<AgentEvent>,
     mission_id: Uuid,
@@ -1622,7 +1791,74 @@ fn handle_part_update(
     })
 }
 
-fn parse_opencode_stderr_text_part(line: &str) -> Option<String> {
+/// Build the block-final `Thinking` event for a completed thinking block.
+///
+/// All `done: true` thinking emissions must go through this helper: the
+/// finalizer is the only thinking event that gets persisted (incremental
+/// `done: false` deltas are broadcast-only), so it has to carry the full
+/// accumulated block content. An empty finalizer means a runner lost its
+/// buffer — warn so the regression is visible in logs instead of silently
+/// producing empty thought history again.
+pub(crate) fn thinking_final_event(content: String, mission_id: Uuid) -> AgentEvent {
+    if content.trim().is_empty() {
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Finalizing a thinking block with empty content; thought history will miss this block"
+        );
+    }
+    AgentEvent::Thinking {
+        content,
+        done: true,
+        mission_id: Some(mission_id),
+    }
+}
+
+// Error classification moved to `super::runners::errors` (Phase 1 of the
+// mission_runner decomposition). Re-exported so call sites and tests keep
+// their existing paths.
+#[allow(unused_imports)] // several are consumed only by this module's tests
+pub(crate) use super::runners::errors::{
+    contains_ascii_case_insensitive, find_ascii_case_insensitive, is_auth_error,
+    is_capacity_limited_error, is_provider_payload_error, is_rate_limited_error,
+    is_standalone_invalid_credentials_message, is_success_path_auth_error,
+    is_success_path_provider_payload_error, is_success_path_rate_limited_error,
+    looks_like_explicit_provider_error_output, starts_with_ascii_case_insensitive,
+};
+
+// Grok runner moved to `super::runners::grok` (Phase 2). Re-exported so the
+// dispatch in control.rs and this module's tests keep their paths.
+#[allow(unused_imports)]
+pub(crate) use super::runners::grok::{
+    grok_event_reasoning, grok_event_text, grok_event_usage,
+    grok_stdout_line_requests_interactive_login, run_grok_turn,
+};
+
+// Codex runner moved to `super::runners::codex` (Phase 2). Re-exported so
+// the control.rs dispatch and this module's tests keep their paths.
+#[allow(unused_imports)]
+pub(crate) use super::runners::codex::{
+    codex_final_message_looks_like_progress_update, codex_is_goal_request,
+    codex_missing_goal_final_response_message, codex_turn_requires_tool_activity,
+    extract_codex_reset_window, run_codex_turn, run_codex_turn_with_rotation,
+    summarize_codex_usage_caps,
+};
+
+// Gemini runner moved to `super::runners::gemini` (Phase 2). Re-exported so
+// the control.rs dispatch keeps its path.
+#[allow(unused_imports)]
+pub(crate) use super::runners::gemini::run_gemini_turn;
+
+// OpenCode runner moved to `super::runners::opencode` (Phase 2). Re-exported
+// so the control.rs dispatch keeps its path.
+#[allow(unused_imports)]
+pub(crate) use super::runners::opencode::run_opencode_turn;
+
+// Claude Code runner moved to `super::runners::claudecode` (Phase 2).
+// Re-exported so the control.rs dispatch and tests keep their paths.
+#[allow(unused_imports)]
+pub(crate) use super::runners::claudecode::run_claudecode_turn;
+
+pub(crate) fn parse_opencode_stderr_text_part(line: &str) -> Option<String> {
     let marker = "message.part (text):";
     let idx = line.find(marker)?;
     let mut text = line[idx + marker.len()..].trim().to_string();
@@ -1644,7 +1880,7 @@ fn parse_opencode_stderr_text_part(line: &str) -> Option<String> {
     }
 }
 
-fn parse_opencode_sse_event(
+pub(crate) fn parse_opencode_sse_event(
     data_str: &str,
     event_name: Option<&str>,
     current_session_id: Option<&str>,
@@ -1943,16 +2179,26 @@ fn parse_opencode_sse_event(
             if text.is_empty() {
                 None
             } else {
-                // Strip <think>...</think> tags — emit clean text only
-                let clean = if let Some(end_pos) = text.find("</think>") {
-                    text[end_pos + 8..].trim()
-                } else if text.starts_with("<think>") {
-                    // Thinking-only block with no closing tag yet — skip
-                    ""
-                } else {
-                    text
-                };
-                if clean.is_empty() {
+                // Extract <think>...</think> content as thinking events before
+                // stripping them from the visible text. This captures reasoning
+                // from models (e.g. MiniMax-M3) that embed it in content.
+                if let Some(thinking) = extract_think_content(text) {
+                    if !thinking.trim().is_empty()
+                        && state.last_emitted_thinking.as_deref() != Some(thinking.as_str())
+                    {
+                        state.last_emitted_thinking = Some(thinking.clone());
+                        extra_events.push(AgentEvent::Thinking {
+                            content: thinking,
+                            done: false,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                }
+
+                // Strip <think>...</think> tags for the visible text
+                let clean = strip_think_tags(text);
+                let clean = clean.trim();
+                if clean.is_empty() || state.last_emitted_text.as_deref() == Some(clean) {
                     None
                 } else {
                     state.last_emitted_text = Some(clean.to_string());
@@ -2567,9 +2813,24 @@ impl MissionRunner {
                     Some(result)
                 }
                 Err(e) => {
+                    // A panicked turn used to vanish here (mission left
+                    // "active" forever with no event). Synthesize a failed
+                    // result so the normal finalization path marks the
+                    // mission failed and the UI surfaces the error.
                     tracing::error!("Mission runner task failed: {}", e);
                     self.state = MissionRunState::Finished;
-                    None
+                    Some((
+                        self.mission_id,
+                        String::new(),
+                        AgentResult::failure(
+                            format!(
+                                "Internal error: the agent turn crashed before completing ({e}). \
+                                 This is a bug in sandboxed.sh, not in your request — retry the \
+                                 message and report if it persists."
+                            ),
+                            0,
+                        ),
+                    ))
                 }
             }
         } else {
@@ -2812,6 +3073,15 @@ pub(crate) fn claudecode_transport_recovery_strategy(
                 return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
             }
         }
+        // Degenerate-stream is a self-induced failure: we killed the CLI on
+        // purpose because the model was looping. Resuming the same session
+        // would replay the same loop. Always start a fresh session so the
+        // next turn re-reads the project from a clean context.
+        Some(ClaudeTransportFailureStage::DegenerateStream) => {
+            if !attempted_session_reset {
+                return ClaudeTransportRecoveryStrategy::ResetSessionFresh;
+            }
+        }
         None => {
             if has_session_id
                 && is_claudecode_incomplete_turn_transport_error(result)
@@ -2989,11 +3259,12 @@ async fn run_mission_turn(
     };
 
     let mut convo = String::new();
-    convo.push_str(&history_context);
-    convo.push_str("User:\n");
-    convo.push_str(&user_message);
+    convo.push_str(&crate::util::frame_turn_prompt(
+        &history_context,
+        &user_message,
+    ));
     convo.push_str(&deliverable_reminder);
-    convo.push_str("\n\nInstructions:\n- Continue the conversation helpfully.\n- Use available tools to gather information or make changes.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n- USE information already provided in the message - do not ask for URLs, paths, or details that were already given.\n- When you have fully completed the user's goal or determined it cannot be completed, state that clearly in your final response.");
+    convo.push_str("\n\nInstructions:\n- Respond to the CURRENT user request. The conversation history is context only: do not resume or continue earlier tasks from it unless the current request asks you to.\n- Use available tools to gather information or make changes.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n- USE information already provided in the message - do not ask for URLs, paths, or details that were already given.\n- When you have fully completed the user's goal or determined it cannot be completed, state that clearly in your final response.");
     convo.push_str(multi_step_instructions);
     convo.push('\n');
 
@@ -3083,7 +3354,7 @@ async fn run_mission_turn(
     } else {
         tracing::debug!(
             mission_id = %mission_id,
-            user_message_prefix = &user_message[..user_message.len().min(100)],
+            user_message_prefix = utf8_safe_prefix(&user_message, 100),
             "Not a Telegram message, skipping CLAUDE.md injection"
         );
     }
@@ -3156,655 +3427,84 @@ async fn run_mission_turn(
     // Note: history may include the current user message before the turn runs,
     // so we check for assistant messages to determine if this is truly a continuation.
     let is_continuation = history.iter().any(|(role, _)| role == "assistant");
-    let result = match backend_id.as_str() {
-        "claudecode" => {
-            // Track the effective message and session used for the most recent
-            // attempt, so account rotation uses the right context (e.g. after
-            // session corruption recovery rebuilds the message).
-            let mut effective_msg = user_message.clone();
-            let mut effective_sid = session_id.clone();
-            let mut attempted_same_session_resume = false;
-            let mut attempted_session_reset = false;
-
-            let mut result = run_claudecode_turn(
-                &workspace,
-                &mission_work_dir,
-                &effective_msg,
-                config.default_model.as_deref(),
-                model_effort.as_deref(),
-                effective_agent.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel.clone(),
-                secrets.clone(),
-                &config.working_dir,
-                effective_sid.as_deref(),
-                is_continuation,
-                Some(Arc::clone(&tool_hub)),
-                Some(Arc::clone(&status)),
-                None, // override_auth: use default credential resolution
-            )
-            .await;
-
-            loop {
-                if cancel.is_cancelled() || super::routes::is_shutdown_initiated() {
-                    tracing::debug!(
-                        mission_id = %mission_id,
-                        "Skipping Claude transport recovery because execution is cancelling or shutting down"
-                    );
-                    break;
-                }
-
-                match claudecode_transport_recovery_strategy(
-                    &result,
-                    effective_sid.is_some(),
-                    attempted_same_session_resume,
-                    attempted_session_reset,
-                ) {
-                    ClaudeTransportRecoveryStrategy::None => break,
-                    ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
-                        attempted_same_session_resume = true;
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            session_id = ?effective_sid,
-                            error = %result.output,
-                            "Incomplete Claude turn detected; retrying once by continuing the current session"
-                        );
-                        effective_msg = claudecode_resume_current_session_message().to_string();
-                        result = run_claudecode_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &effective_msg,
-                            config.default_model.as_deref(),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            secrets.clone(),
-                            &config.working_dir,
-                            effective_sid.as_deref(),
-                            true,
-                            Some(Arc::clone(&tool_hub)),
-                            Some(Arc::clone(&status)),
-                            None,
-                        )
-                        .await;
-                    }
-                    ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
-                        attempted_session_reset = true;
-                        let new_session_id = Uuid::new_v4().to_string();
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            old_session_id = ?effective_sid,
-                            new_session_id = %new_session_id,
-                            attempted_same_session_resume,
-                            is_continuation = is_continuation,
-                            error = %result.output,
-                            "Claude transport recovery is rotating to a fresh session"
-                        );
-
-                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                            mission_id,
-                            session_id: new_session_id.clone(),
-                        });
-
-                        let session_marker = mission_work_dir.join(".claude-session-initiated");
-                        if session_marker.exists() {
-                            let _ = std::fs::remove_file(&session_marker);
-                        }
-
-                        let history_for_retry = match history.last() {
-                            Some((role, content)) if role == "user" && content == &user_message => {
-                                &history[..history.len() - 1]
-                            }
-                            _ => history.as_slice(),
-                        };
-                        let retry_message = if history_for_retry.is_empty() {
-                            user_message.clone()
-                        } else {
-                            let history_ctx = build_history_context(
-                                history_for_retry,
-                                config.context.max_history_total_chars,
-                            );
-                            format!(
-                                "## Prior conversation (session was reset due to a transient error)\n\n\
-                                 {history_ctx}\
-                                 ## Current message\n\n\
-                                 {user_message}"
-                            )
-                        };
-
-                        effective_msg = retry_message;
-                        effective_sid = Some(new_session_id);
-
-                        result = run_claudecode_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &effective_msg,
-                            config.default_model.as_deref(),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            secrets.clone(),
-                            &config.working_dir,
-                            effective_sid.as_deref(),
-                            false,
-                            Some(Arc::clone(&tool_hub)),
-                            Some(Arc::clone(&status)),
-                            None,
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            // Proactive auth refresh for SIGKILL'd processes: when Claude Code is
-            // killed mid-turn (signal: Killed, no terminal result), the cause is often
-            // an expired OAuth token that caused Node.js to crash. Even if we can't
-            // detect "auth error" in the output, preemptively refresh credentials so
-            // the transport recovery retry (above) uses fresh tokens. This is cheap
-            // (just a token validity check) and prevents cascading auth failures.
-            if !cancel.is_cancelled()
-                && result.terminal_reason == Some(TerminalReason::LlmError)
-                && result.output.contains("signal: Some(\"Killed\")")
-            {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    "SIGKILL detected — preemptively refreshing OAuth credentials"
-                );
-                let mission_creds = mission_work_dir.join(".claude").join(".credentials.json");
-                if mission_creds.exists() {
-                    let _ = std::fs::remove_file(&mission_creds);
-                }
-                if let Err(e) = super::ai_providers::force_refresh_anthropic_oauth_token().await {
-                    tracing::debug!(
-                        "Preemptive OAuth refresh after SIGKILL failed (non-fatal): {}",
-                        e
-                    );
-                }
-            }
-
-            // Auth error recovery: if the token was revoked server-side but the
-            // local expiry hadn't passed yet, invalidate stale credentials, force
-            // an OAuth refresh, and retry once.
-            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "Auth error detected — invalidating stale credentials and retrying"
-                );
-
-                refresh_claude_credentials_after_auth_error(
-                    &mission_work_dir,
-                    "mission_runner_initial_auth_error",
-                )
-                .await;
-
-                // Retry with fresh credentials (override_auth=None forces re-resolution)
-                result = run_claudecode_turn(
-                    &workspace,
-                    &mission_work_dir,
-                    &effective_msg,
-                    config.default_model.as_deref(),
-                    model_effort.as_deref(),
-                    effective_agent.as_deref(),
-                    mission_id,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    secrets.clone(),
-                    &config.working_dir,
-                    effective_sid.as_deref(),
-                    false,
-                    Some(Arc::clone(&tool_hub)),
-                    Some(Arc::clone(&status)),
-                    None,
-                )
-                .await;
-            }
-
-            // Account rotation: if rate-limited, or if auth still fails after
-            // one refresh attempt, try alternate Anthropic credentials.
-            // The first entry in the list is the highest-priority credential, which
-            // is almost certainly what the initial (override_auth=None) call used.
-            // Skip it to avoid a guaranteed duplicate failure.
-            let mut rotated_anthropic_account = false;
-            if matches!(
-                result.terminal_reason,
-                Some(TerminalReason::RateLimited | TerminalReason::AuthError)
-            ) {
-                let rotation_reason = result.terminal_reason;
-                let rotation_accounts =
-                    anthropic_rotation_accounts(&workspace, &mission_work_dir, &config.working_dir);
-                if !rotation_accounts.accounts.is_empty() {
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        total_accounts = rotation_accounts.total_accounts,
-                        alternate_accounts = rotation_accounts.accounts.len(),
-                        skipped_current = rotation_accounts.skipped_current,
-                        ?rotation_reason,
-                        "Primary Anthropic credential failed; trying alternate credentials"
-                    );
-                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        rotated_anthropic_account = true;
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            rotation_attempt = idx + 1,
-                            auth_type = match &alt_auth {
-                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
-                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) => "oauth_token",
-                            },
-                            "Rotating to alternate Anthropic account"
-                        );
-                        result = run_claudecode_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            &effective_msg,
-                            config.default_model.as_deref(),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            secrets.clone(),
-                            &config.working_dir,
-                            effective_sid.as_deref(),
-                            is_continuation,
-                            Some(Arc::clone(&tool_hub)),
-                            Some(Arc::clone(&status)),
-                            Some(alt_auth),
-                        )
-                        .await;
-                        // Continue rotating on account-specific failures.
-                        // Other LLM errors (model errors, context limit, etc.)
-                        // would fail on every account, so stop early to avoid
-                        // masking the real failure.
-                        match result.terminal_reason {
-                            Some(TerminalReason::RateLimited | TerminalReason::AuthError) => {
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    rotation_attempt = idx + 1,
-                                    ?result.terminal_reason,
-                                    "Anthropic credential failed; rotating to next account"
-                                );
-                                continue;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-
-            // If an alternate OAuth credential is revoked, rotation returns
-            // AuthError. Refresh stale Claude credentials and retry once with
-            // freshly resolved auth instead of surfacing a raw 401.
-            if rotated_anthropic_account
-                && result.terminal_reason == Some(TerminalReason::AuthError)
-                && !cancel.is_cancelled()
-            {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
-                );
-
-                refresh_claude_credentials_after_auth_error(
-                    &mission_work_dir,
-                    "mission_runner_rotated_auth_error",
-                )
-                .await;
-
-                result = run_claudecode_turn(
-                    &workspace,
-                    &mission_work_dir,
-                    &effective_msg,
-                    config.default_model.as_deref(),
-                    model_effort.as_deref(),
-                    effective_agent.as_deref(),
-                    mission_id,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    secrets.clone(),
-                    &config.working_dir,
-                    effective_sid.as_deref(),
-                    is_continuation,
-                    Some(Arc::clone(&tool_hub)),
-                    Some(Arc::clone(&status)),
-                    None,
-                )
-                .await;
-            }
-
-            result
-        }
-        "opencode" => {
-            // Use per-workspace CLI execution for all workspace types to ensure
-            // native bash + correct filesystem scope.
-            let opencode_message_owned: String = if user_message.trim_start().starts_with("/goal ")
-            {
+    // Per-backend message framing + continuation semantics. These are
+    // call-site decisions (the runner receives exactly the message it should
+    // send): goal-mode missions need the raw `/goal ...` text preserved;
+    // OpenCode resumes its own per-mission session storage (so the framed
+    // `convo` would duplicate context the CLI is about to load); grok/codex
+    // see the history-framed convo on normal turns; gemini always gets the
+    // framed convo; Claude Code maintains its own session and gets the raw
+    // user message.
+    let is_goal_mode = user_message.trim_start().starts_with("/goal ");
+    let has_opencode_session = session_id
+        .as_deref()
+        .map(is_opencode_session_id)
+        .unwrap_or(false);
+    let (turn_message, turn_is_continuation): (String, bool) = match backend_id.as_str() {
+        "opencode" => (
+            if is_goal_mode || has_opencode_session {
                 user_message.clone()
             } else {
                 convo.clone()
-            };
-            run_opencode_turn(
-                &workspace,
-                &mission_work_dir,
-                &opencode_message_owned,
-                config.default_model.as_deref(),
-                model_effort.as_deref(),
-                effective_agent.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-            )
-            .await
-        }
-        "grok" => {
-            run_grok_turn(
-                &workspace,
-                &mission_work_dir,
-                &user_message,
-                config.default_model.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                is_continuation,
-            )
-            .await
-        }
-        "codex" => {
-            let requested_model = config.default_model.as_deref();
-            // Goal-mode missions (`/goal <objective>`) need to reach the
-            // codex backend with the prefix intact so its app-server driver
-            // can route via `thread/goal/set` instead of a plain
-            // `turn/start`. The "User:\n... Instructions: ..." convo
-            // wrapper buries the prefix and breaks detection; for goal
-            // missions we send the raw user message instead. Non-goal
-            // codex missions keep the wrapped convo so they retain the
-            // history/deliverable scaffolding the model relies on.
-            let codex_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+            },
+            // A stored OpenCode session id is always a continuation: even if
+            // the in-memory history lost its assistant messages (restart,
+            // resume, rebuild), the per-mission XDG storage has the prior
+            // session and --session/--continue must fire.
+            is_continuation || has_opencode_session,
+        ),
+        "grok" | "codex" => (
+            if is_goal_mode {
                 user_message.clone()
             } else {
                 convo.clone()
+            },
+            is_continuation,
+        ),
+        "gemini" => (convo.clone(), is_continuation),
+        _ => (user_message.clone(), is_continuation),
+    };
+
+    let result = match super::runners::runner_for(&backend_id) {
+        Some(runner) => {
+            tracing::debug!(
+                mission_id = %mission_id,
+                runner = runner.name(),
+                "Dispatching mission turn to harness runner"
+            );
+            let extras = if backend_id == "claudecode" {
+                super::runners::TurnExtras::ClaudeCode {
+                    secrets: secrets.clone(),
+                    tool_hub: Some(Arc::clone(&tool_hub)),
+                    status: Some(Arc::clone(&status)),
+                    history: &history,
+                    max_history_total_chars: config.context.max_history_total_chars,
+                }
+            } else {
+                super::runners::TurnExtras::None
             };
-            let codex_message: &str = codex_message_owned.as_str();
-            // Unified credential pool: API keys + ChatGPT-OAuth identities,
-            // de-duplicated by chatgpt_account_id. Empty only when neither
-            // an OpenAI API key nor a connected ChatGPT account is available.
-            //
-            // Defensive: if the pool was empty and the turn hits a rate
-            // limit, re-query once and rerun via rotation if credentials are
-            // now visible. The May 2026 incident showed the empty branch can
-            // be taken transiently even when accounts exist on disk, leaving
-            // the user with no rotation. The recheck guards against that
-            // without changing the happy-path behaviour.
-            'codex_arm: {
-                let mut all_creds = collect_codex_credentials(&config.working_dir);
-                let mut prior_empty_result: Option<AgentResult> = None;
-                if all_creds.is_empty() {
-                    let mut result = run_codex_turn(
-                        &workspace,
-                        &mission_work_dir,
-                        codex_message,
-                        requested_model,
-                        model_effort.as_deref(),
-                        effective_agent.as_deref(),
-                        mission_id,
-                        events_tx.clone(),
-                        cancel.clone(),
-                        &config.working_dir,
-                        session_id.as_deref(),
-                        None,
-                    )
-                    .await;
-
-                    if let Some(fallback_model) =
-                        codex_chatgpt_fallback_for_result(requested_model, &result)
-                    {
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            requested_model = ?requested_model,
-                            fallback_model,
-                            "Retrying Codex turn with fallback model for ChatGPT account compatibility"
-                        );
-                        result = run_codex_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            codex_message,
-                            Some(fallback_model),
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            None,
-                        )
-                        .await;
-                    } else if codex_tool_stall_should_retry_with_default_model(
-                        requested_model,
-                        &result,
-                    ) {
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            requested_model = ?requested_model,
-                            "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
-                        );
-                        result = run_codex_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            codex_message,
-                            // Was `None`, which made the Codex CLI fall back to
-                            // its built-in default — currently the retired
-                            // `gpt-5.3-codex`, rejected by ChatGPT-account auth
-                            // with a 400. Retry on the requested (latest) model.
-                            requested_model,
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            None,
-                        )
-                        .await;
-                    }
-
-                    // Defensive re-query: if this turn was rate/capacity limited
-                    // and a fresh enumeration now returns accounts, fall through
-                    // to the rotation loop instead of surfacing the failure.
-                    let constrained = matches!(
-                        result.terminal_reason,
-                        Some(TerminalReason::RateLimited | TerminalReason::CapacityLimited)
-                    );
-                    if constrained {
-                        let recheck = collect_codex_credentials(&config.working_dir);
-                        if !recheck.is_empty() {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                recovered_credentials = recheck.len(),
-                                "Codex credential pool was empty on first attempt but re-query found accounts after a rate-limited turn; retrying with rotation"
-                            );
-                            all_creds = recheck;
-                            prior_empty_result = Some(result);
-                            // fall through to rotation loop below
-                        } else {
-                            break 'codex_arm result;
-                        }
-                    } else {
-                        break 'codex_arm result;
-                    }
-                }
-                {
-                    let mut attempted_credentials: HashSet<String> = HashSet::new();
-                    let mut attempt_idx = 0usize;
-                    let mut last_constrained_result: Option<AgentResult> = prior_empty_result;
-
-                    loop {
-                        if cancel.is_cancelled() {
-                            break last_constrained_result
-                                .unwrap_or_else(cancel_or_shutdown_failure);
-                        }
-
-                        let lease = lease_codex_account(
-                            &config.working_dir,
-                            &attempted_credentials,
-                            &cancel,
-                        )
-                        .await;
-                        let Some(lease) = lease else {
-                            if let Some(prev) = last_constrained_result {
-                                break prev;
-                            }
-                            break AgentResult::failure(
-                            "All configured Codex accounts are currently at capacity. Try again shortly."
-                                .to_string(),
-                            0,
-                        )
-                        .with_terminal_reason(TerminalReason::CapacityLimited);
-                        };
-
-                        attempt_idx += 1;
-                        let credential_label = lease.credential.label_for_logs();
-                        attempted_credentials.insert(lease.credential.fingerprint());
-                        let credential_override = lease.credential.as_override();
-
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            attempt = attempt_idx,
-                            credential = %credential_label,
-                            total_credentials = all_creds.len(),
-                            "Running Codex turn with leased account slot"
-                        );
-
-                        let mut result = run_codex_turn(
-                            &workspace,
-                            &mission_work_dir,
-                            codex_message,
-                            requested_model,
-                            model_effort.as_deref(),
-                            effective_agent.as_deref(),
-                            mission_id,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            &config.working_dir,
-                            session_id.as_deref(),
-                            Some(&credential_override),
-                        )
-                        .await;
-
-                        if let Some(fallback_model) =
-                            codex_chatgpt_fallback_for_result(requested_model, &result)
-                        {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                attempt = attempt_idx,
-                                requested_model = ?requested_model,
-                                fallback_model,
-                                credential = %credential_label,
-                                "Retrying Codex turn with fallback model for ChatGPT account compatibility"
-                            );
-                            result = run_codex_turn(
-                                &workspace,
-                                &mission_work_dir,
-                                codex_message,
-                                Some(fallback_model),
-                                model_effort.as_deref(),
-                                effective_agent.as_deref(),
-                                mission_id,
-                                events_tx.clone(),
-                                cancel.clone(),
-                                &config.working_dir,
-                                session_id.as_deref(),
-                                Some(&credential_override),
-                            )
-                            .await;
-                        } else if codex_tool_stall_should_retry_with_default_model(
-                            requested_model,
-                            &result,
-                        ) {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                attempt = attempt_idx,
-                                requested_model = ?requested_model,
-                                credential = %credential_label,
-                                "Retrying Codex turn on the requested model (not the stale Codex CLI default) after it stopped before tool use"
-                            );
-                            result = run_codex_turn(
-                                &workspace,
-                                &mission_work_dir,
-                                codex_message,
-                                // Was `None` (stale CLI default gpt-5.3-codex,
-                                // 400 on ChatGPT auth). Retry on the requested
-                                // (latest) model instead.
-                                requested_model,
-                                model_effort.as_deref(),
-                                effective_agent.as_deref(),
-                                mission_id,
-                                events_tx.clone(),
-                                cancel.clone(),
-                                &config.working_dir,
-                                session_id.as_deref(),
-                                Some(&credential_override),
-                            )
-                            .await;
-                        }
-
-                        drop(lease);
-
-                        match result.terminal_reason {
-                            Some(
-                                TerminalReason::RateLimited
-                                | TerminalReason::CapacityLimited
-                                | TerminalReason::AuthError,
-                            ) if attempted_credentials.len() < all_creds.len() => {
-                                let reason = match result.terminal_reason {
-                                    Some(TerminalReason::CapacityLimited) => "capacity limited",
-                                    Some(TerminalReason::AuthError) => {
-                                        "auth failed (likely refresh-token reuse)"
-                                    }
-                                    _ => "rate limited",
-                                };
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    attempt = attempt_idx,
-                                    reason,
-                                    "Codex account constrained; leasing next account"
-                                );
-                                last_constrained_result = Some(result);
-                            }
-                            _ => break result,
-                        }
-                    }
-                }
-            }
+            runner
+                .run_turn(super::runners::TurnContext {
+                    workspace: &workspace,
+                    work_dir: &mission_work_dir,
+                    message: &turn_message,
+                    model: config.default_model.as_deref(),
+                    model_effort: model_effort.as_deref(),
+                    agent: effective_agent.as_deref(),
+                    mission_id,
+                    events_tx: events_tx.clone(),
+                    cancel: cancel.clone(),
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: turn_is_continuation,
+                    extras,
+                })
+                .await
         }
-        "gemini" => {
-            run_gemini_turn(
-                &workspace,
-                &mission_work_dir,
-                &convo,
-                config.default_model.as_deref(),
-                effective_agent.as_deref(),
-                mission_id,
-                events_tx.clone(),
-                cancel.clone(),
-                &config.working_dir,
-                session_id.as_deref(),
-            )
-            .await
-        }
-        _ => {
-            // Don't send Error event - the failure will be emitted as an AssistantMessage
-            // with success=false by the caller (control.rs), avoiding duplicate messages.
+        None => {
+            // Don't send Error event - the failure will be emitted as an
+            // AssistantMessage with success=false by the caller (control.rs),
+            // avoiding duplicate messages.
             AgentResult::failure(format!("Unsupported backend: {}", backend_id), 0)
                 .with_terminal_reason(TerminalReason::LlmError)
         }
@@ -3891,7 +3591,7 @@ fn read_backend_configs() -> Option<Vec<serde_json::Value>> {
 }
 
 /// Read a non-empty string setting from a backend's config entry.
-fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<String> {
+pub(crate) fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<String> {
     let configs = read_backend_configs()?;
     for config in configs {
         if config.get("id")?.as_str()? == backend_id {
@@ -3915,7 +3615,7 @@ fn get_backend_string_setting(backend_id: &str, key: &str) -> Option<String> {
 }
 
 /// Read a boolean setting from a backend's config entry.
-fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
+pub(crate) fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
     let configs = read_backend_configs()?;
     for config in configs {
         if config.get("id")?.as_str()? == backend_id {
@@ -3932,2300 +3632,8 @@ fn get_backend_bool_setting(backend_id: &str, key: &str) -> Option<bool> {
     None
 }
 
-/// Map a mission `model_effort` to a Claude Code extended-thinking budget
-/// (`MAX_THINKING_TOKENS`).
-///
-/// `CLAUDE_CODE_EFFORT_LEVEL` alone only nudges *adaptive* reasoning: on
-/// tool-heavy turns the model frequently chooses not to think at all, so no
-/// `thinking_delta` blocks stream and the Thoughts panel stays empty (see
-/// mission 5aede562, which ran at effort=max yet recorded 0 thinking events
-/// across ~1600 tool calls). Pinning a non-zero budget forces an extended
-/// thinking block every turn, so thoughts are captured deterministically.
-///
-/// Returns 0 for unknown efforts, leaving thinking fully adaptive.
-fn claude_thinking_budget(effort: &str) -> u32 {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "max" => 32_000,
-        "xhigh" => 24_000,
-        "high" => 16_000,
-        "medium" => 8_000,
-        "low" => 4_000,
-        _ => 0,
-    }
-}
-
-/// Execute a turn using Claude Code CLI backend.
-///
-/// For Host workspaces: spawns the CLI directly on the host.
-/// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
-#[allow(clippy::too_many_arguments)]
-pub fn run_claudecode_turn<'a>(
-    workspace: &'a Workspace,
-    work_dir: &'a std::path::Path,
-    message: &'a str,
-    model: Option<&'a str>,
-    model_effort: Option<&'a str>,
-    agent: Option<&'a str>,
-    mission_id: Uuid,
-    events_tx: broadcast::Sender<AgentEvent>,
-    cancel: CancellationToken,
-    secrets: Option<Arc<SecretsStore>>,
-    app_working_dir: &'a std::path::Path,
-    session_id: Option<&'a str>,
-    is_continuation: bool,
-    tool_hub: Option<Arc<FrontendToolHub>>,
-    status: Option<Arc<RwLock<ControlStatus>>>,
-    override_auth: Option<super::ai_providers::ClaudeCodeAuth>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
-    Box::pin(async move {
-        use super::ai_providers::{
-            anthropic_cli_proxy_account_available, ensure_anthropic_oauth_token_valid,
-            get_anthropic_auth_for_claudecode, get_anthropic_auth_from_host_with_expiry,
-            get_anthropic_auth_from_workspace, get_workspace_auth_path,
-            refresh_workspace_anthropic_auth, ClaudeCodeAuth,
-        };
-        use std::collections::HashMap;
-        use tokio::time::{Duration, Instant};
-
-        fn describe_pty_exit_status(
-            exit_status: &Result<
-                Result<portable_pty::ExitStatus, std::io::Error>,
-                tokio::task::JoinError,
-            >,
-        ) -> String {
-            match exit_status {
-                Ok(Ok(status)) => format!("{:?}", status),
-                Ok(Err(err)) => format!("wait error: {}", err),
-                Err(err) => format!("join error: {}", err),
-            }
-        }
-
-        fn classify_claudecode_secret(value: String) -> ClaudeCodeAuth {
-            if value.starts_with("sk-ant-oat") {
-                ClaudeCodeAuth::OAuthToken(value)
-            } else {
-                ClaudeCodeAuth::ApiKey(value)
-            }
-        }
-
-        #[derive(Debug, Clone)]
-        struct ClaudeCodeProxyConfig {
-            base_url: String,
-            api_key: String,
-        }
-
-        fn claudecode_cli_proxy_config() -> Option<ClaudeCodeProxyConfig> {
-            // Only fall back to the CLI proxy when it is actually configured —
-            // either via explicit env vars or a fresh CLI-proxy-api account.
-            // Without this gate we would hijack any ANTHROPIC_* setup on hosts
-            // that never opted into the proxy and inject the synthetic key.
-            if !anthropic_cli_proxy_account_available() {
-                return None;
-            }
-
-            // Note: ANTHROPIC_BASE_URL is intentionally *not* consulted here;
-            // it is a standard Anthropic SDK variable and users set it for
-            // unrelated API proxies. The aliases used here are the same ones
-            // listed in `util::CLI_PROXY_BASE_URL_ENV_VARS` so every CLI-proxy
-            // code path agrees.
-            let base_url = crate::util::cli_proxy_base_url_from_env()
-                .unwrap_or_else(|| "http://127.0.0.1:8317".to_string());
-            let base_url = base_url.trim_end_matches('/').to_string();
-            if base_url.is_empty() {
-                return None;
-            }
-
-            // The CLI Proxy API commonly runs unauthenticated on localhost, but
-            // Claude Code still requires a non-empty ANTHROPIC_API_KEY when an
-            // Anthropic base URL is configured. If the proxy needs auth, pass
-            // through the configured proxy key; otherwise use an inert value.
-            let api_key = crate::util::cli_proxy_api_key_from_env()
-                .unwrap_or_else(|| "sandboxed-sh-cli-proxy".to_string());
-
-            Some(ClaudeCodeProxyConfig { base_url, api_key })
-        }
-
-        fn claude_cli_credentials_info(path: &std::path::Path) -> Option<(i64, bool)> {
-            let (_, expires_at, _, has_refresh) = read_claude_cli_credentials(path)?;
-            Some((expires_at, has_refresh))
-        }
-
-        /// Read the full claudeAiOauth payload from a credentials file.
-        /// Returns `(access_token, expires_at, refresh_token, has_refresh)`.
-        fn read_claude_cli_credentials(
-            path: &std::path::Path,
-        ) -> Option<(String, i64, String, bool)> {
-            let metadata = std::fs::metadata(path).ok()?;
-            if metadata.len() == 0 {
-                return None;
-            }
-            let contents = std::fs::read_to_string(path).ok()?;
-            let creds: serde_json::Value = serde_json::from_str(&contents).ok()?;
-            let oauth = creds.get("claudeAiOauth")?;
-            let access_token = oauth
-                .get("accessToken")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .filter(|s| !s.trim().is_empty())?;
-            let expires_at = oauth
-                .get("expiresAt")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(i64::MAX);
-            let refresh_token = oauth
-                .get("refreshToken")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            let has_refresh = !refresh_token.trim().is_empty();
-            Some((access_token, expires_at, refresh_token, has_refresh))
-        }
-
-        fn looks_like_claude_cli_credentials(path: &std::path::Path) -> bool {
-            let (expires_at, has_refresh) = match claude_cli_credentials_info(path) {
-                Some(info) => info,
-                None => return false,
-            };
-            // Check if the access token is expired.
-            // Claude Code in --print mode does not auto-refresh OAuth tokens,
-            // so we must ensure the token is valid before launching.
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            // Add 60s buffer to avoid race conditions with near-expiry tokens
-            if expires_at < now_ms + 60_000 {
-                tracing::warn!(
-                    path = %path.display(),
-                    expires_at = expires_at,
-                    has_refresh = has_refresh,
-                    "Claude CLI credentials expired or near-expiry, will use OAuth refresh flow"
-                );
-                return false;
-            }
-            true
-        }
-
-        fn find_host_claude_cli_credentials() -> Option<std::path::PathBuf> {
-            let mut candidates = vec![
-                std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
-                std::path::PathBuf::from("/root/.claude/.credentials.json"),
-            ];
-            if let Ok(home) = std::env::var("HOME") {
-                candidates.push(std::path::PathBuf::from(home).join(".claude/.credentials.json"));
-            }
-
-            candidates
-                .into_iter()
-                .find(|p| looks_like_claude_cli_credentials(p))
-        }
-
-        // Prefer the user's Claude CLI login if present, but avoid mutating the global
-        // credentials file. We run each mission with a per-mission HOME, and copy the
-        // host credentials into the mission directory if needed.
-        let mission_creds_path = work_dir.join(".claude").join(".credentials.json");
-        let using_override_auth = override_auth.is_some();
-        if using_override_auth && mission_creds_path.exists() {
-            match std::fs::remove_file(&mission_creds_path) {
-                Ok(_) => {
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        path = %mission_creds_path.display(),
-                        "Removed mission Claude CLI credentials so override auth can take precedence"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        path = %mission_creds_path.display(),
-                        error = %e,
-                        "Failed to remove mission Claude CLI credentials before override auth"
-                    );
-                }
-            }
-        }
-        // Propagate mission → host BEFORE deciding whether to copy host → mission.
-        // Anthropic's OAuth uses rotating refresh tokens (each refresh returns a
-        // new refresh_token and invalidates the old one). If a previous turn's
-        // Claude CLI rotated tokens inside the mission directory, the host file
-        // still holds the old (now-invalid) refresh_token. Without this back-sync
-        // the next backend refresh — or any sibling mission that copies host
-        // creds — would hit "refresh_token already used" / invalid_grant.
-        if !using_override_auth {
-            if let (Some(host_path), Some((m_access, m_expires, m_refresh, m_has_refresh))) = (
-                find_host_claude_cli_credentials(),
-                read_claude_cli_credentials(&mission_creds_path),
-            ) {
-                if m_has_refresh {
-                    let host_expires = claude_cli_credentials_info(&host_path)
-                        .map(|(e, _)| e)
-                        .unwrap_or(i64::MIN);
-                    if m_expires > host_expires {
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            mission_expires_at = m_expires,
-                            host_expires_at = host_expires,
-                            "Mission credentials are fresher than host; syncing back to all storage tiers"
-                        );
-                        if let Err(e) = super::ai_providers::sync_oauth_to_all_tiers(
-                            crate::ai_providers::ProviderType::Anthropic,
-                            &m_refresh,
-                            &m_access,
-                            m_expires,
-                        ) {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                error = %e,
-                                "Failed to write mission-rotated Anthropic credentials back to host"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Copy host credentials if missing OR if the existing ones are expired/near-expiry.
-        let needs_copy = if using_override_auth {
-            false
-        } else if !looks_like_claude_cli_credentials(&mission_creds_path) {
-            true
-        } else if let Some((expires_at, _)) = claude_cli_credentials_info(&mission_creds_path) {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            if expires_at < now_ms + 120_000 {
-                true // expired or about to expire
-            } else {
-                // Re-copy only when host credentials are STRICTLY newer than the
-                // mission's local copy. The previous `!=` check overwrote a
-                // mission's freshly-rotated tokens with the host's stale ones
-                // whenever the two diverged, which destroyed the only valid
-                // refresh_token and triggered the invalid_grant we're guarding
-                // against.
-                if let Some(host_path) = find_host_claude_cli_credentials() {
-                    if let Some((host_expires, _)) = claude_cli_credentials_info(&host_path) {
-                        host_expires > expires_at
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        // Proactive refresh: if host CLI credentials are expired or near-expiry,
-        // refresh them before copying into the mission directory.  This prevents
-        // the mission from starting with stale credentials that will fail mid-turn.
-        if needs_copy {
-            if let Some(host_creds_path) = find_host_claude_cli_credentials() {
-                if let Some((host_expires, _)) = claude_cli_credentials_info(&host_creds_path) {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
-                    if host_expires < now_ms + 300_000 {
-                        // 5 minute buffer
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            host_expires_at = host_expires,
-                            now_ms = now_ms,
-                            "Host CLI credentials expired or near-expiry; triggering proactive OAuth refresh"
-                        );
-                        if let Err(e) =
-                            super::ai_providers::force_refresh_anthropic_oauth_token().await
-                        {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                "Proactive OAuth refresh failed: {}",
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        if needs_copy {
-            if let Some(host_creds) = find_host_claude_cli_credentials() {
-                if let Some(parent) = mission_creds_path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            path = %parent.display(),
-                            error = %e,
-                            "Failed to create parent directory for Claude CLI credentials"
-                        );
-                    }
-                }
-                match std::fs::copy(&host_creds, &mission_creds_path) {
-                    Ok(_) => {
-                        tracing::info!(
-                            from = %host_creds.display(),
-                            to = %mission_creds_path.display(),
-                            "Copied Claude CLI credentials into mission directory"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            from = %host_creds.display(),
-                            to = %mission_creds_path.display(),
-                            error = %e,
-                            "Failed to copy Claude CLI credentials into mission directory"
-                        );
-                    }
-                }
-            }
-        }
-        let mut has_cli_creds =
-            !using_override_auth && looks_like_claude_cli_credentials(&mission_creds_path);
-        if let Some((expires_at, has_refresh)) = claude_cli_credentials_info(&mission_creds_path) {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let is_expired = expires_at < now_ms;
-            tracing::info!(
-                mission_id = %mission_id,
-                path = %mission_creds_path.display(),
-                expires_at = expires_at,
-                has_refresh = has_refresh,
-                has_cli_creds = has_cli_creds,
-                is_expired = is_expired,
-                "Claude CLI credential status for mission"
-            );
-            // If credentials are expired even after the copy/refresh attempt,
-            // don't trust them — fall through to OAuth injection instead.
-            if is_expired {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    expires_at = expires_at,
-                    now_ms = now_ms,
-                    "Mission CLI credentials are expired; removing stale file and falling through to OAuth refresh"
-                );
-                has_cli_creds = false;
-                // Remove the stale file so Claude Code doesn't pick it up
-                // and fail with "Invalid authentication credentials".
-                if let Err(e) = std::fs::remove_file(&mission_creds_path) {
-                    tracing::debug!(
-                        mission_id = %mission_id,
-                        error = %e,
-                        "Failed to remove expired credentials file (may not exist)"
-                    );
-                }
-            }
-        } else {
-            tracing::info!(
-                mission_id = %mission_id,
-                path = %mission_creds_path.display(),
-                has_cli_creds = has_cli_creds,
-                "No Claude CLI credentials found for mission"
-            );
-        }
-
-        let proxy_auth = if !using_override_auth && !has_cli_creds {
-            let config = claudecode_cli_proxy_config();
-            if let Some(ref proxy) = config {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    base_url = %proxy.base_url,
-                    "Using Claude Code via CLI Proxy API fallback"
-                );
-            }
-            config
-        } else {
-            None
-        };
-
-        // Only refresh OpenCode/Anthropic OAuth tokens if we plan to inject them.
-        let oauth_refresh_result = if has_cli_creds || proxy_auth.is_some() {
-            tracing::info!(
-                mission_id = %mission_id,
-                has_cli_creds = has_cli_creds,
-                using_cli_proxy = proxy_auth.is_some(),
-                "Using non-OAuth-refresh Claude Code auth path; skipping OAuth refresh injection"
-            );
-            Ok(())
-        } else {
-            tracing::info!(
-                mission_id = %mission_id,
-                "No valid Claude CLI credentials; using OAuth refresh flow"
-            );
-            // Ensure OAuth tokens are fresh before resolving credentials.
-            ensure_anthropic_oauth_token_valid().await
-        };
-        if let Err(e) = &oauth_refresh_result {
-            tracing::warn!("Failed to refresh Anthropic OAuth token: {}", e);
-        }
-
-        // Keep a clone of the override credential so recursive continuation
-        // calls (tool-result → next turn) keep using the same rotated account.
-        let override_auth_for_continuation = override_auth.clone();
-
-        // If an override credential was provided (account rotation), use it directly.
-        let api_auth = if let Some(auth) = override_auth {
-            tracing::info!(
-                mission_id = %mission_id,
-                auth_type = match &auth {
-                    ClaudeCodeAuth::ApiKey(_) => "api_key",
-                    ClaudeCodeAuth::OAuthToken(_) => "oauth_token",
-                },
-                "Using override credential for account rotation"
-            );
-            Some(auth)
-        } else if proxy_auth.is_some() || has_cli_creds {
-            // CLI-proxy runs get credentials injected via `proxy_auth` env vars,
-            // and CLI credentials come from the mirrored `.credentials.json`.
-            // Either way, there's nothing to select here.
-            None
-        } else {
-            // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
-            // For container workspaces, compare workspace auth vs host auth and use the fresher one.
-            // If workspace auth is expired, try to refresh it using the refresh token.
-            // For container workspaces, get both workspace and host auth with expiry info
-            let mut workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
-                get_anthropic_auth_from_workspace(&workspace.path)
-            } else {
-                None
-            };
-
-            let host_auth = get_anthropic_auth_from_host_with_expiry();
-            let now = chrono::Utc::now().timestamp_millis();
-
-            // If workspace auth is expired and we have no fresh host auth, try to refresh the workspace auth
-            if let Some(ref ws) = workspace_auth {
-                let ws_expiry = ws.expires_at.unwrap_or(i64::MAX);
-                let ws_expired = ws_expiry < now;
-                let host_has_fresh_auth = host_auth
-                    .as_ref()
-                    .map(|h| h.expires_at.unwrap_or(i64::MAX) > now)
-                    .unwrap_or(false);
-
-                if ws_expired && !host_has_fresh_auth {
-                    // Workspace auth is expired and no fresh host auth - try to refresh workspace auth
-                    tracing::info!(
-                        workspace_path = %workspace.path.display(),
-                        ws_expiry = ws_expiry,
-                        "Workspace auth is expired, attempting to refresh"
-                    );
-                    match refresh_workspace_anthropic_auth(&workspace.path).await {
-                        Ok(refreshed) => {
-                            tracing::info!(
-                                workspace_path = %workspace.path.display(),
-                                "Successfully refreshed workspace Anthropic auth"
-                            );
-                            workspace_auth = Some(refreshed);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                workspace_path = %workspace.path.display(),
-                                error = %e,
-                                "Failed to refresh workspace auth, will try other sources"
-                            );
-                            // Clear the stale workspace auth so we don't keep trying
-                            workspace_auth = None;
-                        }
-                    }
-                }
-            }
-
-            // Choose the fresher auth based on expiry timestamps
-            let chosen_auth: Option<ClaudeCodeAuth> = match (&workspace_auth, &host_auth) {
-                (Some(ws), Some(host)) => {
-                    // Both available - compare expiry timestamps
-                    let ws_expiry = ws.expires_at.unwrap_or(i64::MAX); // API keys never expire
-                    let host_expiry = host.expires_at.unwrap_or(i64::MAX);
-
-                    // Check if workspace auth is expired
-                    let ws_expired = ws_expiry < now;
-                    let host_expired = host_expiry < now;
-
-                    if ws_expired && !host_expired {
-                        // Workspace auth is expired but host auth is fresh - use host auth
-                        // Also delete the stale workspace auth file
-                        let ws_auth_path = get_workspace_auth_path(&workspace.path);
-                        if ws_auth_path.exists() {
-                            tracing::info!(
-                                workspace_path = %workspace.path.display(),
-                                ws_expiry = ws_expiry,
-                                host_expiry = host_expiry,
-                                "Workspace auth is expired, using fresher host auth and removing stale workspace auth"
-                            );
-                            if let Err(e) = std::fs::remove_file(&ws_auth_path) {
-                                tracing::warn!(
-                                    path = %ws_auth_path.display(),
-                                    error = %e,
-                                    "Failed to remove stale workspace auth file"
-                                );
-                            }
-                        }
-                        Some(host.auth.clone())
-                    } else if host_expiry > ws_expiry {
-                        // Host auth has later expiry - use it (it was likely just refreshed)
-                        tracing::info!(
-                            workspace_path = %workspace.path.display(),
-                            ws_expiry = ws_expiry,
-                            host_expiry = host_expiry,
-                            "Using fresher host auth (expires later than workspace auth)"
-                        );
-                        Some(host.auth.clone())
-                    } else {
-                        // Workspace auth is fresher or equal - use it
-                        tracing::info!(
-                            workspace_path = %workspace.path.display(),
-                            ws_expiry = ws_expiry,
-                            host_expiry = host_expiry,
-                            "Using workspace auth"
-                        );
-                        Some(ws.auth.clone())
-                    }
-                }
-                (Some(ws), None) => {
-                    // Only workspace auth available
-                    tracing::info!(
-                        workspace_path = %workspace.path.display(),
-                        "Using Anthropic credentials from container workspace"
-                    );
-                    Some(ws.auth.clone())
-                }
-                (None, Some(host)) => {
-                    // Only host auth available
-                    tracing::info!("Using Anthropic credentials from host");
-                    Some(host.auth.clone())
-                }
-                (None, None) => None,
-            };
-
-            // If we found auth from workspace/host comparison, use it
-            if let Some(auth) = chosen_auth {
-                Some(auth)
-            } else if let Some(auth) = get_anthropic_auth_for_claudecode(app_working_dir) {
-                tracing::info!("Using Anthropic credentials from provider for Claude Code");
-                Some(auth)
-            } else {
-                // Fall back to secrets vault (legacy support)
-                if let Some(ref store) = secrets {
-                    match store.get_secret("claudecode", "api_key").await {
-                        Ok(key) => {
-                            tracing::info!(
-                                "Using Claude Code credentials from secrets vault (legacy)"
-                            );
-                            Some(classify_claudecode_secret(key))
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to get Claude API key from secrets: {}", e);
-                            // Fall back to environment variable
-                            std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-                                .ok()
-                                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                                .map(classify_claudecode_secret)
-                        }
-                    }
-                } else {
-                    std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-                        .ok()
-                        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                        .map(classify_claudecode_secret)
-                }
-            }
-        };
-
-        if matches!(api_auth, Some(ClaudeCodeAuth::OAuthToken(_))) {
-            if let Err(err) = oauth_refresh_result {
-                let err_msg = format!(
-                "Anthropic OAuth token refresh failed: {}. Please re-authenticate in Settings → AI Providers.",
-                err
-            );
-                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-                return AgentResult::failure(err_msg, 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
-            }
-        }
-
-        // Fail fast only if neither:
-        // - Claude CLI credentials are available (copied into the mission directory), nor
-        // - We have explicit API auth to inject via env vars.
-        if api_auth.is_none() && !has_cli_creds && proxy_auth.is_none() {
-            let err_msg = "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
-            tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-            return AgentResult::failure(err_msg.to_string(), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
-
-        // Determine CLI path: prefer backend config, then env var, then default
-        let cli_path = get_backend_string_setting("claudecode", "cli_path")
-            .or_else(|| std::env::var("CLAUDE_CLI_PATH").ok())
-            .unwrap_or_else(|| "claude".to_string());
-
-        // Use stored session_id for conversation persistence.
-        // If session_id is None (legacy mission), generate a new one but warn that continuation
-        // won't work correctly since the generated ID isn't persisted back to the mission store.
-        let session_id = match session_id {
-            Some(id) => id.to_string(),
-            None => {
-                let generated = Uuid::new_v4().to_string();
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    generated_session_id = %generated,
-                    "Mission has no stored session_id (legacy mission). Generated temporary ID, but conversation continuation will not work correctly. Consider recreating the mission."
-                );
-                generated
-            }
-        };
-
-        let workspace_exec = WorkspaceExec::new(workspace.clone());
-        let cli_path =
-            match ensure_claudecode_cli_available(&workspace_exec, work_dir, &cli_path).await {
-                Ok(path) => path,
-                Err(err_msg) => {
-                    tracing::error!("{}", err_msg);
-                    return AgentResult::failure(err_msg, 0)
-                        .with_terminal_reason(TerminalReason::LlmError);
-                }
-            };
-
-        // Proactive network connectivity check - fail fast if API is unreachable
-        // This catches DNS/network issues immediately instead of waiting for a timeout.
-        // When the CLI proxy is the auth source, skip this probe: it hits
-        // `api.anthropic.com` directly, and environments that rely on the CLI
-        // proxy may intentionally block direct Anthropic egress.
-        if proxy_auth.is_none() {
-            if let Err(err_msg) = check_claudecode_connectivity(&workspace_exec, work_dir).await {
-                tracing::error!(mission_id = %mission_id, "{}", err_msg);
-                return AgentResult::failure(err_msg, 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
-            }
-        }
-
-        tracing::info!(
-            mission_id = %mission_id,
-            session_id = %session_id,
-            work_dir = %work_dir.display(),
-            workspace_type = ?workspace.workspace_type,
-            model = ?model,
-            agent = ?agent,
-            "Starting Claude Code execution via WorkspaceExec"
-        );
-
-        // Check for Claude Code builtin slash commands that need special handling
-        let trimmed_message = message.trim();
-        let (effective_message, permission_mode) =
-            if trimmed_message == "/plan" || trimmed_message.starts_with("/plan ") {
-                // /plan triggers plan mode via --permission-mode plan
-                let rest = trimmed_message.strip_prefix("/plan").unwrap_or("").trim();
-                let msg = if rest.is_empty() {
-                    "Please analyze the codebase and create a plan for the task.".to_string()
-                } else {
-                    rest.to_string()
-                };
-                (msg, Some("plan"))
-            } else {
-                (message.to_string(), None)
-            };
-
-        // Build CLI arguments
-        let mut args = vec![
-            "--print".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-            "--include-partial-messages".to_string(),
-        ];
-
-        // Add permission mode if a slash command triggered a special mode
-        if let Some(mode) = permission_mode {
-            args.push("--permission-mode".to_string());
-            args.push(mode.to_string());
-        }
-
-        // Skip all permission checks. IS_SANDBOX=1 is set in env vars below
-        // to allow --dangerously-skip-permissions even when running as root.
-        args.push("--dangerously-skip-permissions".to_string());
-
-        // Claude Code settings and MCP config are loaded via CLAUDE_CONFIG_DIR
-        // which points to the per-mission .claude directory. Claude Code auto-discovers
-        // settings.local.json and mcp.json from that directory.
-        //
-        // Note: --settings and --mcp-config flags are NOT used because Claude Code 2.1.77+
-        // changed these to expect inline JSON content rather than file paths, causing
-        // SyntaxError ("Unexpected token '/'") at startup when a path is passed.
-        let settings_path = work_dir.join(".claude").join("settings.local.json");
-        if settings_path.exists() {
-            match std::fs::read_to_string(&settings_path) {
-                Ok(json_content) => {
-                    args.push("--settings".to_string());
-                    args.push(json_content);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        path = %settings_path.display(),
-                        error = %e,
-                        "Failed to read settings file for --settings flag"
-                    );
-                }
-            }
-        }
-        let mcp_config_path = work_dir.join(".claude").join("mcp.json");
-        if mcp_config_path.exists() {
-            match std::fs::read_to_string(&mcp_config_path) {
-                Ok(json_content) => {
-                    args.push("--mcp-config".to_string());
-                    args.push(json_content);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        path = %mcp_config_path.display(),
-                        error = %e,
-                        "Failed to read MCP config file for --mcp-config flag"
-                    );
-                }
-            }
-        }
-
-        if let Some(m) = model {
-            // Claude Code expects bare model IDs (e.g. "claude-opus-4-7"),
-            // not provider-prefixed ones (e.g. "anthropic/claude-opus-4-7").
-            let bare = m.strip_prefix("anthropic/").unwrap_or(m);
-            args.push("--model".to_string());
-            args.push(bare.to_string());
-        }
-
-        // Note: model_effort is set via CLAUDE_CODE_EFFORT_LEVEL env var below,
-        // not as a CLI flag (Claude Code CLI does not have an --effort flag).
-
-        // For continuation turns, use --resume to resume existing session.
-        // For first turn, use --session-id to create new session with that ID.
-        //
-        // Important: We use a marker file to track if the session was ever initiated.
-        // This prevents "Session ID already in use" errors when a turn is cancelled
-        // after the session is created but before any assistant response is recorded.
-        // The marker file contains the session ID to prevent cross-mission interference
-        // when workspaces are shared (e.g., fallback to workspace-wide directory).
-        let session_marker = work_dir.join(".claude-session-initiated");
-        let session_was_initiated = session_marker.exists()
-            && std::fs::read_to_string(&session_marker)
-                .map(|content| content.trim() == session_id)
-                .unwrap_or(false);
-
-        // Determine if we should use --resume:
-        // We can only resume if the session was actually initiated at THIS work_dir
-        // (confirmed by the marker file containing the matching session ID).
-        //
-        // Having assistant messages in history (is_continuation) is NOT sufficient on its own,
-        // because:
-        // - Error messages from failed attempts are recorded as assistant messages
-        // - The session may have been created at a different HOME (e.g., container root
-        //   before per-mission HOME isolation was added)
-        // - The session_id may have been reset (e.g., database update after stuck session)
-        //
-        // Using --resume with a non-existent session causes Claude Code to exit with
-        // "No conversation found with session ID: ..." and code 1.
-        //
-        // Additional safety: even when the marker file says the session was initiated,
-        // verify that Claude's session data directory actually exists on disk.
-        // A stale marker file (e.g., after container restart, HOME wipe, or service
-        // restart) combined with --resume causes the CLI to hang silently, triggering
-        // the startup timeout. This pre-validation avoids that entirely.
-        let session_data_exists = if session_was_initiated {
-            // Claude Code stores session data under $CLAUDE_CONFIG_DIR/projects/<hash>/
-            // or ~/.claude/projects/<hash>/.  We check the broader `.claude/projects`
-            // dir for *any* session data rather than guessing the exact hash, since the
-            // hash depends on the absolute cwd path inside the container.
-            let claude_projects_dir = work_dir.join(".claude").join("projects");
-            let has_projects = claude_projects_dir.exists()
-                && std::fs::read_dir(&claude_projects_dir)
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false);
-            if !has_projects {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    session_id = %session_id,
-                    projects_dir = %claude_projects_dir.display(),
-                    "Session marker exists but no Claude session data found on disk; \
-                     skipping --resume to avoid CLI hang"
-                );
-            }
-            has_projects
-        } else {
-            false
-        };
-
-        let use_resume = session_was_initiated && session_data_exists;
-
-        if use_resume {
-            args.push("--resume".to_string());
-            args.push(session_id.clone());
-            tracing::debug!(
-                mission_id = %mission_id,
-                session_id = %session_id,
-                is_continuation = is_continuation,
-                session_was_initiated = session_was_initiated,
-                session_data_exists = session_data_exists,
-                "Resuming existing Claude Code session"
-            );
-        } else {
-            // If the marker was stale (session data missing), remove it so it
-            // gets recreated with the current session ID.
-            if session_was_initiated && !session_data_exists {
-                let _ = std::fs::remove_file(&session_marker);
-            }
-
-            // Create the marker file BEFORE starting the CLI to prevent races
-            if let Err(e) = std::fs::write(&session_marker, &session_id) {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    error = %e,
-                    "Failed to write session marker file"
-                );
-            }
-
-            args.push("--session-id".to_string());
-            args.push(session_id.clone());
-            tracing::debug!(
-                mission_id = %mission_id,
-                session_id = %session_id,
-                "Starting new Claude Code session"
-            );
-        }
-
-        // Skip `--agent general-purpose` because it's the default behaviour in
-        // `--print` mode and causes the CLI to hang during "Loading commands and
-        // agents" when spawned from a systemd service (missing interactive
-        // environment).  Non-default agents (e.g. Bash, Explore, Plan) are still
-        // passed through.
-        if let Some(a) = agent {
-            if a != "general-purpose" {
-                args.push("--agent".to_string());
-                args.push(a.to_string());
-            }
-        }
-
-        // Provide the prompt as a positional argument (instead of stdin).
-        //
-        // In production we have observed cases where piping stdin from the backend results in
-        // Claude Code producing no stdout events (even though it creates the session files),
-        // leaving missions stuck "Agent is working..." indefinitely.
-        args.push("--".to_string());
-        args.push(effective_message.clone());
-
-        // Build environment variables
-        let mut env: HashMap<String, String> = HashMap::new();
-        // Allow --dangerously-skip-permissions when running as root inside containers.
-        env.insert("IS_SANDBOX".to_string(), "1".to_string());
-
-        // Run Claude Code with a per-mission HOME to avoid:
-        // - clobbering global `~/.claude/.credentials.json`
-        // - cross-mission config lock contention inside the shared home dir
-        let mission_home = workspace_exec.translate_path_for_container(work_dir);
-        let xdg_config_home = work_dir.join(".config");
-        let xdg_data_home = work_dir.join(".local").join("share");
-        let xdg_state_home = work_dir.join(".local").join("state");
-        let xdg_cache_home = work_dir.join(".cache");
-
-        for dir in [
-            &xdg_config_home,
-            &xdg_data_home,
-            &xdg_state_home,
-            &xdg_cache_home,
-        ] {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    path = %dir.display(),
-                    error = %e,
-                    "Failed to create per-mission XDG directory"
-                );
-            }
-        }
-
-        env.insert("HOME".to_string(), mission_home);
-        env.insert(
-            "XDG_CONFIG_HOME".to_string(),
-            workspace_exec.translate_path_for_container(&xdg_config_home),
-        );
-        env.insert(
-            "XDG_DATA_HOME".to_string(),
-            workspace_exec.translate_path_for_container(&xdg_data_home),
-        );
-        env.insert(
-            "XDG_STATE_HOME".to_string(),
-            workspace_exec.translate_path_for_container(&xdg_state_home),
-        );
-        env.insert(
-            "XDG_CACHE_HOME".to_string(),
-            workspace_exec.translate_path_for_container(&xdg_cache_home),
-        );
-        let claude_config_dir =
-            workspace_exec.translate_path_for_container(&work_dir.join(".claude"));
-        env.insert("CLAUDE_CONFIG_DIR".to_string(), claude_config_dir.clone());
-        // Note: CLAUDE_CONFIG is NOT set. Recent Claude Code versions interpret it
-        // as inline JSON (not a file path), causing a SyntaxError at startup.
-        // CLAUDE_CONFIG_DIR + --settings flag are sufficient.
-
-        // Set effort level via environment variable.
-        // Claude Code reads CLAUDE_CODE_EFFORT_LEVEL to control adaptive reasoning depth.
-        if let Some(effort) = model_effort {
-            env.insert("CLAUDE_CODE_EFFORT_LEVEL".to_string(), effort.to_string());
-
-            // CLAUDE_CODE_EFFORT_LEVEL only nudges adaptive reasoning, which
-            // leaves the Thoughts panel empty on tool-heavy turns. Pin an
-            // explicit extended-thinking budget so every turn emits a thinking
-            // block we can capture and stream. (The capture pipeline already
-            // handles thinking_delta — see backend/shared.rs — the CLI just
-            // wasn't emitting any.)
-            let thinking_tokens = claude_thinking_budget(effort);
-            if thinking_tokens > 0 {
-                env.insert(
-                    "MAX_THINKING_TOKENS".to_string(),
-                    thinking_tokens.to_string(),
-                );
-            }
-            tracing::info!(
-                mission_id = %mission_id,
-                effort = %effort,
-                max_thinking_tokens = thinking_tokens,
-                "Setting Claude Code effort level + extended-thinking budget"
-            );
-        }
-
-        // Trigger auto-compaction at 80% context capacity to prevent "Prompt is too long"
-        // errors on long-running missions. Claude Code's default (95%) is too aggressive
-        // and can fail to compact in time, permanently locking the session.
-        env.insert(
-            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".to_string(),
-            "80".to_string(),
-        );
-
-        // Prevent CLI tools from hanging in our PTY environment.
-        //
-        // The `gh` CLI's terminal renderer (lipgloss/glamour) sends escape sequences
-        // like `\033]11;?` (background color query) and `\033[6n` (cursor position)
-        // when it detects a TTY. Our PTY has no terminal emulator to respond, so
-        // these queries block forever. This specifically affects tabular commands
-        // like `gh issue list` and `gh pr list`.
-        //
-        // GH_NO_PAGER=1  — disables paging (prevents `less` from activating)
-        // NO_COLOR=1     — disables color and terminal capability queries
-        // GH_PROMPT_DISABLED=1 — disables interactive prompts
-        env.insert("GH_NO_PAGER".to_string(), "1".to_string());
-        env.insert("NO_COLOR".to_string(), "1".to_string());
-        env.insert("GH_PROMPT_DISABLED".to_string(), "1".to_string());
-
-        if let Some(ref proxy) = proxy_auth {
-            env.insert("ANTHROPIC_BASE_URL".to_string(), proxy.base_url.clone());
-            env.insert("ANTHROPIC_API_KEY".to_string(), proxy.api_key.clone());
-            tracing::info!(
-                mission_id = %mission_id,
-                base_url = %proxy.base_url,
-                "Injecting Claude Code CLI Proxy API environment"
-            );
-        } else if let Some(ref auth) = api_auth {
-            match auth {
-                ClaudeCodeAuth::OAuthToken(token) => {
-                    env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
-                    tracing::debug!(
-                        "Injecting OAuth token for Claude CLI authentication (token_len={})",
-                        token.len()
-                    );
-                }
-                ClaudeCodeAuth::ApiKey(key) => {
-                    env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
-                    tracing::debug!("Using API key for Claude CLI authentication");
-                }
-            }
-        } else if has_cli_creds {
-            tracing::debug!("Using Claude CLI credentials from mission directory");
-        } else {
-            tracing::warn!("No authentication available for Claude Code!");
-        }
-
-        // Inject Telegram action environment variables when processing a Telegram message.
-        // These are needed by the telegram-action CLI helper inside the container to schedule
-        // reminders, send replies, etc.
-        let telegram_action_helpers_enabled =
-            message.contains("[Telegram from ") || message.contains("[Telegram workflow reply ");
-        if telegram_action_helpers_enabled {
-            write_telegram_action_cli_helpers(work_dir);
-
-            env.insert("MISSION_ID".to_string(), mission_id.to_string());
-
-            if let Some(token) =
-                crate::api::telegram::build_internal_telegram_action_token(mission_id)
-            {
-                env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
-            }
-
-            // Use localhost only — never fall back to a public URL for internal
-            // action endpoints (they use HMAC tokens, not bearer auth).
-            let internal_api_url = localhost_api_base_url_from_env();
-            if let Some(api_url) = internal_api_url {
-                env.insert(
-                    "TELEGRAM_ACTION_URL".to_string(),
-                    format!("{}/api/control/telegram/actions/internal", api_url),
-                );
-                env.insert(
-                    "TELEGRAM_WORKFLOW_URL".to_string(),
-                    format!(
-                        "{}/api/control/telegram/workflows/request/internal",
-                        api_url
-                    ),
-                );
-            }
-
-            let container_work_dir = workspace_exec.translate_path_for_container(work_dir);
-            env.insert(
-                "TELEGRAM_ACTION_CLI".to_string(),
-                format!("{}/.sandboxed-sh-telegram-action.py", container_work_dir),
-            );
-            env.insert(
-                "TELEGRAM_ACTION_COMMAND".to_string(),
-                format!("{}/telegram-action", container_work_dir),
-            );
-
-            // Append a dedicated bin subdirectory (not the workspace root) to
-            // PATH so that `telegram-action` is findable as a bare command
-            // without letting arbitrary repo files shadow system binaries.
-            {
-                let current_path = env
-                    .get("PATH")
-                    .cloned()
-                    .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-                env.insert(
-                    "PATH".to_string(),
-                    format!("{}:{}/.sandboxed-sh-bin", current_path, container_work_dir),
-                );
-            }
-
-            tracing::info!(
-                mission_id = %mission_id,
-                "Telegram action env vars injected for Claude Code backend"
-            );
-        }
-
-        // Handle case where cli_path might be a wrapper command like "bun /path/to/claude"
-        let (mut program, mut full_args) = if cli_path.contains(' ') {
-            let parts: Vec<&str> = cli_path.splitn(2, ' ').collect();
-            let program = parts[0].to_string();
-            let mut full_args = if parts.len() > 1 {
-                vec![parts[1].to_string()]
-            } else {
-                vec![]
-            };
-            full_args.extend(args.clone());
-            (program, full_args)
-        } else {
-            (cli_path.clone(), args.clone())
-        };
-
-        // Container workaround:
-        //
-        // Claude Code CLI 2.1.x in our container templates uses Bun APIs in some
-        // code paths (e.g. `Bun.which`). When executed under Node it can crash
-        // with `ReferenceError: Bun is not defined`, which breaks automations.
-        //
-        // If Bun is available in the workspace, prefer running Claude via Bun.
-        if workspace.workspace_type == WorkspaceType::Container
-            && env_var_bool("SANDBOXED_SH_CLAUDECODE_USE_BUN", true)
-            && program != "bun"
-            && !program.ends_with("/bun")
-        {
-            let is_claude_program = program == "claude" || program.ends_with("/claude");
-            if is_claude_program && command_available(&workspace_exec, work_dir, "bun").await {
-                if let Some(claude_path) =
-                    resolve_command_path_in_workspace(&workspace_exec, work_dir, &program).await
-                {
-                    let force_bun = env_var_bool("SANDBOXED_SH_CLAUDECODE_FORCE_BUN", false);
-                    let prefers_bun = force_bun
-                        || claude_cli_shebang_contains(
-                            &workspace_exec,
-                            work_dir,
-                            &claude_path,
-                            "bun",
-                        )
-                        .await
-                        .unwrap_or(false);
-                    let shebang_is_node = claude_cli_shebang_contains(
-                        &workspace_exec,
-                        work_dir,
-                        &claude_path,
-                        "node",
-                    )
-                    .await
-                    .unwrap_or(false);
-
-                    if prefers_bun && !shebang_is_node {
-                        program = "bun".to_string();
-                        full_args.insert(0, claude_path);
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            "Running Claude CLI via bun wrapper (container workspace)"
-                        );
-                    } else {
-                        tracing::debug!(
-                            mission_id = %mission_id,
-                            claude_path = %claude_path,
-                            prefers_bun = prefers_bun,
-                            shebang_is_node = shebang_is_node,
-                            "Running Claude CLI directly (bun wrapper not required)"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Use WorkspaceExec to spawn the CLI in the correct workspace context.
-        //
-        // Claude Code 2.1.x can hang indefinitely when stdout is a pipe (non-tty),
-        // even in `--print --output-format stream-json` mode. Running it under a PTY
-        // fixes this and restores streaming.
-        let mut pty = match workspace_exec
-            .spawn_streaming_pty(work_dir, &program, &full_args, env)
-            .await
-        {
-            Ok(child) => child,
-            Err(e) => {
-                let err_msg = format!("Failed to start Claude CLI: {}", e);
-                tracing::error!("{}", err_msg);
-                return AgentResult::failure(err_msg, 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
-            }
-        };
-
-        // Keep stdin open - dropping the writer (closing stdin) can cause some Claude CLI
-        // agent modes to hang. We pass the prompt via argv so stdin is not needed, but the
-        // CLI may check if stdin is open during initialization.
-        let _stdin_writer = pty.take_writer();
-        tracing::debug!(mission_id = %mission_id, "PTY writer taken (kept alive)");
-
-        let reader = match pty.try_clone_reader() {
-            Ok(r) => {
-                tracing::debug!(mission_id = %mission_id, "PTY reader cloned successfully");
-                r
-            }
-            Err(e) => {
-                pty.kill();
-                let err_msg = format!("Failed to capture Claude PTY output: {}", e);
-                tracing::error!("{}", err_msg);
-                return AgentResult::failure(err_msg, 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
-            }
-        };
-
-        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let reader_mission_id = mission_id.to_string();
-        let reader_handle = tokio::task::spawn_blocking(move || {
-            use std::io::BufRead;
-            tracing::debug!(mission_id = %reader_mission_id, "PTY reader task started, waiting for first read");
-            let mut buf_reader = std::io::BufReader::new(reader);
-            let mut buf: Vec<u8> = Vec::with_capacity(8192);
-            let mut line_count = 0u64;
-            loop {
-                buf.clear();
-                match buf_reader.read_until(b'\n', &mut buf) {
-                    Ok(0) => {
-                        tracing::debug!(
-                            mission_id = %reader_mission_id,
-                            total_lines = line_count,
-                            "PTY reader got EOF"
-                        );
-                        break;
-                    }
-                    Ok(n) => {
-                        line_count += 1;
-                        if line_count <= 3 {
-                            tracing::debug!(
-                                mission_id = %reader_mission_id,
-                                bytes = n,
-                                line_num = line_count,
-                                "PTY reader got line"
-                            );
-                        }
-                        let s = String::from_utf8_lossy(&buf).to_string();
-                        if line_tx.send(s).is_err() {
-                            tracing::debug!(
-                                mission_id = %reader_mission_id,
-                                "PTY reader: channel closed"
-                            );
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            mission_id = %reader_mission_id,
-                            error = %e,
-                            total_lines = line_count,
-                            "PTY reader error"
-                        );
-                        break;
-                    }
-                }
-            }
-        });
-
-        let mut non_json_output: Vec<String> = Vec::new();
-        let mut malformed_json_output: Vec<String> = Vec::new();
-
-        // Track tool calls for result mapping
-        let mut pending_tools: HashMap<String, String> = HashMap::new();
-        // Track Claude Code's built-in ScheduleWakeup calls so we can convert
-        // a successful tool result into an open_agent wakeup automation.
-        // Maps tool_use_id -> (delay_seconds, prompt, reason).
-        let mut pending_wakeups: HashMap<String, (u64, String, String)> = HashMap::new();
-        let mut total_cost_usd: Option<f64> = None;
-        let mut total_input_tokens: u64 = 0;
-        let mut total_output_tokens: u64 = 0;
-        let mut total_cache_creation_tokens: u64 = 0;
-        let mut total_cache_read_tokens: u64 = 0;
-        let mut observed_model: Option<String> = None;
-        let mut final_result = String::new();
-        let mut had_error = false;
-        let mut saw_terminal_result_event = false;
-        let mut process_exited_without_result = false;
-        let mut idle_timeout_triggered = false;
-        let mut transport_failure_stage: Option<ClaudeTransportFailureStage> = None;
-        // Cancellation breaks out of the loop instead of returning immediately,
-        // so the post-loop fallback (final_result ← text_buffer ← thinking_buffer)
-        // can surface whatever the agent already produced. See run_codex_turn.
-        let mut cancelled = false;
-
-        // Track content block types and accumulated content for Claude Code streaming
-        // This is needed because Claude sends incremental deltas that need to be accumulated
-        let mut block_types: HashMap<u32, String> = HashMap::new();
-        let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
-        let mut text_buffer: HashMap<u32, String> = HashMap::new();
-        let mut active_thinking_index: Option<u32> = None; // Track which thinking block is active
-        let mut finalized_thinking_indices: std::collections::HashSet<u32> =
-            std::collections::HashSet::new(); // Blocks already sent done:true during streaming
-        let mut last_text_len: usize = 0; // Track last emitted text length for streaming text deltas
-
-        let mut saw_non_init_event = false;
-        let startup_timeout = Duration::from_secs(
-            std::env::var("SANDBOXED_SH_CLAUDECODE_STARTUP_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(20),
-        );
-        let idle_timeout = Duration::from_secs(
-            std::env::var("SANDBOXED_SH_CLAUDECODE_IDLE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(600),
-        );
-        let tool_idle_timeout = Duration::from_secs(
-            std::env::var("SANDBOXED_SH_CLAUDECODE_TOOL_IDLE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1800),
-        );
-        let post_tool_result_idle_timeout = Duration::from_secs(
-            std::env::var("SANDBOXED_SH_CLAUDECODE_POST_TOOL_RESULT_IDLE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(30),
-        );
-        // Heartbeat interval used to signal liveness to the actor-level
-        // stuck-mission watchdog. During extended thinking (notably with
-        // model_effort=max), Claude CLI can emit only scaffolding stream
-        // events (message_start, content_block_start, signature_delta…)
-        // for many minutes without any thinking_delta. Those reset the
-        // per-turn PTY idle timer but never become broadcast events, so
-        // the actor's main_runner_last_activity never updates and the
-        // 900s stuck-mission watchdog cancels the mission mid-turn.
-        let heartbeat_interval = Duration::from_secs(
-            std::env::var("SANDBOXED_SH_CLAUDECODE_HEARTBEAT_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(300),
-        );
-        let mut last_heartbeat_at = Instant::now();
-        let startup_deadline = Instant::now() + startup_timeout;
-        let mut turn_wait_state = ClaudeTurnWaitState::Startup;
-        let mut tool_timeout_override: Option<tokio::time::Instant> = None;
-        let mut idle_deadline = claudecode_idle_deadline(
-            turn_wait_state,
-            Instant::now(),
-            idle_timeout,
-            tool_idle_timeout,
-            post_tool_result_idle_timeout,
-            tool_timeout_override,
-        );
-
-        // Monitor child process exit. When Claude Code exits mid-tool-execution
-        // (e.g. while `gh` is still running), child processes can keep the PTY
-        // slave fd open, preventing the PTY reader from getting EOF. We detect
-        // the main process exit and break the loop with a grace period.
-        let process_exit_notify = {
-            let notify = Arc::new(tokio::sync::Notify::new());
-            if let Some(pid) = pty.process_id() {
-                let notify_clone = Arc::clone(&notify);
-                let exit_mission_id = mission_id.to_string();
-                tokio::task::spawn_blocking(move || {
-                    let pid = pid as i32;
-                    loop {
-                        // kill(pid, 0) checks if the process exists without
-                        // actually sending a signal.
-                        let alive = unsafe { libc::kill(pid, 0) } == 0;
-                        if !alive {
-                            tracing::debug!(
-                                mission_id = %exit_mission_id,
-                                pid = pid,
-                                "PTY child process has exited"
-                            );
-                            notify_clone.notify_one();
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                });
-            }
-            notify
-        };
-        let mut process_exited = false;
-        // Grace period: after process exits, wait briefly for remaining events
-        // before breaking the loop. This lets us capture any final `result` event
-        // that may already be buffered in the PTY/channel.
-        let mut process_exit_grace_deadline: Option<Instant> = None;
-        // Process events until completion or cancellation
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
-                    // Kill the process to stop consuming API resources
-                    pty.kill();
-                    reader_handle.abort();
-                    cancelled = true;
-                    break;
-                }
-                _ = tokio::time::sleep_until(startup_deadline), if !saw_non_init_event => {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        use_resume = use_resume,
-                        non_json_lines = non_json_output.len(),
-                        malformed_json_lines = malformed_json_output.len(),
-                        non_json_sample = ?non_json_output.first(),
-                        malformed_json_sample = ?malformed_json_output.first(),
-                        cli_program = %program,
-                        cli_args_count = full_args.len(),
-                        "Claude Code startup timeout - no stream events received"
-                    );
-                    pty.kill();
-                    reader_handle.abort();
-                    let mut msg = if !malformed_json_output.is_empty() {
-                        claudecode_malformed_startup_message(
-                            &malformed_json_output,
-                            use_resume,
-                            &session_id,
-                        )
-                    } else {
-                        let mut msg = "Claude Code produced no stream events after startup timeout. The Claude CLI started but did not emit any stream-json events.".to_string();
-                        msg.push_str("\n\nThis can happen when resuming an old/stuck Claude session or when the CLI hangs during initialization.");
-                        msg.push_str(&format!("\n\nDiagnostics: use_resume={}, session_id={}", use_resume, session_id));
-                        msg
-                    };
-                    if !non_json_output.is_empty() {
-                        msg.push_str(&format!(
-                            "\n\nNon-JSON output captured ({} lines):\n{}",
-                            non_json_output.len(),
-                            non_json_output.join("\n")
-                        ));
-                    }
-                    return AgentResult::failure(msg, 0)
-                        .with_terminal_reason(TerminalReason::LlmError)
-                        .with_data(claudecode_transport_failure_data(
-                            ClaudeTransportFailureStage::Startup,
-                            false,
-                            false,
-                            &[],
-                        ));
-                }
-                _ = tokio::time::sleep_until(idle_deadline), if saw_non_init_event => {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        wait_state = ?turn_wait_state,
-                        pending_tool_count = pending_tools.len(),
-                        had_partial_output = !final_result.trim().is_empty() || !text_buffer.is_empty(),
-                        "Claude Code idle timeout after activity; treating turn as incomplete"
-                    );
-                    pty.kill();
-                    reader_handle.abort();
-                    idle_timeout_triggered = true;
-                    break;
-                }
-                _ = process_exit_notify.notified(), if !process_exited => {
-                    // The main PTY child (nsenter/claude) has exited.
-                    // Give a short grace period to drain any buffered events
-                    // (the `result` event may already be in the channel).
-                    process_exited = true;
-                    process_exit_grace_deadline = Some(Instant::now() + Duration::from_secs(3));
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        "PTY child process exited, draining remaining events (3s grace)"
-                    );
-                }
-                _ = tokio::time::sleep_until(process_exit_grace_deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400))), if process_exited => {
-                    // Grace period expired after process exit — no `result` event arrived.
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        "Claude Code process exited without emitting a result event, breaking event loop"
-                    );
-                    process_exited_without_result = true;
-                    // Kill any orphaned child processes still holding the PTY open
-                    pty.kill();
-                    reader_handle.abort();
-                    break;
-                }
-                // Timer-based liveness heartbeat, gated to AwaitingToolResults.
-                //
-                // While a foreground tool runs (notably a long build), the CLI
-                // emits no stream events for minutes, so the event-gated
-                // heartbeat below never fires. The actor-level stuck-mission
-                // watchdog (control.rs, 900s) keys off broadcast events and
-                // would cancel the mission mid-tool — even though the turn-level
-                // `tool_idle_timeout` (much larger) is the correct arbiter for a
-                // running tool. Emitting a heartbeat on a timer here makes the
-                // coarse watchdog defer to `tool_idle_timeout`.
-                //
-                // Strictly gated to AwaitingToolResults so it does NOT mask a
-                // genuine hang: a fire-and-forget background job that returns
-                // immediately leaves the turn in AwaitingTerminalResult/
-                // AwaitingClaude (not this state), so those stalls remain subject
-                // to the watchdog as before.
-                _ = tokio::time::sleep_until(last_heartbeat_at + heartbeat_interval),
-                    if saw_non_init_event
-                        && matches!(turn_wait_state, ClaudeTurnWaitState::AwaitingToolResults) => {
-                    let _ = events_tx.send(AgentEvent::MissionActivity {
-                        label: "Tool running…".to_string(),
-                        tool_name: "claudecode_heartbeat".to_string(),
-                        mission_id: Some(mission_id),
-                    });
-                    last_heartbeat_at = Instant::now();
-                }
-                line_opt = line_rx.recv() => {
-                    let Some(raw_line) = line_opt else {
-                        // EOF - PTY closed
-                        break;
-                    };
-
-                    let raw_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
-                    let cleaned = strip_ansi_codes(raw_line);
-                    let line = cleaned.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    if !line.starts_with('{') {
-                        // Preserve a small excerpt for diagnostics on "no output" failures.
-                        if non_json_output.len() < 20 {
-                            non_json_output.push(if line.len() > 200 {
-                                let end = safe_truncate_index(line, 200);
-                                format!("{}...", &line[..end])
-                            } else {
-                                line.to_string()
-                            });
-                        }
-                        continue;
-                    }
-
-                    let claude_event: ClaudeEvent = match serde_json::from_str(line) {
-                        Ok(event) => event,
-                        Err(e) => {
-                            if malformed_json_output.len() < 20 {
-                                let excerpt = if line.len() > 200 {
-                                    let end = safe_truncate_index(line, 200);
-                                    format!("{}...", &line[..end])
-                                } else {
-                                    line.to_string()
-                                };
-                                malformed_json_output
-                                    .push(format!("Parse error: {} | line: {}", e, excerpt));
-                            }
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                "Failed to parse Claude event: {} - line: {}",
-                                e,
-                                if line.len() > 200 {
-                                    let end = safe_truncate_index(line, 200);
-                                    format!("{}...", &line[..end])
-                                } else {
-                                    line.to_string()
-                                }
-                            );
-                            continue;
-                        }
-                    };
-
-                    if !matches!(claude_event, ClaudeEvent::System(_)) {
-                        saw_non_init_event = true;
-                        if matches!(turn_wait_state, ClaudeTurnWaitState::Startup) {
-                            turn_wait_state = ClaudeTurnWaitState::AwaitingClaude;
-                        }
-                    }
-
-                            match claude_event {
-                                ClaudeEvent::System(sys) => {
-                                    if let Some(m) = sys.model {
-                                        observed_model = Some(m);
-                                    }
-                                    tracing::debug!(
-                                        "Claude session init: session_id={}, model={:?}",
-                                        sys.session_id, observed_model
-                                    );
-                                }
-                                ClaudeEvent::StreamEvent(wrapper) => {
-                                    match wrapper.event {
-                                        StreamEvent::ContentBlockDelta { index, delta } => {
-                                            let block_type = block_types
-                                                .get(&index)
-                                                .map(|value| value.as_str());
-                                            let is_thinking_block =
-                                                matches!(block_type, Some("thinking"));
-                                            // Check the delta type to determine where to route content
-                                            // "thinking_delta" -> thinking panel (uses delta.thinking field)
-                                            // "text_delta" -> text output (uses delta.text field)
-                                            if delta.delta_type == "thinking_delta"
-                                                || (is_thinking_block
-                                                    && delta.delta_type == "text_delta")
-                                            {
-                                                // For thinking deltas, check both `thinking` and `text` fields
-                                                // Extended thinking uses `thinking`, but some versions use `text`
-                                                let thinking_text = delta.thinking.or(delta.text.clone());
-                                                if let Some(thinking_content) = thinking_text {
-                                                    if !thinking_content.is_empty() {
-                                                        // If a new thinking block started, finalize the previous one
-                                                        if let Some(prev_idx) = active_thinking_index {
-                                                            if prev_idx != index {
-                                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                                    content: String::new(),
-                                                                    done: true,
-                                                                    mission_id: Some(mission_id),
-                                                                });
-                                                                finalized_thinking_indices.insert(prev_idx);
-                                                            }
-                                                        }
-                                                        active_thinking_index = Some(index);
-
-                                                        // Accumulate thinking content per block. Most Claude events are
-                                                        // incremental deltas, but using the merge helper also handles
-                                                        // CLI versions that resend a cumulative snapshot.
-                                                        let buffer = thinking_buffer.entry(index).or_default();
-                                                        merge_stream_fragment(buffer, &thinking_content);
-
-                                                        // Send this block's accumulated content
-                                                        let _ = events_tx.send(AgentEvent::Thinking {
-                                                            content: buffer.clone(),
-                                                            done: false,
-                                                            mission_id: Some(mission_id),
-                                                        });
-                                                    }
-                                                }
-                                            } else if delta.delta_type == "text_delta" {
-                                                // For text deltas, content is in the `text` field
-                                                if let Some(text) = delta.text {
-                                                    if !text.is_empty() {
-                                                        // Accumulate text content (will be used for final response).
-                                                        // This accepts both incremental chunks and snapshot-style
-                                                        // replacements so streamed text never doubles words if a CLI
-                                                        // changes semantics.
-                                                        let buffer = text_buffer.entry(index).or_default();
-                                                        merge_stream_fragment(buffer, &text);
-
-                                                        // Stream text deltas similar to thinking panel
-                                                        // This allows users to see tool use descriptions as they're generated
-                                                        let total_len = text_buffer.values().map(|s| s.len()).sum::<usize>();
-                                                        if total_len > last_text_len {
-                                                            let accumulated: String = text_buffer.values().cloned().collect::<Vec<_>>().join("");
-                                                            last_text_len = total_len;
-
-                                                            let _ = events_tx.send(AgentEvent::TextDelta {
-                                                                content: accumulated,
-                                                                mission_id: Some(mission_id),
-                                                            });
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // Ignore other delta types (e.g., input_json_delta for tool use)
-                                        }
-                                        StreamEvent::ContentBlockStart { index, content_block }
-                                            if content_block.block_type == "tool_use" =>
-                                        {
-                                            // Track the block type so we know how to handle deltas
-                                            block_types.insert(index, content_block.block_type.clone());
-
-                                            if let (Some(id), Some(name)) =
-                                                (content_block.id, content_block.name)
-                                            {
-                                                pending_tools.insert(id, name);
-                                                turn_wait_state =
-                                                    ClaudeTurnWaitState::AwaitingToolResults;
-                                            }
-                                        }
-                                        StreamEvent::ContentBlockStart { index, content_block } => {
-                                            block_types.insert(index, content_block.block_type);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                ClaudeEvent::Assistant(evt) => {
-                                    if let Some(m) = evt.message.model.as_ref() {
-                                        observed_model = Some(m.clone());
-                                    }
-                                    if let Some(usage) = &evt.message.usage {
-                                        total_input_tokens += usage.input_tokens.unwrap_or(0);
-                                        total_output_tokens += usage.output_tokens.unwrap_or(0);
-                                        total_cache_creation_tokens +=
-                                            usage.cache_creation_input_tokens.unwrap_or(0);
-                                        total_cache_read_tokens +=
-                                            usage.cache_read_input_tokens.unwrap_or(0);
-                                    }
-                                    let mut assistant_thinking_fallback = String::new();
-                                    for (content_idx, block) in evt.message.content.into_iter().enumerate() {
-                                        let content_idx = content_idx as u32;
-                                        match block {
-                                            ContentBlock::Text { text } if !text.is_empty() => {
-                                                // Text content is the final assistant response.
-                                                // Thinking must come from explicit provider
-                                                // reasoning/thinking blocks, not answer text.
-                                                final_result = text;
-                                            }
-                                            ContentBlock::ToolUse { id, name, input } => {
-                                                pending_tools.insert(id.clone(), name.clone());
-                                                turn_wait_state = ClaudeTurnWaitState::AwaitingToolResults;
-                                                let _ = events_tx.send(AgentEvent::ToolCall {
-                                                    tool_call_id: id.clone(),
-                                                    name: name.clone(),
-                                                    args: input.clone(),
-                                                    mission_id: Some(mission_id),
-                                                });
-
-                                                // Capture args from Claude Code's built-in
-                                                // ScheduleWakeup so the matching ToolResult
-                                                // can turn it into a real wakeup automation.
-                                                if name == "ScheduleWakeup" {
-                                                    let delay = input
-                                                        .get("delaySeconds")
-                                                        .or_else(|| input.get("delay_seconds"))
-                                                        .and_then(|v| v.as_u64());
-                                                    let prompt = input
-                                                        .get("prompt")
-                                                        .and_then(|v| v.as_str())
-                                                        .map(|s| s.to_string());
-                                                    let reason = input
-                                                        .get("reason")
-                                                        .and_then(|v| v.as_str())
-                                                        .map(|s| s.to_string())
-                                                        .unwrap_or_default();
-                                                    match (delay, prompt) {
-                                                        (Some(d), Some(p)) => {
-                                                            pending_wakeups
-                                                                .insert(id.clone(), (d, p, reason));
-                                                        }
-                                                        _ => {
-                                                            tracing::warn!(
-                                                                mission_id = %mission_id,
-                                                                tool_use_id = %id,
-                                                                "Claude built-in ScheduleWakeup tool call missing delaySeconds or prompt; skipping wakeup automation"
-                                                            );
-                                                        }
-                                                    }
-                                                }
-
-                                                // Extend idle timeout when tool has its own timeout.
-                                                // Long-running commands (e.g. `lake build` with timeout: 600000ms)
-                                                // produce no PTY output while waiting, so our default idle
-                                                // timeout would kill the process prematurely.
-                                                if let Some(tool_timeout_ms) = input.get("timeout").and_then(|v| v.as_u64()) {
-                                                    let tool_timeout = Duration::from_millis(tool_timeout_ms);
-                                                    // Add a buffer beyond the tool's own timeout
-                                                    let extended = tool_timeout + Duration::from_secs(30);
-                                                    let new_deadline = Instant::now() + extended;
-                                                    let should_extend = tool_timeout_override
-                                                        .map(|current| new_deadline > current)
-                                                        .unwrap_or(true);
-                                                    if should_extend {
-                                                        tracing::info!(
-                                                            mission_id = %mission_id,
-                                                            tool_name = %name,
-                                                            tool_timeout_secs = tool_timeout_ms / 1000,
-                                                            "Extending idle timeout for long-running tool call"
-                                                        );
-                                                        tool_timeout_override = Some(new_deadline);
-                                                    }
-                                                }
-
-                                                if name == "question" || name == "AskUserQuestion" || name.starts_with("ui_") {
-                                                    if let Some(ref hub) = tool_hub {
-                                                        tracing::info!(
-                                                            mission_id = %mission_id,
-                                                            tool_call_id = %id,
-                                                            tool_name = %name,
-                                                            "Frontend tool detected, pausing for user input"
-                                                        );
-                                                        let hub = Arc::clone(hub);
-                                                        if let Some(ref status_ref) = status {
-                                                            set_control_state_for_mission(
-                                                                status_ref,
-                                                                &events_tx,
-                                                                mission_id,
-                                                                ControlRunState::WaitingForTool,
-                                                            )
-                                                            .await;
-                                                        }
-                                                        let rx = hub.register(id.clone()).await;
-
-                                                        pty.kill();
-                                                        reader_handle.abort();
-
-                                                        let answer = tokio::select! {
-                                                            _ = cancel.cancelled() => {
-                                                                return AgentResult::failure("Cancelled".to_string(), 0)
-                                                                    .with_terminal_reason(TerminalReason::Cancelled);
-                                                            }
-                                                            res = rx => {
-                                                                match res {
-                                                                    Ok(v) => v,
-                                                                    Err(_) => {
-                                                                        return AgentResult::failure(
-                                                                            "Frontend tool result channel closed".to_string(), 0
-                                                                        ).with_terminal_reason(TerminalReason::LlmError);
-                                                                    }
-                                                                }
-                                                            }
-                                                        };
-
-                                                        if let Some(ref status_ref) = status {
-                                                            set_control_state_for_mission(
-                                                                status_ref,
-                                                                &events_tx,
-                                                                mission_id,
-                                                                ControlRunState::Running,
-                                                            )
-                                                            .await;
-                                                        }
-                                                        let _ = events_tx.send(AgentEvent::ToolResult {
-                                                            tool_call_id: id.clone(),
-                                                            name: name.clone(),
-                                                            result: answer.clone(),
-                                                            mission_id: Some(mission_id),
-                                                        });
-
-                                                        let answer_text = if let Some(answers) = answer.get("answers") {
-                                                            answers.to_string()
-                                                        } else {
-                                                            answer.to_string()
-                                                        };
-
-                                                        return run_claudecode_turn(
-                                                            workspace,
-                                                            work_dir,
-                                                            &answer_text,
-                                                            model,
-                                                            model_effort,
-                                                            agent,
-                                                            mission_id,
-                                                            events_tx,
-                                                            cancel,
-                                                            secrets,
-                                                            app_working_dir,
-                                                            Some(&session_id),
-                                                            true,
-                                                            tool_hub,
-                                                            status,
-                                                            override_auth_for_continuation,
-                                                        ).await;
-                                                    }
-                                                }
-                                            }
-                                            ContentBlock::Thinking { thinking }
-                                                if !thinking.is_empty()
-                                                    && !finalized_thinking_indices
-                                                        .contains(&content_idx) =>
-                                            {
-                                                if !assistant_thinking_fallback.is_empty() {
-                                                    assistant_thinking_fallback.push('\n');
-                                                }
-                                                assistant_thinking_fallback.push_str(&thinking);
-                                                // Only send done:true for the last active thinking block.
-                                                // Earlier blocks were already finalized during streaming
-                                                // (via the block-transition mechanism) and re-sending them
-                                                // causes duplicate items in the frontend thinking panel.
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: thinking,
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    // If the Assistant event's ContentBlock::Text didn't
-                                    // populate final_result, fall back to the accumulated
-                                    // text_buffer from streaming deltas (text_delta events).
-                                    if final_result.trim().is_empty() && !text_buffer.is_empty() && pending_tools.is_empty() {
-                                        let mut sorted: Vec<_> = text_buffer.iter().collect();
-                                        sorted.sort_by_key(|(idx, _)| *idx);
-                                        final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");
-                                        tracing::info!(
-                                            mission_id = %mission_id,
-                                            "Using text delta buffer as final result ({} chars, ContentBlock::Text was empty)",
-                                            final_result.len()
-                                        );
-                                    }
-                                    // If still empty, try thinking buffer
-                                    if final_result.trim().is_empty() && !thinking_buffer.is_empty() && pending_tools.is_empty() {
-                                        let mut sorted: Vec<_> = thinking_buffer.iter().collect();
-                                        sorted.sort_by_key(|(idx, _)| *idx);
-                                        final_result = sorted.into_iter().map(|(_, t)| t.clone()).collect::<Vec<_>>().join("");
-                                        tracing::info!(
-                                            mission_id = %mission_id,
-                                            "Using thinking buffer as final result ({} chars, no text content in this turn)",
-                                            final_result.len()
-                                        );
-                                    }
-                                    if use_thinking_only_fallback(
-                                        &mut final_result,
-                                        &assistant_thinking_fallback,
-                                        pending_tools.is_empty(),
-                                    ) {
-                                        tracing::info!(
-                                            mission_id = %mission_id,
-                                            "Using assistant thinking-only block as final result ({} chars, no text content in this turn)",
-                                            final_result.len()
-                                        );
-                                    }
-                                    // Reset per-turn accumulation state so the next turn
-                                    // starts fresh (block indices restart from 0 each turn)
-                                    thinking_buffer.clear();
-                                    text_buffer.clear();
-                                    active_thinking_index = None;
-                                    finalized_thinking_indices.clear();
-                                    last_text_len = 0;
-                                    block_types.clear();
-                                }
-                                ClaudeEvent::User(evt) => {
-                                    for block in evt.message.content {
-                                        if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
-                                            // Get tool name and remove from pending (tool is now complete)
-                                            let name = pending_tools
-                                                .remove(&tool_use_id)
-                                                .unwrap_or_else(|| "unknown".to_string());
-                                            if pending_tools.is_empty() {
-                                                turn_wait_state =
-                                                    ClaudeTurnWaitState::AwaitingTerminalResult;
-                                                tool_timeout_override = None;
-                                                tracing::debug!(
-                                                    mission_id = %mission_id,
-                                                    "All observed Claude tool results completed; waiting for terminal result"
-                                                );
-                                            }
-
-                                            // Convert a successful Claude built-in
-                                            // ScheduleWakeup into an open_agent wakeup
-                                            // automation. Claude Code's CLI handles the
-                                            // tool locally and emits a confirmation result
-                                            // but no further re-invocation happens in
-                                            // --print mode — we have to schedule it.
-                                            if let Some((delay, prompt, reason)) =
-                                                pending_wakeups.remove(&tool_use_id)
-                                            {
-                                                if !is_error {
-                                                    spawn_claude_builtin_wakeup_automation(
-                                                        mission_id, delay, prompt, reason,
-                                                    );
-                                                } else {
-                                                    tracing::warn!(
-                                                        mission_id = %mission_id,
-                                                        tool_use_id = %tool_use_id,
-                                                        "Claude built-in ScheduleWakeup result was an error; skipping wakeup automation"
-                                                    );
-                                                }
-                                            }
-
-                                            // Convert content to string representation (handles both text and image results)
-                                            let content_str = content.to_string_lossy();
-
-                                            let result_value = if let Some(ref extra) = evt.tool_use_result {
-                                                serde_json::json!({
-                                                    "content": content_str,
-                                                    "stdout": extra.stdout(),
-                                                    "stderr": extra.stderr(),
-                                                    "is_error": is_error,
-                                                })
-                                            } else {
-                                                serde_json::Value::String(content_str)
-                                            };
-
-                                            let _ = events_tx.send(AgentEvent::ToolResult {
-                                                tool_call_id: tool_use_id,
-                                                name,
-                                                result: result_value,
-                                                mission_id: Some(mission_id),
-                                            });
-                                        }
-                                    }
-                                }
-                                ClaudeEvent::Result(res) => {
-                                    saw_terminal_result_event = true;
-                                    if let Some(cost) = res.total_cost_usd {
-                                        total_cost_usd = Some(cost);
-                                    }
-                                    // Check for errors: explicit error flags OR embedded API error payloads.
-                                    //
-                                    // Note: Claude Code may populate error details in `error` / `message`
-                                    // fields (not just `result`). Use `error_message()` for best-effort
-                                    // extraction.
-                                    let error_msg = res.error_message();
-                                    let looks_like_api_error = error_msg.starts_with("API Error:")
-                                        || error_msg.contains("\"type\":\"error\"")
-                                        || error_msg.contains("\"type\":\"overloaded_error\"")
-                                        || error_msg.contains("\"type\":\"api_error\"");
-
-                                    if res.is_error || res.subtype == "error" || looks_like_api_error {
-                                        had_error = true;
-                                        // Don't send an Error event here - let the failure propagate
-                                        // through the AgentResult. control.rs will emit an AssistantMessage
-                                        // with success=false which the UI displays as a failure message.
-                                        // Sending Error here would cause duplicate messages.
-                                        final_result = error_msg;
-                                    } else {
-                                        apply_terminal_result_text(&mut final_result, res.result);
-                                    }
-                                    tracing::info!(
-                                        mission_id = %mission_id,
-                                        cost_usd = total_cost_usd.unwrap_or(0.0),
-                                        "Claude Code execution completed"
-                                    );
-                                    break;
-                                }
-                                ClaudeEvent::Unknown => {
-                                    // Forward-compatibility: unknown event types from
-                                    // newer CLI versions are silently ignored.
-                                    tracing::trace!(
-                                        mission_id = %mission_id,
-                                        "Ignoring unknown Claude event type"
-                                    );
-                                }
-                            }
-                    idle_deadline = claudecode_idle_deadline(
-                        turn_wait_state,
-                        Instant::now(),
-                        idle_timeout,
-                        tool_idle_timeout,
-                        post_tool_result_idle_timeout,
-                        tool_timeout_override,
-                    );
-                    // Emit a throttled liveness heartbeat so the stuck-mission
-                    // watchdog (control.rs:stuck_mission_watchdog_loop) does not
-                    // cancel us while Claude is producing CLI scaffolding events
-                    // that don't translate to broadcast events (e.g. extended
-                    // thinking without thinking_delta).
-                    if last_heartbeat_at.elapsed() >= heartbeat_interval {
-                        let label = match turn_wait_state {
-                            ClaudeTurnWaitState::Startup => "Claude Code starting…",
-                            ClaudeTurnWaitState::AwaitingClaude => "Claude is responding…",
-                            ClaudeTurnWaitState::AwaitingToolResults => "Awaiting tool results…",
-                            ClaudeTurnWaitState::AwaitingTerminalResult => "Claude is thinking…",
-                        };
-                        let _ = events_tx.send(AgentEvent::MissionActivity {
-                            label: label.to_string(),
-                            tool_name: "claudecode_heartbeat".to_string(),
-                            mission_id: Some(mission_id),
-                        });
-                        last_heartbeat_at = Instant::now();
-                    }
-                }
-            }
-        }
-
-        // Wait for child process to finish and clean up.
-        tracing::debug!(
-            mission_id = %mission_id,
-            "Event loop completed, waiting for Claude Code process"
-        );
-        let exit_status = tokio::task::spawn_blocking(move || {
-            let mut pty = pty;
-            pty.wait()
-        })
-        .await;
-        tracing::debug!(
-            mission_id = %mission_id,
-            exit_status = ?exit_status,
-            "Claude Code process exited"
-        );
-
-        // Ensure the PTY reader task stops (it should naturally end after process exit).
-        let _ = reader_handle.await;
-
-        let usage = crate::cost::TokenUsage {
-            input_tokens: total_input_tokens,
-            output_tokens: total_output_tokens,
-            cache_creation_input_tokens: if total_cache_creation_tokens > 0 {
-                Some(total_cache_creation_tokens)
-            } else {
-                None
-            },
-            cache_read_input_tokens: if total_cache_read_tokens > 0 {
-                Some(total_cache_read_tokens)
-            } else {
-                None
-            },
-        };
-        let actual_cost_cents = actual_cost_cents_from_total_cost_usd(total_cost_usd);
-        let model_for_cost = preferred_model_for_cost(model, observed_model.as_deref());
-        let (cost_cents, cost_source) =
-            resolve_cost_cents_and_source(actual_cost_cents, model_for_cost, &usage);
-
-        // If no final result from Assistant or Result events, use accumulated text buffer
-        // This handles plan mode and other cases where text is streamed incrementally
-        if final_result.trim().is_empty() && !text_buffer.is_empty() {
-            // Sort by content block index to ensure correct ordering (HashMap iteration is non-deterministic)
-            let mut sorted_entries: Vec<_> = text_buffer.iter().collect();
-            sorted_entries.sort_by_key(|(idx, _)| *idx);
-            final_result = sorted_entries
-                .into_iter()
-                .map(|(_, text)| text.clone())
-                .collect::<Vec<_>>()
-                .join("");
-            tracing::debug!(
-                mission_id = %mission_id,
-                "Using accumulated text buffer as final result ({} chars)",
-                final_result.len()
-            );
-        }
-
-        // If still no final result, fall back to thinking buffer.
-        // This handles cases where the model's entire response is in extended thinking
-        // (no text content block), e.g. when the answer is generated as thinking content.
-        if final_result.trim().is_empty() && !thinking_buffer.is_empty() {
-            let mut sorted_entries: Vec<_> = thinking_buffer.iter().collect();
-            sorted_entries.sort_by_key(|(idx, _)| *idx);
-            final_result = sorted_entries
-                .into_iter()
-                .map(|(_, text)| text.clone())
-                .collect::<Vec<_>>()
-                .join("");
-            tracing::info!(
-                mission_id = %mission_id,
-                "Using accumulated thinking buffer as final result ({} chars, no text content was produced)",
-                final_result.len()
-            );
-        }
-
-        // Cancellation suppresses the "no terminal result" / "no output"
-        // failure-message construction below: those messages describe a
-        // broken Claude Code transport, but a user/system cancel is not a
-        // transport failure. We want the accumulated text/thinking buffers
-        // (or, as a last resort, the synthetic cancel string) to surface.
-        if !cancelled && !had_error && !saw_terminal_result_event {
-            had_error = true;
-            let exit_summary = describe_pty_exit_status(&exit_status);
-            if !saw_non_init_event {
-                transport_failure_stage = Some(ClaudeTransportFailureStage::Startup);
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    exit_status = %exit_summary,
-                    process_exited_without_result,
-                    idle_timeout_triggered,
-                    non_json_lines = non_json_output.len(),
-                    malformed_json_lines = malformed_json_output.len(),
-                    "Claude Code ended before any usable turn events; treating as startup transport failure"
-                );
-                final_result = claudecode_pre_turn_transport_message(
-                    &exit_summary,
-                    &non_json_output,
-                    &malformed_json_output,
-                    use_resume,
-                    &session_id,
-                );
-            } else {
-                let stage = claudecode_transport_failure_stage_for_incomplete_turn(
-                    saw_non_init_event,
-                    turn_wait_state,
-                );
-                transport_failure_stage = Some(stage);
-                let partial_output =
-                    (!final_result.trim().is_empty()).then_some(final_result.as_str());
-                let pending_tool_names: Vec<String> = pending_tools
-                    .values()
-                    .map(|name| format!("- {}", name))
-                    .collect();
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    exit_status = %exit_summary,
-                    process_exited_without_result,
-                    idle_timeout_triggered,
-                    had_partial_output = partial_output.is_some(),
-                    "Claude Code turn ended without a terminal result event; treating as incomplete"
-                );
-                final_result = claudecode_incomplete_turn_message(
-                    &exit_summary,
-                    ClaudeIncompleteTurnContext {
-                        partial_output,
-                        non_json_output: &non_json_output,
-                        malformed_json_output: &malformed_json_output,
-                        process_exited_without_result,
-                        idle_timeout_triggered,
-                        wait_state: turn_wait_state,
-                        pending_tools: &pending_tool_names,
-                    },
-                );
-            }
-        }
-
-        if !cancelled && final_result.trim().is_empty() && !had_error {
-            had_error = true;
-            if !non_json_output.is_empty() {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    exit_status = ?exit_status,
-                    "Claude Code produced no parseable JSON output"
-                );
-                final_result = format!(
-                    "Claude Code produced no parseable output. Last output: {}",
-                    non_json_output.join(" | ")
-                );
-            } else if !malformed_json_output.is_empty() {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    exit_status = ?exit_status,
-                    "Claude Code produced malformed JSON output"
-                );
-                final_result = format!(
-                    "Claude Code produced malformed stream-json output. Last malformed lines: {}",
-                    malformed_json_output.join(" | ")
-                );
-            } else {
-                let exit_summary = describe_pty_exit_status(&exit_status);
-                let mut message = format!(
-                    "Claude Code produced no output. Exit status: {}.",
-                    exit_summary
-                );
-                if exit_summary.contains("signal: Some(\"Killed\")") {
-                    message.push_str(
-                        " The process was killed by the OS (often OOM or sandbox limits).",
-                    );
-                }
-                message.push_str(" Check CLI installation or authentication.");
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    exit_status = ?exit_status,
-                    "Claude Code produced no output"
-                );
-                final_result = message;
-            }
-        }
-
-        // If Claude reported an error but didn't provide a useful message, fall back to raw output.
-        if had_error
-            && (final_result.trim().is_empty() || final_result.trim() == "Unknown error")
-            && !non_json_output.is_empty()
-        {
-            tracing::warn!(
-                mission_id = %mission_id,
-                exit_status = ?exit_status,
-                "Claude Code failed with empty/generic error; using raw output excerpt"
-            );
-            final_result = format!("Claude Code error: {}", non_json_output.join(" | "));
-        }
-
-        let mut result = if cancelled {
-            // The cancel arm fell through here instead of returning a synthetic
-            // "Cancelled" failure, so final_result still holds whatever the
-            // text/thinking-buffer fallbacks managed to recover. Surface that
-            // partial work but mark the mission Interrupted/ServerShutdown
-            // so the dashboard renders the resume affordance.
-            //
-            // Snapshot the cancel marker once — calling
-            // `cancel_or_shutdown_failure()` twice could pair "Mission
-            // cancelled" text with ServerShutdown (or vice versa) if a
-            // shutdown signal arrives between reads.
-            let cancel_marker = cancel_or_shutdown_failure();
-            if final_result.trim().is_empty() {
-                final_result = cancel_marker.output.clone();
-            }
-            let cancel_reason = cancel_marker
-                .terminal_reason
-                .unwrap_or(TerminalReason::Cancelled);
-            AgentResult::failure(final_result, cost_cents).with_terminal_reason(cancel_reason)
-        } else if had_error {
-            // Detect rate limit / overloaded errors for account rotation.
-            //
-            // We check for specific Anthropic error types and HTTP status codes.
-            // Using "overloaded_error" rather than bare "overloaded" to avoid
-            // false positives from tool output or user content.
-            //
-            // Check both the final result text and non-JSON output (stderr) for
-            // auth/rate-limit markers. When Claude Code is SIGKILL'd mid-turn, the
-            // final_result is a generic "did not emit terminal result" message, but
-            // stderr may contain the actual auth error from the Anthropic API.
-            let combined_for_detection = if non_json_output.is_empty() {
-                final_result.clone()
-            } else {
-                format!("{}\n{}", final_result, non_json_output.join("\n"))
-            };
-            let reason = if is_rate_limited_error(&combined_for_detection) {
-                TerminalReason::RateLimited
-            } else if is_auth_error(&combined_for_detection) {
-                TerminalReason::AuthError
-            } else {
-                TerminalReason::LlmError
-            };
-            AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
-        } else if is_success_path_rate_limited_error(&final_result) {
-            // Claude Code sometimes surfaces subscription quota exhaustion as a
-            // normal assistant message (e.g. "You've hit your limit · resets
-            // 9pm") and exits with code 0. Without this check the turn would be
-            // treated as TurnComplete and account rotation would never trigger.
-            tracing::warn!(
-                mission_id = %mission_id,
-                "Claude Code returned a rate-limit message as a successful turn; marking as RateLimited for account rotation"
-            );
-            AgentResult::failure(final_result, cost_cents)
-                .with_terminal_reason(TerminalReason::RateLimited)
-        } else if is_success_path_auth_error(&final_result) {
-            // Claude Code can surface revoked/expired credential failures as a
-            // normal assistant message while exiting successfully. Treat that
-            // as AuthError so the caller invalidates stale credentials, refreshes
-            // OAuth, and retries instead of completing the mission with the error
-            // text as if it were the agent's answer.
-            tracing::warn!(
-                mission_id = %mission_id,
-                "Claude Code returned an auth error as a successful turn; marking as AuthError for credential refresh"
-            );
-            AgentResult::failure(final_result, cost_cents)
-                .with_terminal_reason(TerminalReason::AuthError)
-        } else if is_success_path_provider_payload_error(&final_result) {
-            // Claude Code can surface provider request validation errors as
-            // ordinary assistant text while exiting successfully. Treat them as
-            // LLM failures so the mission does not falsely complete.
-            tracing::warn!(
-                mission_id = %mission_id,
-                "Claude Code returned a provider payload error as a successful turn; marking as LlmError"
-            );
-            AgentResult::failure(final_result, cost_cents)
-                .with_terminal_reason(TerminalReason::LlmError)
-        } else {
-            AgentResult::success(final_result, cost_cents)
-                .with_terminal_reason(TerminalReason::TurnComplete)
-        };
-        if let Some(stage) = transport_failure_stage {
-            let pending_tool_names: Vec<String> = pending_tools.values().cloned().collect();
-            result = result.with_data(claudecode_transport_failure_data(
-                stage,
-                idle_timeout_triggered,
-                process_exited_without_result,
-                &pending_tool_names,
-            ));
-        }
-        let outcome = turn_outcome_for_result(
-            &result,
-            CompletionSignal::NativeTerminal,
-            CompletionConfidence::High,
-        );
-        result = result.with_turn_outcome(outcome);
-        if let Some(model) = model_for_cost {
-            result = result.with_model(model.to_string());
-        }
-        if usage.has_usage() {
-            result = result.with_usage(usage);
-        }
-        result = result.with_cost_source(cost_source);
-        result
-    }) // end Box::pin(async move { ... })
-}
-
 /// Read CLI path for opencode from backend config file if available.
-fn workspace_path_for_env(
+pub(crate) fn workspace_path_for_env(
     workspace: &Workspace,
     host_path: &std::path::Path,
 ) -> std::path::PathBuf {
@@ -6239,7 +3647,7 @@ fn workspace_path_for_env(
     host_path.to_path_buf()
 }
 
-fn strip_ansi_codes(input: &str) -> Cow<'_, str> {
+pub(crate) fn strip_ansi_codes(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
     if !bytes
         .iter()
@@ -6383,7 +3791,10 @@ fn opencode_session_token_from_line(line: &str) -> Option<&str> {
     None
 }
 
-fn prepend_opencode_bin_to_path(env: &mut HashMap<String, String>, workspace: &Workspace) {
+pub(crate) fn prepend_opencode_bin_to_path(
+    env: &mut HashMap<String, String>,
+    workspace: &Workspace,
+) {
     let home = if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
     {
@@ -6409,11 +3820,26 @@ fn prepend_opencode_bin_to_path(env: &mut HashMap<String, String>, workspace: &W
     }
 }
 
-fn extract_opencode_session_id(output: &str) -> Option<String> {
+pub(crate) fn extract_opencode_session_id(output: &str) -> Option<String> {
     output
         .lines()
         .find_map(opencode_session_token_from_line)
         .map(ToOwned::to_owned)
+}
+
+/// Return true if `s` looks like an OpenCode session id (e.g.
+/// `ses_14ecf17a4ffezc57OUz1Zz9Noc`) — the prefix and shape the CLI uses
+/// for its own session files. We use this to reject the *Claude Code*-style
+/// UUIDs that mission creation pre-assigns for conversation persistence —
+/// those are valid for `claude --session-id` but cause the opencode CLI
+/// to print "Session not found" if we hand them to `--session`.
+pub(crate) fn is_opencode_session_id(s: &str) -> bool {
+    let s = s.trim();
+    if !s.starts_with("ses_") {
+        return false;
+    }
+    // ses_<alphanumeric>, at least 4 chars of body.
+    s.len() >= 7 && s[4..].chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Returns true if the line is an OpenCode runner/status banner (not model output).
@@ -6426,7 +3852,7 @@ fn extract_opencode_session_id(output: &str) -> Option<String> {
 /// `contains("completed")` would silently drop model responses that happen to
 /// contain that word (e.g. "Task completed successfully"), which is a critical
 /// correctness bug when the SSE path is unavailable and stdout is the only source.
-fn is_opencode_banner_line(line: &str) -> bool {
+pub(crate) fn is_opencode_banner_line(line: &str) -> bool {
     const PREFIXES: [&[u8]; 11] = [
         b"starting opencode server",
         b"opencode server started",
@@ -6448,183 +3874,17 @@ fn is_opencode_banner_line(line: &str) -> bool {
         || opencode_session_token_from_line(line).is_some()
 }
 
-fn starts_with_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    if haystack.len() < needle.len() {
-        return false;
-    }
-
-    haystack[..needle.len()]
-        .iter()
-        .zip(needle.iter())
-        .all(|(&left, &right)| ascii_lower(left) == ascii_lower(right))
-}
-
-fn find_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if haystack.len() < needle.len() || needle.is_empty() {
-        return None;
-    }
-
-    for idx in 0..=haystack.len() - needle.len() {
-        if starts_with_ascii_case_insensitive(&haystack[idx..], needle) {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-#[inline]
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    find_ascii_case_insensitive(haystack.as_bytes(), needle.as_bytes()).is_some()
-}
-
-#[inline]
-fn ascii_lower(byte: u8) -> u8 {
-    match byte {
-        b'A'..=b'Z' => byte + 32,
-        _ => byte,
-    }
-}
-
-pub(crate) fn is_auth_error(message: &str) -> bool {
-    const AUTH_MARKERS: [&str; 10] = [
-        "invalid authentication credentials",
-        "authentication_error",
-        "invalid api key",
-        "invalid x-api-key",
-        "failed to authenticate",
-        "error: 401",
-        // Codex/ChatGPT OAuth surfaces refresh-token reuse with these
-        // phrasings; both should drive account rotation rather than failing
-        // the mission outright (the user may have another configured account
-        // whose refresh_token is still valid).
-        "refresh token was already used",
-        "refresh_token was already used",
-        "refresh_token_reused",
-        "please log out and sign in again",
-    ];
-
-    AUTH_MARKERS
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(message, needle))
-}
-
-pub(crate) fn is_rate_limited_error(message: &str) -> bool {
-    const RATE_LIMIT_MARKERS: [&str; 15] = [
-        "overloaded_error",
-        "rate limit",
-        "rate_limit",
-        "resource_exhausted",
-        "too many requests",
-        "error: 429",
-        "error: 529",
-        "status code: 429",
-        "status code: 529",
-        "out of extra usage",
-        "out of regular usage",
-        // Claude Code CLI surfaces subscription quota exhaustion with this
-        // phrasing (e.g. "You've hit your limit · resets 9pm"). Treat it
-        // as a rate-limit signal so account rotation kicks in.
-        "hit your limit",
-        // Codex CLI / ChatGPT account quota exhaustion. Codex emits
-        // TurnFailed with messages like:
-        //   "You've hit your usage limit. Visit
-        //    https://chatgpt.com/codex/settings/usage to purchase more
-        //    credits or try again at Apr 28th, 2026 10:03 PM."
-        // The reset window is days, not minutes — match it as a
-        // rate-limit so the harness classifies the turn correctly and
-        // surfaces the actionable message instead of the generic
-        // "Codex CLI exited before completing the turn" wrapper.
-        "hit your usage limit",
-        "purchase more credits",
-        "settings/usage",
-    ];
-
-    RATE_LIMIT_MARKERS
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(message, needle))
-}
-
-fn looks_like_explicit_provider_error_output(message: &str) -> bool {
-    let trimmed = message.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let compact_lower = lower
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect::<String>();
-    let starts_with_error_payload = compact_lower.starts_with("{\"error\":")
-        || compact_lower.starts_with("[{\"error\":")
-        || compact_lower.starts_with("{\"type\":\"error\"");
-    let structured_provider_error = starts_with_error_payload
-        && (compact_lower.contains("\"error\":{")
-            || compact_lower.contains("\"message\":")
-            || compact_lower.contains("\"code\":")
-            || compact_lower.contains("authentication_error")
-            || compact_lower.contains("invalid_request_error")
-            || compact_lower.contains("permission_error")
-            || compact_lower.contains("rate_limit_error")
-            || compact_lower.contains("overloaded_error"));
-
-    trimmed.starts_with("API Error:")
-        || lower.starts_with("error:")
-        || lower.starts_with("anthropic api error:")
-        || lower.starts_with("claude code error:")
-        || structured_provider_error
-        || lower.contains("status code: 401")
-        || lower.contains("status code: 429")
-        || lower.contains("status code: 529")
-}
-
-fn is_standalone_invalid_credentials_message(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .trim_matches(|c: char| matches!(c, '.' | '!' | '"' | '\''))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    normalized == "invalid authentication credentials"
-}
-
-fn is_success_path_rate_limited_error(message: &str) -> bool {
-    let lower = message.trim().replace('\u{2019}', "'").to_ascii_lowercase();
-    lower.starts_with("you've hit your limit")
-        || lower.starts_with("you have hit your limit")
-        || (looks_like_explicit_provider_error_output(message) && is_rate_limited_error(message))
-}
-
-fn is_success_path_auth_error(message: &str) -> bool {
-    is_standalone_invalid_credentials_message(message)
-        || (looks_like_explicit_provider_error_output(message) && is_auth_error(message))
-}
-
-fn is_success_path_provider_payload_error(message: &str) -> bool {
-    (looks_like_explicit_provider_error_output(message)
-        || message.trim_start().starts_with("messages."))
-        && is_provider_payload_error(message)
-}
-
-fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
-    let partial_output = partial_output.trim();
-    if partial_output.is_empty() {
-        return "OpenCode idle timeout: the model stopped producing output before finishing the turn. No response was generated.".to_string();
-    }
-
-    format!(
-        "OpenCode idle timeout: the model stopped producing output before finishing the turn. Partial output was discarded because it was incomplete.\n\nPartial output:\n{}",
-        partial_output
-    )
-}
-
-pub(crate) fn is_provider_payload_error(message: &str) -> bool {
-    const PROVIDER_PAYLOAD_MARKERS: [&str; 3] = [
-        "image.source.base64.data",
-        "image dimensions exceed max allowed size",
-        "many-image requests: 2000 pixels",
-    ];
-
-    PROVIDER_PAYLOAD_MARKERS
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(message, needle))
+pub(crate) fn opencode_idle_timeout_result_message(partial_output: &str) -> String {
+    // The previous version echoed a snippet of the model's last text fragment
+    // (often a half-finished `<think>` tail) into the assistant bubble, which
+    // read as a corrupted reply. The model output is intentionally discarded:
+    // a kill for inactivity means we never received a terminal result event,
+    // so we have no idea whether the fragment was a real answer or a
+    // pre-response leak. Surface a clean, retryable error instead.
+    let _ = partial_output.trim();
+    "OpenCode turn aborted: the model stopped producing output before finishing \
+     the turn (idle timeout). Click Resume to retry."
+        .to_string()
 }
 
 pub(crate) struct AnthropicRotationAccounts {
@@ -6737,42 +3997,8 @@ pub(crate) async fn refresh_claude_credentials_after_auth_error(
     }
 }
 
-pub(crate) fn is_capacity_limited_error(message: &str) -> bool {
-    const CAPACITY_LIMIT_MARKERS: [&str; 8] = [
-        "already have five missions running",
-        "already have 5 missions running",
-        "too many concurrent missions",
-        "concurrent mission limit",
-        "maximum concurrent missions",
-        // OpenAI's model-level capacity rejection, emitted by Codex CLI
-        // as a TurnFailed error when the selected model (e.g. GPT-5.5
-        // during its rollout window) is saturated.
-        "selected model is at capacity",
-        "model is at capacity",
-        "please try a different model",
-    ];
-
-    if CAPACITY_LIMIT_MARKERS
-        .iter()
-        .any(|needle| contains_ascii_case_insensitive(message, needle))
-    {
-        return true;
-    }
-
-    let has_already_have = contains_ascii_case_insensitive(message, "already have");
-    let has_missions_running = contains_ascii_case_insensitive(message, "missions running");
-    if has_already_have && has_missions_running {
-        return true;
-    }
-
-    let has_concurrent = contains_ascii_case_insensitive(message, "concurrent");
-    let has_mission = contains_ascii_case_insensitive(message, "mission");
-    let has_limit = contains_ascii_case_insensitive(message, "limit")
-        || contains_ascii_case_insensitive(message, "exceeded");
-    has_concurrent && has_mission && has_limit
-}
-
-const CODEX_PENDING_TOOLS_ERROR_PREFIX: &str = "Codex stopped while tool calls were still pending";
+pub(crate) const CODEX_PENDING_TOOLS_ERROR_PREFIX: &str =
+    "Codex stopped while tool calls were still pending";
 
 fn is_codex_generic_exit_wrapper(message: &str) -> bool {
     message.contains("Codex CLI exited before completing the turn")
@@ -6796,7 +4022,7 @@ fn codex_pending_tools_error_message(
     }
 }
 
-fn codex_error_message_to_surface(
+pub(crate) fn codex_error_message_to_surface(
     assistant_message: &str,
     pending_tools: &HashMap<String, String>,
     message: &str,
@@ -6810,7 +4036,10 @@ fn codex_error_message_to_surface(
     }
 }
 
-fn record_codex_error_message(error_message: &mut Option<String>, message: String) -> bool {
+pub(crate) fn record_codex_error_message(
+    error_message: &mut Option<String>,
+    message: String,
+) -> bool {
     let new_is_generic_exit_wrapper = is_codex_generic_exit_wrapper(&message);
     let already_have_specific = error_message
         .as_deref()
@@ -6850,8 +4079,109 @@ fn strip_opencode_banner_lines(output: &str) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
-fn sanitized_opencode_stdout(output: &str) -> Cow<'_, str> {
+pub(crate) fn sanitized_opencode_stdout(output: &str) -> Cow<'_, str> {
     strip_opencode_banner_lines(output)
+}
+
+/// Detect and truncate garbled/repetitive output where the model echoes tool
+/// results verbatim instead of summarizing them.
+///
+/// Models (observed: MiniMax-M3) sometimes get confused by long tool outputs
+/// (SSH warnings, nvidia-smi tables, etc.) and start echoing them verbatim in
+/// their text response, creating extremely long messages with >80% repetition.
+///
+/// Returns `Some(truncated)` if garbling was detected, `None` if the output
+/// looks normal.
+pub(crate) fn truncate_garbled_output(text: &str) -> Option<String> {
+    const MIN_LENGTH: usize = 2000;
+    const MAX_REPETITION_RATIO: f64 = 0.70;
+    const MIN_UNIQUE_BLOCKS: usize = 1;
+
+    if text.len() < MIN_LENGTH {
+        return None;
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 20 {
+        return None;
+    }
+
+    let unique_lines: std::collections::HashSet<&str> = lines.iter().copied().collect();
+    let unique_ratio = unique_lines.len() as f64 / lines.len() as f64;
+
+    if unique_ratio >= (1.0 - MAX_REPETITION_RATIO) {
+        return None;
+    }
+
+    // Also check for repeated multi-line blocks (the model repeats entire
+    // nvidia-smi tables or SSH warning blocks).
+    let block_size = 3;
+    let mut block_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for chunk in lines.chunks(block_size) {
+        if chunk.len() == block_size {
+            let key: String = chunk.join("\n");
+            *block_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    let unique_blocks = block_counts.len();
+
+    if unique_blocks < MIN_UNIQUE_BLOCKS {
+        return None;
+    }
+
+    let block_repetition_ratio =
+        1.0 - (unique_blocks as f64 / block_counts.values().sum::<usize>() as f64);
+    if block_repetition_ratio < MAX_REPETITION_RATIO {
+        return None;
+    }
+
+    // Garbling detected. Find the end of the first unique-content region by
+    // walking forward and stopping when we see a line that has appeared before.
+    let mut seen_lines = std::collections::HashSet::new();
+    let mut cutoff = lines.len();
+
+    for (i, &line) in lines.iter().enumerate() {
+        if i > 0 && seen_lines.contains(line) && !line.trim().is_empty() {
+            // Check if the next few lines are also repeats (to avoid cutting
+            // in the middle of legitimate repeated words)
+            let ahead_repeats = lines[i..]
+                .iter()
+                .take(5)
+                .filter(|&&l| seen_lines.contains(l) && !l.trim().is_empty())
+                .count();
+            if ahead_repeats >= 3 {
+                cutoff = i;
+                break;
+            }
+        }
+        seen_lines.insert(line);
+    }
+
+    if cutoff >= lines.len() {
+        return None;
+    }
+
+    let truncated = lines[..cutoff].join("\n");
+    let truncated = truncated.trim();
+
+    if truncated.len() >= text.len() / 2 {
+        return None;
+    }
+
+    if truncated.is_empty() {
+        return Some(format!(
+            "[Agent output was garbled — model echoed tool output verbatim. Original length: {} bytes]",
+            text.len()
+        ));
+    }
+
+    Some(format!(
+        "{}\n\n[... output truncated: model echoed tool output repeatedly. Original: {} bytes, kept: {} bytes]",
+        truncated,
+        text.len(),
+        truncated.len()
+    ))
 }
 
 fn is_opencode_exit_status_placeholder(output: &str) -> bool {
@@ -6865,12 +4195,14 @@ fn is_opencode_exit_status_placeholder(output: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn opencode_output_needs_fallback(output: &str) -> bool {
+pub(crate) fn opencode_output_needs_fallback(output: &str) -> bool {
     let sanitized = sanitized_opencode_stdout(output);
     sanitized.trim().is_empty() || is_opencode_exit_status_placeholder(sanitized.as_ref())
 }
 
-fn summarize_recent_opencode_stderr(lines: &std::collections::VecDeque<String>) -> Option<String> {
+pub(crate) fn summarize_recent_opencode_stderr(
+    lines: &std::collections::VecDeque<String>,
+) -> Option<String> {
     for line in lines.iter().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() || is_opencode_banner_line(trimmed) {
@@ -6910,7 +4242,7 @@ fn summarize_recent_opencode_stderr(lines: &std::collections::VecDeque<String>) 
 /// JSON object containing tool-call markers (`name` + `arguments`/`input`,
 /// or `type` == `function_call`/`tool_use`/`tool-call`), the output is
 /// considered tool-call-only and should not be returned as assistant text.
-fn is_tool_call_only_output(output: &str) -> bool {
+pub(crate) fn is_tool_call_only_output(output: &str) -> bool {
     let sanitized = sanitized_opencode_stdout(output);
     let mut saw_candidate = false;
 
@@ -6949,20 +4281,20 @@ fn is_tool_call_only_output(output: &str) -> bool {
     saw_candidate // true only if at least one non-banner, non-empty line existed
 }
 
-fn allocate_opencode_server_port() -> Option<u16> {
+pub(crate) fn allocate_opencode_server_port() -> Option<u16> {
     std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
         .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
 }
 
-struct OpenCodeAuthState {
-    has_openai: bool,
-    has_anthropic: bool,
-    has_google: bool,
-    has_zai: bool,
-    has_other: bool,
+pub(crate) struct OpenCodeAuthState {
+    pub(crate) has_openai: bool,
+    pub(crate) has_anthropic: bool,
+    pub(crate) has_google: bool,
+    pub(crate) has_zai: bool,
+    pub(crate) has_other: bool,
     /// Tracks which specific provider IDs have been detected as configured.
-    configured_providers: std::collections::HashSet<String>,
+    pub(crate) configured_providers: std::collections::HashSet<String>,
 }
 
 fn load_provider_auth_entries(
@@ -6996,7 +4328,9 @@ fn load_provider_auth_entries(
     entries
 }
 
-fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> OpenCodeAuthState {
+pub(crate) fn detect_opencode_provider_auth(
+    app_working_dir: Option<&std::path::Path>,
+) -> OpenCodeAuthState {
     let mut has_openai = false;
     let mut has_anthropic = false;
     let mut has_google = false;
@@ -7174,7 +4508,7 @@ fn package_base(spec: &str) -> &str {
     split_package_spec(spec).0
 }
 
-fn parse_opencode_goal_objective(message: &str) -> Option<String> {
+pub(crate) fn parse_opencode_goal_objective(message: &str) -> Option<String> {
     let objective = message.trim_start().strip_prefix("/goal ")?.trim();
     if objective.is_empty() {
         None
@@ -7183,7 +4517,7 @@ fn parse_opencode_goal_objective(message: &str) -> Option<String> {
     }
 }
 
-fn opencode_goal_terminal_status(final_result: &str) -> Option<&'static str> {
+pub(crate) fn opencode_goal_terminal_status(final_result: &str) -> Option<&'static str> {
     let marker = final_result
         .lines()
         .rev()
@@ -7233,7 +4567,10 @@ fn save_json_warn(path: &std::path::Path, value: &serde_json::Value, context: &s
     }
 }
 
-fn ensure_opencode_plugin_specs(opencode_config_dir: &std::path::Path, plugin_specs: &[&str]) {
+pub(crate) fn ensure_opencode_plugin_specs(
+    opencode_config_dir: &std::path::Path,
+    plugin_specs: &[&str],
+) {
     if plugin_specs.is_empty() {
         return;
     }
@@ -7282,7 +4619,7 @@ fn ensure_opencode_plugin_specs(opencode_config_dir: &std::path::Path, plugin_sp
     }
 }
 
-fn detect_google_project_id() -> Option<String> {
+pub(crate) fn detect_google_project_id() -> Option<String> {
     for key in [
         "SANDBOXED_SH_GOOGLE_PROJECT_ID",
         "GOOGLE_CLOUD_PROJECT",
@@ -7299,7 +4636,10 @@ fn detect_google_project_id() -> Option<String> {
     None
 }
 
-fn ensure_opencode_google_project_id(opencode_config_dir: &std::path::Path, project_id: &str) {
+pub(crate) fn ensure_opencode_google_project_id(
+    opencode_config_dir: &std::path::Path,
+    project_id: &str,
+) {
     if project_id.trim().is_empty() {
         return;
     }
@@ -7351,7 +4691,7 @@ fn ensure_opencode_google_project_id(opencode_config_dir: &std::path::Path, proj
     }
 }
 
-async fn ensure_opencode_plugin_installed(
+pub(crate) async fn ensure_opencode_plugin_installed(
     workspace_exec: &WorkspaceExec,
     work_dir: &std::path::Path,
     opencode_config_dir_host: &std::path::Path,
@@ -7490,10 +4830,19 @@ fn custom_opencode_provider_definition(
     }))
 }
 
-fn ensure_opencode_provider_for_model(
+pub(crate) fn ensure_opencode_provider_for_model(
     opencode_config_dir: &std::path::Path,
     app_working_dir: &std::path::Path,
     model_override: &str,
+    // Host address as seen from the workspace's network namespace.
+    // Private-network containers (Tailscale veth) cannot reach the host
+    // proxy on 127.0.0.1 — pointing builtin/* there made OpenCode exit
+    // banner-only until the 120s inactivity watchdog SIGKILLed it.
+    host_ip: &str,
+    // Mission id sent as a header on builtin proxy requests so runner
+    // watchdogs can see "this mission's LLM call is still streaming"
+    // (proxy_liveness). None for non-mission contexts.
+    mission_id: Option<&str>,
 ) {
     let model_override = model_override.trim();
     if model_override.is_empty() {
@@ -7577,16 +4926,22 @@ fn ensure_opencode_provider_for_model(
                     tracing::error!("SANDBOXED_PROXY_SECRET not set; builtin proxy auth will fail");
                     String::new()
                 });
+            let mut options = serde_json::json!({
+                "baseURL": format!("http://{}:{}/v1", host_ip, port),
+                "apiKey": proxy_key
+            });
+            if let Some(mid) = mission_id {
+                options["headers"] = serde_json::json!({
+                    crate::api::proxy_liveness::MISSION_ID_HEADER: mid
+                });
+            }
             Some(serde_json::json!({
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "Builtin",
                 "models": {
                     model_id: { "name": model_id }
                 },
-                "options": {
-                    "baseURL": format!("http://127.0.0.1:{}/v1", port),
-                    "apiKey": proxy_key
-                }
+                "options": options
             }))
         }
         _ => custom_opencode_provider_definition(app_working_dir, provider_id),
@@ -7657,6 +5012,38 @@ fn ensure_opencode_provider_for_model(
             opencode_path.display()
         );
     }
+}
+
+/// Whether an OpenCode session is present in the given XDG data home
+/// (`<data_home>/opencode/storage`). Sessions store an info JSON named
+/// `<session_id>.json` (layout has moved between CLI versions, so search a
+/// few levels deep) and per-message files under `message/<session_id>/`.
+pub(crate) fn opencode_session_exists_in_data_home(
+    data_home: &std::path::Path,
+    session_id: &str,
+) -> bool {
+    let storage = data_home.join("opencode").join("storage");
+    if storage.join("message").join(session_id).is_dir() {
+        return true;
+    }
+    let target = format!("{session_id}.json");
+    fn find_file(dir: &std::path::Path, target: &str, depth: u8) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if path.file_name().and_then(|n| n.to_str()) == Some(target) {
+                    return true;
+                }
+            } else if depth > 0 && path.is_dir() && find_file(&path, target, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    find_file(&storage.join("session"), &target, 3)
 }
 
 fn opencode_storage_roots(workspace: &Workspace) -> Vec<std::path::PathBuf> {
@@ -7854,7 +5241,7 @@ fn write_json_file(path: &std::path::Path, value: &serde_json::Value) -> std::io
     std::fs::write(path, contents)
 }
 
-fn sync_opencode_auth_to_workspace(
+pub(crate) fn sync_opencode_auth_to_workspace(
     workspace: &Workspace,
     app_working_dir: &std::path::Path,
 ) -> Option<serde_json::Value> {
@@ -8021,7 +5408,7 @@ fn extract_opencode_api_key(entry: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn apply_opencode_auth_env(
+pub(crate) fn apply_opencode_auth_env(
     auth: &serde_json::Value,
     env: &mut std::collections::HashMap<String, String>,
 ) -> Vec<&'static str> {
@@ -8061,9 +5448,9 @@ fn apply_opencode_auth_env(
 }
 
 #[derive(Debug, Clone)]
-struct StoredOpenCodeMessage {
-    parts: Vec<serde_json::Value>,
-    model: Option<String>,
+pub(crate) struct StoredOpenCodeMessage {
+    pub(crate) parts: Vec<serde_json::Value>,
+    pub(crate) model: Option<String>,
 }
 
 fn extract_model_from_message(value: &serde_json::Value) -> Option<String> {
@@ -8116,7 +5503,7 @@ fn extract_model_from_message(value: &serde_json::Value) -> Option<String> {
         .or_else(|| model_candidates.first().cloned())
 }
 
-fn load_latest_opencode_assistant_message(
+pub(crate) fn load_latest_opencode_assistant_message(
     workspace: &Workspace,
     session_id: &str,
 ) -> Option<StoredOpenCodeMessage> {
@@ -8212,7 +5599,7 @@ fn load_latest_opencode_assistant_message(
     })
 }
 
-fn resolve_opencode_model_from_config(
+pub(crate) fn resolve_opencode_model_from_config(
     opencode_config_dir: &std::path::Path,
     agent: Option<&str>,
 ) -> Option<String> {
@@ -8246,7 +5633,7 @@ fn resolve_opencode_model_from_config(
     None
 }
 
-async fn command_available(
+pub(crate) async fn command_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     program: &str,
@@ -8377,7 +5764,7 @@ async fn seed_container_bun_from_host(
     }
 }
 
-async fn resolve_command_path_in_workspace(
+pub(crate) async fn resolve_command_path_in_workspace(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     program: &str,
@@ -8419,7 +5806,7 @@ fn shell_quote(value: &str) -> String {
     out
 }
 
-async fn claude_cli_shebang_contains(
+pub(crate) async fn claude_cli_shebang_contains(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     path: &str,
@@ -8772,7 +6159,7 @@ const MINIMAX_API: ApiEndpoint = ApiEndpoint {
 
 /// Proactive API connectivity check for Claude Code.
 /// Tests basic internet, then DNS, then Anthropic API reachability.
-async fn check_claudecode_connectivity(
+pub(crate) async fn check_claudecode_connectivity(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
 ) -> Result<(), String> {
@@ -8788,7 +6175,7 @@ async fn check_claudecode_connectivity(
 
 /// Proactive API connectivity check for OpenCode.
 /// Tests basic internet, then checks the appropriate API based on configured providers.
-async fn check_opencode_connectivity(
+pub(crate) async fn check_opencode_connectivity(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     has_openai: bool,
@@ -8833,7 +6220,7 @@ async fn check_opencode_connectivity(
 
 /// Returns the path to the Claude Code CLI that should be used.
 /// If the CLI is not available, it will be auto-installed via bun or npm.
-async fn ensure_claudecode_cli_available(
+pub(crate) async fn ensure_claudecode_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     cli_path: &str,
@@ -9080,7 +6467,7 @@ async fn claude_cli_matches_desired_version(
 }
 
 /// Returns the path to the Codex CLI that should be used.
-async fn ensure_codex_cli_available(
+pub(crate) async fn ensure_codex_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     cli_path: &str,
@@ -9349,27 +6736,36 @@ fn resolve_codex_native_binary_search_paths(
     let mut paths = Vec::new();
     let npm_pkg = codex_npm_package_name(triple);
 
+    // Layout changed across codex releases: ≤0.128 ships the native binary
+    // at `vendor/<triple>/codex/<bin>`, ≥0.137 at `vendor/<triple>/bin/<bin>`.
+    // Probe both for every base so host upgrades don't strand the resolver.
     let binary_path = |base: &std::path::Path| {
-        base.join("vendor")
-            .join(triple)
-            .join("codex")
-            .join(binary_name)
+        [
+            base.join("vendor")
+                .join(triple)
+                .join("codex")
+                .join(binary_name),
+            base.join("vendor")
+                .join(triple)
+                .join("bin")
+                .join(binary_name),
+        ]
     };
 
     if let Some(bin_dir) = wrapper_path.parent() {
         if let Some(package_root) = bin_dir.parent() {
-            paths.push(binary_path(package_root));
+            paths.extend(binary_path(package_root));
 
             let nested_optional = package_root
                 .join("node_modules")
                 .join("@openai")
                 .join(npm_pkg);
-            paths.push(binary_path(&nested_optional));
+            paths.extend(binary_path(&nested_optional));
         }
 
         if let Some(node_modules) = bin_dir.parent() {
             let sibling_optional = node_modules.join("@openai").join(npm_pkg);
-            paths.push(binary_path(&sibling_optional));
+            paths.extend(binary_path(&sibling_optional));
         }
     }
 
@@ -9379,10 +6775,10 @@ fn resolve_codex_native_binary_search_paths(
             .join("node_modules")
             .join("@openai")
             .join("codex");
-        paths.push(binary_path(&npm_root));
+        paths.extend(binary_path(&npm_root));
 
         let npm_optional = npm_root.join("node_modules").join("@openai").join(npm_pkg);
-        paths.push(binary_path(&npm_optional));
+        paths.extend(binary_path(&npm_optional));
     }
 
     for prefix in ["/usr/local", "/usr"] {
@@ -9391,10 +6787,10 @@ fn resolve_codex_native_binary_search_paths(
             .join("node_modules")
             .join("@openai")
             .join("codex");
-        paths.push(binary_path(&npm_root));
+        paths.extend(binary_path(&npm_root));
 
         let npm_optional = npm_root.join("node_modules").join("@openai").join(npm_pkg);
-        paths.push(binary_path(&npm_optional));
+        paths.extend(binary_path(&npm_optional));
     }
 
     if let Ok(home) = std::env::var("HOME") {
@@ -9405,7 +6801,7 @@ fn resolve_codex_native_binary_search_paths(
             .join("node_modules")
             .join("@openai")
             .join(npm_pkg);
-        paths.push(binary_path(&bun_optional));
+        paths.extend(binary_path(&bun_optional));
 
         let bun_cache_optional = std::path::PathBuf::from(&home)
             .join(".cache")
@@ -9415,7 +6811,7 @@ fn resolve_codex_native_binary_search_paths(
             .join("node_modules")
             .join("@openai")
             .join(npm_pkg);
-        paths.push(binary_path(&bun_cache_optional));
+        paths.extend(binary_path(&bun_cache_optional));
     }
 
     paths
@@ -9552,7 +6948,7 @@ async fn opencode_binary_available(workspace_exec: &WorkspaceExec, cwd: &std::pa
     false
 }
 
-async fn cleanup_opencode_listeners(
+pub(crate) async fn cleanup_opencode_listeners(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     port: Option<&str>,
@@ -9574,7 +6970,7 @@ async fn cleanup_opencode_listeners(
         .await;
 }
 
-async fn ensure_opencode_cli_available(
+pub(crate) async fn ensure_opencode_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
 ) -> Result<(), String> {
@@ -9640,188 +7036,6 @@ async fn ensure_opencode_cli_available(
     }
 
     Ok(())
-}
-
-async fn ensure_grok_cli_available(
-    workspace_exec: &WorkspaceExec,
-    cwd: &std::path::Path,
-    cli_path: &str,
-) -> Result<String, String> {
-    let program = cli_path.split(' ').next().unwrap_or(cli_path);
-    if command_available(workspace_exec, cwd, program).await {
-        return Ok(cli_path.to_string());
-    }
-
-    let auto_install = env_var_bool("SANDBOXED_SH_AUTO_INSTALL_GROK", true);
-    if !auto_install {
-        return Err(format!(
-            "Grok Build CLI '{}' not found in workspace. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash",
-            cli_path
-        ));
-    }
-
-    if !command_available(workspace_exec, cwd, "curl").await {
-        return Err(format!(
-            "Grok Build CLI '{}' not found and curl is not available in the workspace. Install curl or install Grok manually.",
-            cli_path
-        ));
-    }
-
-    tracing::info!("Auto-installing Grok Build CLI");
-    let output = workspace_exec
-        .output(
-            cwd,
-            "/bin/sh",
-            &[
-                "-lc".to_string(),
-                "curl -fsSL https://x.ai/cli/install.sh | GROK_BIN_DIR=/usr/local/bin bash 2>&1"
-                    .to_string(),
-            ],
-            HashMap::new(),
-        )
-        .await
-        .map_err(|e| format!("Failed to run Grok Build installer: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut message = String::new();
-        if !stderr.trim().is_empty() {
-            message.push_str(stderr.trim());
-        }
-        if !stdout.trim().is_empty() {
-            if !message.is_empty() {
-                message.push_str(" | ");
-            }
-            message.push_str(stdout.trim());
-        }
-        if message.is_empty() {
-            message = "Grok Build install failed with no output".to_string();
-        }
-        return Err(format!("Grok Build install failed: {}", message));
-    }
-
-    if command_available(workspace_exec, cwd, cli_path).await {
-        Ok(cli_path.to_string())
-    } else if command_available(workspace_exec, cwd, "/usr/local/bin/grok").await {
-        Ok("/usr/local/bin/grok".to_string())
-    } else {
-        Err(
-            "Grok Build install completed but 'grok' is still not available in workspace PATH."
-                .to_string(),
-        )
-    }
-}
-
-async fn sync_grok_oauth_auth_file(
-    workspace_exec: &WorkspaceExec,
-    cwd: &std::path::Path,
-) -> Result<bool, String> {
-    let auth_path = std::path::PathBuf::from(crate::util::home_dir())
-        .join(".grok")
-        .join("auth.json");
-    if !auth_path.is_file() {
-        return Ok(false);
-    }
-
-    let auth_json = tokio::fs::read_to_string(&auth_path)
-        .await
-        .map_err(|e| format!("Failed to read Grok auth file: {}", e))?;
-    if auth_json.trim().is_empty() {
-        return Ok(false);
-    }
-
-    let source_expires_at = grok_auth_file_expires_at(&auth_json);
-    if crate::api::ai_providers::oauth_token_expired(source_expires_at) {
-        return Err(
-            "Host Grok auth file is expired; reconnect xAI or refresh OAuth before syncing"
-                .to_string(),
-        );
-    }
-    let existing_output = workspace_exec
-        .output(
-            cwd,
-            "/bin/sh",
-            &[
-                "-lc".to_string(),
-                "test -s \"${HOME:-/root}/.grok/auth.json\" && cat \"${HOME:-/root}/.grok/auth.json\""
-                    .to_string(),
-            ],
-            HashMap::new(),
-        )
-        .await
-        .map_err(|e| format!("Failed to inspect workspace Grok auth file: {}", e))?;
-    if existing_output.status.success() {
-        let existing_json = String::from_utf8_lossy(&existing_output.stdout);
-        let existing_expires_at = grok_auth_file_expires_at(&existing_json);
-        if existing_expires_at >= source_expires_at {
-            tracing::debug!(
-                source_expires_at,
-                existing_expires_at,
-                "Skipping Grok auth sync because workspace auth is at least as fresh"
-            );
-            return Ok(false);
-        }
-    }
-
-    let encoded = {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(auth_json.as_bytes())
-    };
-    let output = workspace_exec
-        .output(
-            cwd,
-            "/bin/sh",
-            &[
-                "-lc".to_string(),
-                format!(
-                    "mkdir -p \"${{HOME:-/root}}/.grok\" && printf %s '{}' | base64 -d > \"${{HOME:-/root}}/.grok/auth.json\" && chmod 600 \"${{HOME:-/root}}/.grok/auth.json\"",
-                    encoded
-                ),
-            ],
-            HashMap::new(),
-        )
-        .await
-        .map_err(|e| format!("Failed to sync Grok auth file: {}", e))?;
-    if output.status.success() {
-        Ok(true)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Err(format!(
-            "Failed to sync Grok auth file into workspace: {}{}{}",
-            stderr.trim(),
-            if stderr.trim().is_empty() || stdout.trim().is_empty() {
-                ""
-            } else {
-                " | "
-            },
-            stdout.trim()
-        ))
-    }
-}
-
-fn grok_auth_file_expires_at(contents: &str) -> i64 {
-    const GROK_OAUTH_CLIENT_KEY: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
-
-    serde_json::from_str::<serde_json::Value>(contents)
-        .ok()
-        .and_then(|auth| auth.get(GROK_OAUTH_CLIENT_KEY).cloned())
-        .and_then(|entry| {
-            entry.get("expires_at").and_then(|value| {
-                if let Some(expires_at) = value.as_i64() {
-                    return Some(expires_at);
-                }
-                let text = value.as_str()?.trim();
-                if let Ok(expires_at) = text.parse::<i64>() {
-                    return Some(expires_at);
-                }
-                chrono::DateTime::parse_from_rfc3339(text)
-                    .ok()
-                    .map(|dt| dt.timestamp_millis())
-            })
-        })
-        .unwrap_or(0)
 }
 
 /// Result of a backend preflight check
@@ -10083,7 +7297,7 @@ async fn check_gemini_prerequisites(
 /// Auto-installs via npm/bun if not found and auto-install is enabled.
 /// If the installed CLI requires Node 20+ but only Node 18 is available,
 /// returns a `bun run <entry_point>` command instead.
-async fn ensure_gemini_cli_available(
+pub(crate) async fn ensure_gemini_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     cli_path: &str,
@@ -10295,1922 +7509,13 @@ async fn gemini_bun_fallback_if_needed(
     None
 }
 
-/// Execute a turn using OpenCode CLI backend.
-///
-/// For Host workspaces: spawns the CLI directly on the host.
-/// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
-///
-/// This uses `opencode run` directly for per-workspace isolation.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_opencode_turn(
-    workspace: &Workspace,
-    work_dir: &std::path::Path,
-    message: &str,
-    model: Option<&str>,
-    _model_effort: Option<&str>,
-    agent: Option<&str>,
-    mission_id: Uuid,
-    events_tx: broadcast::Sender<AgentEvent>,
-    cancel: CancellationToken,
-    app_working_dir: &std::path::Path,
-) -> AgentResult {
-    use super::ai_providers::{
-        ensure_anthropic_oauth_token_valid, ensure_google_oauth_token_valid,
-        ensure_openai_oauth_token_valid,
-    };
-    use std::collections::{HashMap, VecDeque};
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    // When no agent is requested, default to vanilla opencode's primary "build" agent.
-    let default_agent = if agent.is_none() { Some("build") } else { None };
-    let agent = agent.or(default_agent);
-    let opencode_goal_objective = parse_opencode_goal_objective(message);
-    if let Some(objective) = opencode_goal_objective.as_deref() {
-        let _ = events_tx.send(AgentEvent::GoalStatus {
-            status: "active".to_string(),
-            objective: objective.to_string(),
-            mission_id: Some(mission_id),
-        });
-        let _ = events_tx.send(AgentEvent::GoalIteration {
-            iteration: 1,
-            objective: objective.to_string(),
-            mission_id: Some(mission_id),
-        });
-    }
-
-    // Use the OpenCode CLI directly for per-workspace execution.
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
-    if let Err(err) = ensure_opencode_cli_available(&workspace_exec, work_dir).await {
-        tracing::error!("{}", err);
-        let _ = events_tx.send(AgentEvent::Error {
-            message: err.clone(),
-            mission_id: Some(mission_id),
-            resumable: true,
-        });
-        return AgentResult::failure(err, 0).with_terminal_reason(TerminalReason::LlmError);
-    }
-
-    let opencode_config_dir_host = work_dir.join(".opencode");
-
-    // Resolve the model: explicit override > agent config > env var defaults.
-    let mut resolved_model = model
-        .map(|m| m.to_string())
-        .or_else(|| resolve_opencode_model_from_config(&opencode_config_dir_host, agent))
-        .or_else(|| {
-            std::env::var("SANDBOXED_SH_OPENCODE_DEFAULT_MODEL")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        })
-        .or_else(|| {
-            std::env::var("OPENCODE_DEFAULT_MODEL")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        });
-    let auth_state = detect_opencode_provider_auth(Some(app_working_dir));
-    let has_openai = auth_state.has_openai;
-    let has_anthropic = auth_state.has_anthropic;
-    let has_google = auth_state.has_google;
-    let has_any_provider = has_openai || has_anthropic || has_google || auth_state.has_other;
-
-    let mut provider_hint = resolved_model
-        .as_deref()
-        .and_then(|m| m.split_once('/'))
-        .map(|(provider, _)| provider.to_lowercase());
-
-    let configured_providers = &auth_state.configured_providers;
-    let provider_available = |provider: &str| -> bool {
-        match provider {
-            "anthropic" | "claude" => has_anthropic,
-            "openai" | "codex" => has_openai,
-            "google" | "gemini" => has_google,
-            // For known catalog providers (xai, zai, cerebras), check if they are actually configured
-            p if super::providers::DEFAULT_CATALOG_PROVIDER_IDS.contains(&p) => {
-                configured_providers.contains(p)
-            }
-            // Unknown providers pass through (custom escape hatch)
-            _ => true,
-        }
-    };
-
-    if let Some(provider) = provider_hint.as_deref() {
-        if !provider_available(provider) {
-            tracing::warn!(
-                mission_id = %mission_id,
-                provider = %provider,
-                "Requested OpenCode model provider is not configured; falling back to available providers"
-            );
-            resolved_model = None;
-            provider_hint = None;
-        }
-    }
-
-    let needs_google = matches!(provider_hint.as_deref(), Some("google" | "gemini"));
-
-    let fallback_provider = if has_openai {
-        Some("openai")
-    } else if has_google {
-        Some("google")
-    } else if has_anthropic {
-        Some("anthropic")
-    } else {
-        None
-    };
-
-    let refresh_provider = provider_hint.as_deref().or(fallback_provider);
-    let refresh_result = match refresh_provider {
-        Some("anthropic") | Some("claude") => ensure_anthropic_oauth_token_valid().await,
-        Some("openai") | Some("codex") => ensure_openai_oauth_token_valid().await,
-        Some("google") | Some("gemini") => ensure_google_oauth_token_valid().await,
-        None => {
-            if has_any_provider {
-                Ok(())
-            } else {
-                Err(
-                    "No OpenCode providers configured. Add a provider in Settings → AI Providers."
-                        .to_string(),
-                )
-            }
-        }
-        _ => Ok(()),
-    };
-
-    if let Err(err) = refresh_result {
-        let label = refresh_provider
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "provider".to_string());
-        let err_msg = format!(
-            "{} OAuth token refresh failed: {}. Please re-authenticate in Settings → AI Providers.",
-            label, err
-        );
-        tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-    }
-
-    // Note: Provider concurrency semaphores (previously used for ZAI) have been
-    // removed. For `builtin/*` models, rate limit handling is done by the proxy's
-    // waterfall failover and per-account health tracking in ProviderHealthTracker.
-    // For direct provider models (e.g. `zai/*`), OpenCode's own retry logic
-    // handles 429s. The old semaphore only serialized requests — it did not do
-    // failover — so removing it trades slightly higher 429 rates under heavy
-    // concurrency for lower latency in the common case.
-
-    let configured_runner = get_backend_string_setting("opencode", "cli_path")
-        .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok());
-
-    let cli_runner = if let Some(path) = configured_runner {
-        if command_available(&workspace_exec, work_dir, &path).await {
-            path
-        } else {
-            let err_msg = format!(
-                "OpenCode CLI runner '{}' not found in workspace. Install it or update OPENCODE_CLI_PATH.",
-                path
-            );
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    } else if command_available(&workspace_exec, work_dir, "opencode").await {
-        "opencode".to_string()
-    } else {
-        let err_msg =
-            "OpenCode CLI not found in workspace. Install opencode or update OPENCODE_CLI_PATH."
-                .to_string();
-        tracing::error!("{}", err_msg);
-        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-    };
-
-    // Proactive network connectivity check - fail fast if API is unreachable
-    // This catches DNS/network issues immediately instead of waiting for a timeout
-    if let Err(err_msg) = check_opencode_connectivity(
-        &workspace_exec,
-        work_dir,
-        has_openai,
-        has_anthropic,
-        has_google,
-        auth_state.has_zai,
-        auth_state.configured_providers.contains("minimax"),
-    )
-    .await
-    {
-        tracing::error!(mission_id = %mission_id, "{}", err_msg);
-        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-    }
-
-    tracing::info!(
-        mission_id = %mission_id,
-        work_dir = %work_dir.display(),
-        workspace_type = ?workspace.workspace_type,
-        model = ?resolved_model,
-        agent = ?agent,
-        cli_runner = %cli_runner,
-        "Starting OpenCode execution via WorkspaceExec (per-workspace CLI mode)"
-    );
-
-    let work_dir_env = workspace_path_for_env(workspace, work_dir);
-    let work_dir_arg = work_dir_env.to_string_lossy().to_string();
-    let opencode_config_dir_env = workspace_path_for_env(workspace, &opencode_config_dir_host);
-    let mut model_used: Option<String> = None;
-    // Accumulate token usage from SSE response.completed events for cost estimation
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
-    let mut total_cache_creation_input_tokens: u64 = 0;
-    let mut total_cache_read_input_tokens: u64 = 0;
-    let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent);
-    if resolved_model.is_none() {
-        resolved_model = agent_model.clone();
-    }
-    // Inject provider definitions into opencode.json for models not in
-    // OpenCode's built-in snapshot.
-    if let Some(model_override) = resolved_model.as_deref() {
-        ensure_opencode_provider_for_model(
-            &opencode_config_dir_host,
-            app_working_dir,
-            model_override,
-        );
-    }
-    if let Some(ref am) = agent_model {
-        if resolved_model.as_deref() != Some(am) {
-            ensure_opencode_provider_for_model(&opencode_config_dir_host, app_working_dir, am);
-        }
-    }
-    let goal_plugin = "opencode-goal-plugin";
-    ensure_opencode_plugin_specs(&opencode_config_dir_host, &[goal_plugin]);
-    ensure_opencode_plugin_installed(
-        &workspace_exec,
-        work_dir,
-        &opencode_config_dir_host,
-        &opencode_config_dir_env,
-        goal_plugin,
-    )
-    .await;
-    if needs_google {
-        if let Some(project_id) = detect_google_project_id() {
-            ensure_opencode_google_project_id(&opencode_config_dir_host, &project_id);
-        }
-        let gemini_plugin = "opencode-gemini-auth@latest";
-        ensure_opencode_plugin_specs(&opencode_config_dir_host, &[gemini_plugin]);
-        ensure_opencode_plugin_installed(
-            &workspace_exec,
-            work_dir,
-            &opencode_config_dir_host,
-            &opencode_config_dir_env,
-            gemini_plugin,
-        )
-        .await;
-    }
-    if has_openai {
-        let openai_plugin = "opencode-openai-codex-auth@latest";
-        ensure_opencode_plugin_specs(&opencode_config_dir_host, &[openai_plugin]);
-        ensure_opencode_plugin_installed(
-            &workspace_exec,
-            work_dir,
-            &opencode_config_dir_host,
-            &opencode_config_dir_env,
-            openai_plugin,
-        )
-        .await;
-    }
-    // The message is written to a temp file and passed via $(cat ...) to avoid
-    // argument splitting issues when multi-line messages go through
-    // systemd-nspawn or nsenter shell wrappers.
-    let prompt_file_host = work_dir.join(".sandboxed-sh-prompt.txt");
-    if let Err(e) = std::fs::write(&prompt_file_host, message) {
-        let err_msg = format!("Failed to write prompt file: {}", e);
-        tracing::error!("{}", err_msg);
-        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-    }
-    let prompt_file_env = workspace_path_for_env(workspace, &prompt_file_host);
-    let prompt_file_arg = prompt_file_env.to_string_lossy().to_string();
-
-    // Build the opencode run command as a shell string so that $(cat <file>)
-    // correctly expands the message as a single argument.
-    let shell_escape = |s: &str| -> String {
-        let mut escaped = String::with_capacity(s.len() + 2);
-        escaped.push('\'');
-        for ch in s.chars() {
-            if ch == '\'' {
-                escaped.push_str("'\"'\"'");
-            } else {
-                escaped.push(ch);
-            }
-        }
-        escaped.push('\'');
-        escaped
-    };
-
-    let opencode_model = resolved_model.as_deref().unwrap_or("builtin/fast");
-    if opencode_model.starts_with("builtin/") {
-        ensure_opencode_provider_for_model(
-            &opencode_config_dir_host,
-            app_working_dir,
-            opencode_model,
-        );
-    }
-
-    let mut inner_cmd = String::new();
-    inner_cmd.push_str("#!/bin/sh\n");
-    inner_cmd.push_str(&shell_escape(&cli_runner));
-    inner_cmd.push_str(" run --format json --model ");
-    inner_cmd.push_str(&shell_escape(opencode_model));
-    if let Some(a) = agent {
-        inner_cmd.push_str(" --agent ");
-        inner_cmd.push_str(&shell_escape(a));
-    }
-    inner_cmd.push_str(" --dir ");
-    inner_cmd.push_str(&shell_escape(&work_dir_arg));
-    inner_cmd.push_str(" \"$(cat ");
-    inner_cmd.push_str(&shell_escape(&prompt_file_arg));
-    inner_cmd.push_str(")\"");
-
-    let script_host_path = format!("{}/.sandboxed-sh-opencode-cmd.sh", work_dir.display());
-    let script_env_path = format!(
-        "{}/.sandboxed-sh-opencode-cmd.sh",
-        prompt_file_arg
-            .rsplit_once('/')
-            .map(|(dir, _)| dir)
-            .unwrap_or(".")
-    );
-    if let Err(e) = std::fs::write(&script_host_path, &inner_cmd) {
-        let err_msg = format!("Failed to write OpenCode command script: {}", e);
-        tracing::error!(mission_id = %mission_id, "{}", err_msg);
-        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&script_host_path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    let mut shell_cmd = String::from("script -qe /dev/null -c ");
-    shell_cmd.push_str(&shell_escape(&script_env_path));
-    shell_cmd.push_str(" 2>/dev/null");
-
-    let args = vec!["-c".to_string(), shell_cmd.clone()];
-    let cli_runner_shell = "/bin/sh".to_string();
-
-    tracing::debug!(
-        mission_id = %mission_id,
-        shell_cmd = %shell_cmd,
-        prompt_file = %prompt_file_arg,
-        "OpenCode CLI args prepared (shell wrapper)"
-    );
-
-    let telegram_action_helpers_enabled =
-        message.contains("[Telegram from ") || message.contains("[Telegram workflow reply ");
-    if telegram_action_helpers_enabled {
-        write_telegram_action_cli_helpers(work_dir);
-    }
-
-    // Build environment variables
-    let mut env: HashMap<String, String> = HashMap::new();
-    env.insert("MISSION_ID".to_string(), mission_id.to_string());
-    if let Some(public_url) = public_api_base_url_from_env() {
-        env.insert("API_URL".to_string(), public_url);
-    } else if let Some(local_url) = localhost_api_base_url_from_env() {
-        env.insert("API_URL".to_string(), local_url);
-    }
-    if telegram_action_helpers_enabled {
-        if let Some(token) = crate::api::telegram::build_internal_telegram_action_token(mission_id)
-        {
-            env.insert("TELEGRAM_ACTION_TOKEN".to_string(), token);
-        }
-        let internal_api_url = localhost_api_base_url_from_env();
-        if let Some(api_url) = internal_api_url {
-            env.insert(
-                "TELEGRAM_ACTION_URL".to_string(),
-                format!("{}/api/control/telegram/actions/internal", api_url),
-            );
-            env.insert(
-                "TELEGRAM_WORKFLOW_URL".to_string(),
-                format!(
-                    "{}/api/control/telegram/workflows/request/internal",
-                    api_url
-                ),
-            );
-        }
-        env.insert(
-            "TELEGRAM_ACTION_CLI".to_string(),
-            format!("{}/.sandboxed-sh-telegram-action.py", work_dir_arg),
-        );
-        env.insert(
-            "TELEGRAM_ACTION_COMMAND".to_string(),
-            format!("{}/telegram-action", work_dir_arg),
-        );
-    }
-
-    // Ensure OpenCode's install directory is available in PATH.
-    {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let bun_bins = "/root/.bun/bin:/root/.cache/.bun/bin";
-        let mut path_parts = Vec::new();
-        if !current_path.contains("/root/.bun/bin") {
-            path_parts.push(bun_bins.to_string());
-        }
-        path_parts.push(current_path);
-        // Append a dedicated bin subdirectory (not the workspace root) so
-        // `telegram-action` is findable as a bare command without letting
-        // arbitrary repo files shadow system binaries.
-        if telegram_action_helpers_enabled {
-            path_parts.push(format!("{}/.sandboxed-sh-bin", work_dir_arg));
-        }
-        env.insert("PATH".to_string(), path_parts.join(":"));
-    }
-
-    let opencode_auth = sync_opencode_auth_to_workspace(workspace, app_working_dir);
-
-    // Allow per-mission OpenCode server port; default to an allocated free port.
-    let requested_port = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_PORT")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let mut opencode_port = requested_port
-        .clone()
-        .or_else(|| allocate_opencode_server_port().map(|p| p.to_string()))
-        .unwrap_or_else(|| "0".to_string());
-
-    if opencode_port == "0" {
-        opencode_port = "4096".to_string();
-    }
-
-    env.insert("OPENCODE_SERVER_PORT".to_string(), opencode_port.clone());
-    if let Ok(host) = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME") {
-        if !host.trim().is_empty() {
-            env.insert("OPENCODE_SERVER_HOSTNAME".to_string(), host);
-        }
-    }
-    tracing::info!(
-        mission_id = %mission_id,
-        opencode_port = %opencode_port,
-        "OpenCode server port selected"
-    );
-
-    // Pass the model if specified
-    if let Some(m) = resolved_model.as_deref() {
-        // Parse provider/model format
-        if let Some((provider, model_id)) = m.split_once('/') {
-            env.insert("OPENCODE_PROVIDER".to_string(), provider.to_string());
-            env.insert("OPENCODE_MODEL".to_string(), model_id.to_string());
-        } else {
-            env.insert("OPENCODE_MODEL".to_string(), m.to_string());
-        }
-    }
-
-    // Ensure OpenCode uses workspace-local config
-    let opencode_config_path =
-        workspace_path_for_env(workspace, &opencode_config_dir_host.join("opencode.json"));
-    env.insert(
-        "OPENCODE_CONFIG_DIR".to_string(),
-        opencode_config_dir_env.to_string_lossy().to_string(),
-    );
-    env.insert(
-        "OPENCODE_CONFIG".to_string(),
-        opencode_config_path.to_string_lossy().to_string(),
-    );
-
-    if let Some(project_id) = detect_google_project_id() {
-        env.entry("GOOGLE_CLOUD_PROJECT".to_string())
-            .or_insert_with(|| project_id.clone());
-        env.entry("GOOGLE_PROJECT_ID".to_string())
-            .or_insert(project_id);
-    }
-
-    if let Some(permissive) = get_backend_bool_setting("opencode", "permissive") {
-        env.insert("OPENCODE_PERMISSIVE".to_string(), permissive.to_string());
-    } else if let Ok(value) = std::env::var("OPENCODE_PERMISSIVE") {
-        if !value.trim().is_empty() {
-            env.insert("OPENCODE_PERMISSIVE".to_string(), value);
-        }
-    }
-
-    // Disable ANSI color codes for easier parsing
-    env.insert("NO_COLOR".to_string(), "1".to_string());
-    env.insert("FORCE_COLOR".to_string(), "0".to_string());
-
-    // Set non-interactive mode
-    env.insert("OPENCODE_NON_INTERACTIVE".to_string(), "true".to_string());
-    env.insert("OPENCODE_RUN".to_string(), "true".to_string());
-    env.entry("SANDBOXED_SH_WORKSPACE_TYPE".to_string())
-        .or_insert_with(|| workspace.workspace_type.as_str().to_string());
-
-    if let Some(auth) = opencode_auth.as_ref() {
-        let providers = apply_opencode_auth_env(auth, &mut env);
-        if !providers.is_empty() {
-            tracing::info!(
-                mission_id = %mission_id,
-                providers = ?providers,
-                "Loaded OpenCode auth credentials for workspace"
-            );
-        }
-    }
-
-    prepend_opencode_bin_to_path(&mut env, workspace);
-
-    cleanup_opencode_listeners(&workspace_exec, work_dir, Some(&opencode_port)).await;
-
-    // Use WorkspaceExec to spawn the CLI in the correct workspace context.
-    // We invoke /bin/sh -c '...' so the prompt file is read via $(cat ...)
-    // and passed as a single argument regardless of workspace type.
-    let mut child = match workspace_exec
-        .spawn_streaming(work_dir, &cli_runner_shell, &args, env)
-        .await
-    {
-        Ok(child) => child,
-        Err(e) => {
-            let err_msg = format!("Failed to start OpenCode CLI: {}", e);
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    // Get stdout and stderr for reading output
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            let err_msg = "Failed to capture OpenCode stdout";
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg.to_string(), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    let stderr = child.stderr.take();
-
-    let mut final_result = String::new();
-    let mut had_error = false;
-    let mut final_result_from_nonzero_exit = false;
-    let mut tool_call_step_count: u32 = 0;
-    let session_id_capture: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let stderr_text_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let stderr_recent_lines: Arc<Mutex<VecDeque<String>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(32)));
-    // Accumulates the latest full-text snapshot from SSE TextDelta events.
-    // Used as a fallback when stdout JSON and session storage both fail —
-    // this buffer contains exactly what was streamed to the dashboard,
-    // unlike stderr which truncates long content (fixes #158).
-    let sse_text_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let sse_emitted_thinking = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let latest_tool_result_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sse_cancel = CancellationToken::new();
-    let (sse_complete_tx, mut sse_complete_rx) = tokio::sync::watch::channel(false);
-    let (sse_session_idle_tx, mut sse_session_idle_rx) = tokio::sync::watch::channel(false);
-    let (sse_retry_tx, mut sse_retry_rx) = tokio::sync::watch::channel(0u32);
-    let last_activity = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-    // Track recent OpenCode heartbeats separately from "meaningful" activity.
-    // Some provider chains can spend >120s between message/status updates while
-    // still emitting heartbeats, so treating heartbeat-only periods as hard
-    // inactivity can kill valid runs prematurely.
-    let last_heartbeat = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
-    let (text_output_tx, mut text_output_rx) = tokio::sync::watch::channel(false);
-    // Track active tool call depth: incremented on ToolCall, decremented on ToolResult.
-    // Used to skip inactivity timeouts during long tool runs (builds, tests, etc.).
-    let (sse_tool_depth_tx, sse_tool_depth_rx) = tokio::sync::watch::channel(0u32);
-
-    // OpenCode's supported integration path is `run --format json`; all events
-    // are consumed from stdout, with no parallel curl/SSE side channel.
-    let sse_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let json_tool_depth_tx = Some(sse_tool_depth_tx);
-
-    // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
-    let mission_id_clone = mission_id;
-    // Use a separate mutex for stderr errors so that broad stderr pattern
-    // matches (e.g. log lines containing "error" with JSON) don't write into
-    // sse_error_message.  Only genuine SSE-level errors (session.error,
-    // AgentEvent::Error from the SSE stream) should block recovery guards.
-    let stderr_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let stderr_error_capture = stderr_error_message.clone();
-    let stderr_text_capture = stderr_text_buffer.clone();
-    let stderr_recent_capture = stderr_recent_lines.clone();
-    let stderr_text_output_tx = text_output_tx.clone();
-    let stderr_last_activity = last_activity.clone();
-    let stderr_last_heartbeat = last_heartbeat.clone();
-    let stderr_rate_limit = rate_limit_detected.clone();
-    let stderr_events_tx = events_tx.clone();
-    let stderr_handle = stderr.map(|stderr| {
-        tokio::spawn(async move {
-            let stderr_reader = BufReader::new(stderr);
-            let mut stderr_lines = stderr_reader.lines();
-            // Track the last message role seen in stderr so we only capture
-            // assistant text parts (not user message echoes) into the buffer.
-            let mut last_stderr_role = String::new();
-            let mut retry_count: u32 = 0;
-            while let Ok(Some(line)) = stderr_lines.next_line().await {
-                let clean = line.trim().to_string();
-                if !clean.is_empty() {
-                    if let Ok(mut recent_lines) = stderr_recent_capture.lock() {
-                        if recent_lines.len() >= 32 {
-                            let _ = recent_lines.pop_front();
-                        }
-                        recent_lines.push_back(clean.clone());
-                    }
-                    // Refresh global inactivity timer for lines that indicate
-                    // real work progress.  Heartbeats and server-internal status
-                    // lines are excluded — they fire every ~30s and would keep a
-                    // hung LLM call alive forever.
-                    let is_heartbeat = clean.contains("server.heartbeat");
-                    let is_server_noise = is_heartbeat
-                        || clean.contains("server.connected")
-                        || clean.contains("server.listening");
-                    if is_heartbeat {
-                        if let Ok(mut guard) = stderr_last_heartbeat.lock() {
-                            *guard = Some(std::time::Instant::now());
-                        }
-                    }
-                    if !is_server_noise {
-                        if let Ok(mut guard) = stderr_last_activity.lock() {
-                            *guard = std::time::Instant::now();
-                        }
-                    }
-                    tracing::debug!(mission_id = %mission_id_clone, line = %clean, "OpenCode CLI stderr");
-
-                    // Track message role from stderr event lines like:
-                    //   [MAIN] message.updated (user, build)
-                    //   [MAIN] message.updated (assistant, build, glm-4.7)
-                    if clean.contains("message.updated") {
-                        if clean.contains("(user") {
-                            last_stderr_role = "user".to_string();
-                        } else if clean.contains("(assistant") {
-                            last_stderr_role = "assistant".to_string();
-                        }
-                    }
-
-                    if let Some(text_part) = parse_opencode_stderr_text_part(&clean) {
-                        // Only capture text parts that follow an assistant message,
-                        // skip user message echoes
-                        if last_stderr_role != "user" {
-                            if let Ok(mut buffer) = stderr_text_capture.lock() {
-                                // Replace the buffer with the latest text.
-                                // Each message.part (text) line contains the full
-                                // accumulated text of the part, not just the delta.
-                                // Using push_str would concatenate snapshots and
-                                // produce stuttered output like "LetLet meLet me get...".
-                                *buffer = text_part;
-                            }
-                            let _ = stderr_text_output_tx.send(true);
-                        }
-                    }
-
-                    // Detect session/provider errors from stderr and surface
-                    // them as AgentEvent::Error so the frontend shows the
-                    // reason a mission failed (issue #146).
-                    let lower = clean.to_lowercase();
-                    let detected_error = if lower.contains("session.error")
-                        || lower.contains("session ended with error")
-                    {
-                        // Standard session error format:
-                        //   [MAIN] session.error: Requested entity was not found
-                        clean.find(": ").map(|pos| clean[pos + 2..].trim().to_string())
-                    } else if lower.contains("response.error") {
-                        // Provider response error:
-                        //   [MAIN] response.error: 404 Not Found
-                        clean.find(": ").map(|pos| clean[pos + 2..].trim().to_string())
-                    } else if (lower.contains("error") || lower.contains("failed"))
-                        && clean.contains('{')
-                    {
-                        // JSON error payload on stderr — try to extract a
-                        // meaningful message from common fields.
-                        if let Some(start) = clean.find('{') {
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&clean[start..]) {
-                                let msg = // 1. Top-level "message" string
-                                    json.get("message")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string())
-                                    // 2. "error" as a plain string (e.g. {"error": "Rate limited"})
-                                    .or_else(|| {
-                                        json.get("error")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string())
-                                    })
-                                    // 3. Nested error object: {"error": {"message": "...", "status": "..."}}
-                                    .or_else(|| {
-                                        json.get("error")
-                                            .and_then(|e| e.as_object())
-                                            .and_then(|obj| {
-                                                let msg = obj.get("message").and_then(|m| m.as_str())?;
-                                                let status = obj.get("status").and_then(|s| s.as_str());
-                                                Some(if let Some(st) = status {
-                                                    format!("{} ({})", msg, st)
-                                                } else {
-                                                    msg.to_string()
-                                                })
-                                            })
-                                    })
-                                    // 4. Last resort: stringify the raw "error" value
-                                    .or_else(|| {
-                                        json.get("error").map(|v| v.to_string())
-                                    });
-                                msg
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(err_msg) = detected_error {
-                        if !err_msg.is_empty() {
-                            tracing::warn!(
-                                mission_id = %mission_id_clone,
-                                error = %err_msg,
-                                "OpenCode provider error detected on stderr"
-                            );
-                            let mut guard = stderr_error_capture.lock().unwrap_or_else(|e| e.into_inner());
-                            if guard.is_none() {
-                                *guard = Some(err_msg.clone());
-                            }
-                            // Emit a real-time error event so the frontend
-                            // shows the error immediately, not just at the end.
-                            let _ = stderr_events_tx.send(AgentEvent::Error {
-                                message: err_msg,
-                                mission_id: Some(mission_id_clone),
-                                resumable: true,
-                            });
-                        }
-                    }
-
-                    // Detect retry loops: OpenCode emits "session.status: retry"
-                    // on stderr when the LLM API call fails and it retries.
-                    // After several consecutive retries without progress, surface
-                    // this as an error so the mission doesn't silently hang.
-                    if lower.contains("session.status: retry")
-                        || lower.contains("session.status:retry")
-                    {
-                        retry_count += 1;
-                        if retry_count >= 3 {
-                            tracing::warn!(
-                                mission_id = %mission_id_clone,
-                                retry_count = retry_count,
-                                "OpenCode stuck in retry loop — LLM API is likely returning errors (e.g. 429 rate limit)"
-                            );
-                            // Signal the main loop to kill the process early for faster recovery.
-                            stderr_rate_limit.store(true, std::sync::atomic::Ordering::SeqCst);
-                            let mut guard = stderr_error_capture.lock().unwrap_or_else(|e| e.into_inner());
-                            if guard.is_none() {
-                                *guard = Some(format!(
-                                    "LLM API request failed after {} retries (possible rate limit or API error). \
-                                     Check your API key and provider endpoint configuration.",
-                                    retry_count
-                                ));
-                            }
-                        }
-                    } else if lower.contains("session.status: busy")
-                        || lower.contains("session.status:busy")
-                    {
-                        // busy between retries is normal, don't reset
-                    } else if lower.contains("message.updated")
-                        || lower.contains("message.completed")
-                    {
-                        // Real progress — reset retry counter and clear rate-limit flag
-                        retry_count = 0;
-                        stderr_rate_limit
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-            }
-        })
-    });
-
-    // Process stdout output from OpenCode.
-    // Events come via SSE (when curl is available), stdout contains the assistant's text response.
-    let stdout_reader = BufReader::new(stdout);
-    let mut stdout_lines = stdout_reader.lines();
-    let mut state = OpencodeSseState::default();
-
-    let mut sse_complete_seen = false;
-    let mut sse_complete_at: Option<std::time::Instant> = None;
-    let mut text_output_at: Option<std::time::Instant> = None;
-    // Set when the process is killed by an idle timeout (text-output or global).
-    // Used after the event loop to flag the result as incomplete so the caller
-    // can surface the truncation to the user.
-    let mut killed_by_idle_timeout = false;
-    // Track session idle state — used as a fallback completion signal when
-    // response.completed is not emitted (common with GLM models).
-    let mut session_idle_seen = false;
-    let mut session_idle_at: Option<std::time::Instant> = None;
-    let mut had_meaningful_work = false;
-    // Track consecutive retries — if the model API keeps failing, abort early
-    // instead of waiting for the full idle timeout.  We track the last-seen
-    // cumulative value from the SSE channel so that a text-output reset only
-    // zeroes the *local* counter and later retries are counted as a fresh run.
-    let mut consecutive_retries: u32 = 0;
-    let mut last_seen_total_retries: u32 = 0;
-    let max_consecutive_retries: u32 = 5;
-    // OpenCode can legitimately spend more than 30s in the next provider call
-    // after emitting an initial acknowledgement and finishing a tool-call step.
-    // A short timeout turns that acknowledgement into a false successful answer
-    // for Telegram. Let the global inactivity timeout handle truly stuck turns.
-    const OPENCODE_TEXT_IDLE_TIMEOUT_SECS: u64 = 120;
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!(mission_id = %mission_id, "OpenCode execution cancelled, killing process");
-                let _ = child.kill().await;
-                // Await background tasks so in-flight mutex writes complete
-                // before we return.  Use the same teardown discipline as the
-                // normal exit path to avoid data races on shared state.
-                if let Some(mut handle) = stderr_handle {
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                            handle.abort();
-                        }
-                        _ = &mut handle => {}
-                    }
-                }
-                sse_cancel.cancel();
-                if let Some(handle) = sse_handle {
-                    handle.abort();
-                    let _ = handle.await;
-                }
-                return AgentResult::failure("Cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
-            }
-            changed = sse_complete_rx.changed() => {
-                if changed.is_ok() && *sse_complete_rx.borrow() && !sse_complete_seen {
-                    sse_complete_seen = true;
-                    sse_complete_at = Some(std::time::Instant::now());
-                }
-            }
-            changed = sse_session_idle_rx.changed() => {
-                if changed.is_ok() {
-                    if *sse_session_idle_rx.borrow() && !session_idle_seen {
-                        session_idle_seen = true;
-                        session_idle_at = Some(std::time::Instant::now());
-                        tracing::debug!(
-                            mission_id = %mission_id,
-                            had_meaningful_work = had_meaningful_work,
-                            "Session idle signal received from SSE"
-                        );
-                    } else if !*sse_session_idle_rx.borrow() && session_idle_seen {
-                        // SSE reconnected — the sender reset to false.  Clear
-                        // the stale idle state so the 10s kill timer doesn't
-                        // fire based on a pre-reconnect timestamp.
-                        session_idle_seen = false;
-                        session_idle_at = None;
-                        tracing::debug!(
-                            mission_id = %mission_id,
-                            "Session idle state reset (SSE reconnect)"
-                        );
-                    }
-                }
-            }
-            changed = sse_retry_rx.changed() => {
-                if changed.is_ok() {
-                    let new_total = *sse_retry_rx.borrow();
-                    // On SSE reconnect the sender resets to 0; clear local
-                    // tracking so stale counts don't accumulate across
-                    // connections.
-                    if new_total == 0 && last_seen_total_retries > 0 {
-                        last_seen_total_retries = 0;
-                        consecutive_retries = 0;
-                        continue;
-                    }
-                    let delta = new_total.saturating_sub(last_seen_total_retries);
-                    last_seen_total_retries = new_total;
-                    consecutive_retries += delta;
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        consecutive_retries = consecutive_retries,
-                        "Model API retry detected"
-                    );
-                    if consecutive_retries >= max_consecutive_retries {
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            retries = consecutive_retries,
-                            "Model API failed after {} consecutive retries; aborting mission",
-                            consecutive_retries
-                        );
-                        let _ = events_tx.send(AgentEvent::Error {
-                            message: format!(
-                                "Model API failed after {} consecutive retries. The model provider may be down or misconfigured.",
-                                consecutive_retries
-                            ),
-                            mission_id: Some(mission_id),
-                            resumable: true,
-                        });
-                        let _ = child.kill().await;
-                        break;
-                    }
-                }
-            }
-            changed = text_output_rx.changed() => {
-                if changed.is_ok() && *text_output_rx.borrow() {
-                    text_output_at = Some(std::time::Instant::now());
-                    had_meaningful_work = true;
-                    // Reset idle state — new activity means the session is
-                    // not truly idle yet.
-                    session_idle_seen = false;
-                    session_idle_at = None;
-                    // Reset retry counter — real output means the model is working.
-                    consecutive_retries = 0;
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(200)), if sse_complete_seen => {
-                if let Some(started) = sse_complete_at {
-                    if started.elapsed() >= std::time::Duration::from_secs(2) {
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            "OpenCode completion observed; terminating lingering CLI process"
-                        );
-                        let _ = child.kill().await;
-                        break;
-                    }
-                }
-            }
-            // Session idle grace period: if the session has been idle for 10s
-            // after meaningful work was produced, treat as completed.  This
-            // catches GLM models that emit response.incomplete without a
-            // subsequent response.completed.
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)), if session_idle_seen && !sse_complete_seen && (had_meaningful_work
-                || sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst)
-                || sse_emitted_text.load(std::sync::atomic::Ordering::SeqCst)) => {
-                if let Some(idle_since) = session_idle_at {
-                    if idle_since.elapsed() >= std::time::Duration::from_secs(10) {
-                        // Don't kill while tools are actively running — the model
-                        // may have sent session.idle prematurely before a long
-                        // tool execution (build, test) produces more output.
-                        let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
-                        let tools_active = if json_tool_depth_tx.is_some() {
-                            *sse_tool_depth_rx.borrow() > 0
-                        } else {
-                            sse_alive && *sse_tool_depth_rx.borrow() > 0
-                        };
-                        if tools_active {
-                            tracing::debug!(
-                                mission_id = %mission_id,
-                                tool_depth = *sse_tool_depth_rx.borrow(),
-                                "Session idle but tools still active; deferring kill"
-                            );
-                        } else {
-                            tracing::info!(
-                                mission_id = %mission_id,
-                                "Session idle for 10s after meaningful work; treating as completion"
-                            );
-                            let _ = child.kill().await;
-                            break;
-                        }
-                    }
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                // Early kill when stderr reader detects a rate-limit retry loop.
-                // Only kill if there's also no real SSE activity (tool calls, thinking).
-                // If the model is doing tool calls, the retry status may be transient.
-                if rate_limit_detected.load(std::sync::atomic::Ordering::SeqCst) {
-                    let sse_idle = last_activity
-                        .lock()
-                        .ok()
-                        .map(|g| g.elapsed() >= std::time::Duration::from_secs(15))
-                        .unwrap_or(true);
-                    if sse_idle {
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            "Rate-limit retry loop detected with no SSE activity; terminating CLI process early"
-                        );
-                        let _ = child.kill().await;
-                        break;
-                    }
-                }
-                if let Some(last_text) = text_output_at {
-                    if last_text.elapsed() >= std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS) {
-                        // Only kill if there's also no recent SSE/stderr activity
-                        // AND no tools are actively running.  A long tool execution
-                        // (build, test, sleep) may produce no text output for >30s;
-                        // killing the process mid-tool would be wrong.
-                        // If the SSE handler has exited, the depth value may be
-                        // stale (stuck > 0), so treat that as "no tools active".
-                        let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
-                        // In JSON stdout mode, tool depth is tracked directly via
-                        // json_tool_depth_tx (no SSE handler).  Check the receiver
-                        // regardless of sse_alive — the sender is kept alive in JSON
-                        // mode specifically for this purpose.
-                        let tools_active = if json_tool_depth_tx.is_some() {
-                            *sse_tool_depth_rx.borrow() > 0
-                        } else {
-                            sse_alive && *sse_tool_depth_rx.borrow() > 0
-                        };
-                        let recent_activity = last_activity
-                            .lock()
-                            .ok()
-                            .map(|g| g.elapsed() < std::time::Duration::from_secs(OPENCODE_TEXT_IDLE_TIMEOUT_SECS))
-                            .unwrap_or(false);
-                        if !recent_activity && !tools_active {
-                            tracing::info!(
-                                mission_id = %mission_id,
-                                "OpenCode output idle timeout reached; terminating CLI process"
-                            );
-                            killed_by_idle_timeout = true;
-                            let _ = child.kill().await;
-                            break;
-                        }
-                    }
-                }
-                // Global inactivity timeout: if nothing at all has happened
-                // for 120s (no SSE events, no stdout, no stderr), the process
-                // is likely stuck.  Kill it and let the fallback recovery
-                // logic read the result from OpenCode storage.
-                // Skip this check while tools are actively running — long
-                // commands (builds, tests) may produce no SSE events for
-                // extended periods and heartbeats are intentionally filtered.
-                // If the SSE handler has exited, the depth value may be stale,
-                // so treat that as "no tools active".
-                let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
-                let tools_active = if json_tool_depth_tx.is_some() {
-                    *sse_tool_depth_rx.borrow() > 0
-                } else {
-                    sse_alive && *sse_tool_depth_rx.borrow() > 0
-                };
-                let inactivity_elapsed = last_activity
-                    .lock()
-                    .ok()
-                    .map(|g| g.elapsed())
-                    .unwrap_or_default();
-                let recent_heartbeat = last_heartbeat
-                    .lock()
-                    .ok()
-                    .and_then(|g| *g)
-                    .map(|ts| ts.elapsed() <= std::time::Duration::from_secs(45))
-                    .unwrap_or(false);
-                if !tools_active && inactivity_elapsed >= std::time::Duration::from_secs(120) {
-                    // Heartbeat-only grace: avoid killing while the OpenCode server is
-                    // still alive and sending heartbeats. This especially affects smart
-                    // routing chains (e.g. GLM/Minimax fallbacks) that can take longer
-                    // to produce non-heartbeat events.
-                    if recent_heartbeat {
-                        if inactivity_elapsed >= std::time::Duration::from_secs(420) {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                inactivity_secs = inactivity_elapsed.as_secs(),
-                                "Heartbeat-only inactivity timeout (420s); terminating stuck CLI process"
-                            );
-                            killed_by_idle_timeout = true;
-                            let _ = child.kill().await;
-                            break;
-                        }
-                    } else {
-                        tracing::warn!(
-                            mission_id = %mission_id,
-                            "Global inactivity timeout (120s); terminating stuck CLI process"
-                        );
-                        killed_by_idle_timeout = true;
-                        let _ = child.kill().await;
-                        break;
-                    }
-                }
-            }
-            line_result = stdout_lines.next_line() => {
-                match line_result {
-                    Ok(None) => {
-                        // EOF - process finished
-                        break;
-                    }
-                    Ok(Some(line)) => {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if let Ok(mut guard) = last_activity.lock() {
-                            *guard = std::time::Instant::now();
-                        }
-
-                        // Try to parse as JSON event
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                            let event_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            tracing::debug!(
-                                mission_id = %mission_id,
-                                event_type = %event_type,
-                                "OpenCode JSON event"
-                            );
-
-                            // Extract text content from message.part.updated for final result
-                            // Only capture assistant messages - skip user message echoes
-                            if event_type == "message.part.updated" {
-                                if let Some(props) = json.get("properties") {
-                                    if let Some(part) = props.get("part") {
-                                        let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                        if part_type == "text" {
-                                            let msg_id = part.get("messageID")
-                                                .or_else(|| part.get("messageId"))
-                                                .or_else(|| part.get("message_id"))
-                                                .or_else(|| props.get("messageID"))
-                                                .or_else(|| props.get("messageId"))
-                                                .or_else(|| props.get("message_id"))
-                                                .and_then(|v| v.as_str());
-                                            // Skip non-assistant and unknown-role messages,
-                                            // consistent with the SSE path in handle_part_update
-                                            // (lines 325-336). Three cases when msg_id is present:
-                                            //   - role is known non-assistant → skip
-                                            //   - role is not yet recorded   → skip (avoids
-                                            //     emitting user-message echoes as model text,
-                                            //     which would set text_output_at and trigger
-                                            //     the premature 30s text-idle timeout)
-                                            //   - role is "assistant"        → process text
-                                            // When msg_id is None (no ID in the event), allow
-                                            // text through — same as the SSE path.
-                                            let is_confirmed_assistant = match msg_id {
-                                                Some(id) => state.message_roles.get(id)
-                                                    .map(|role| role == "assistant")
-                                                    .unwrap_or(false), // unknown role → skip
-                                                None => true, // no msg_id → allow through
-                                            };
-                                            if is_confirmed_assistant {
-                                                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                    final_result = text.to_string();
-                                                    let _ = text_output_tx.send(true);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Track tool depth for plain opencode JSON mode so that
-                            // the text-output idle timeout doesn't kill the process
-                            // while MCP tools (web fetch, etc.) are actively running.
-                            if let Some(ref tx) = json_tool_depth_tx {
-                                if event_type == "tool_use" {
-                                    tx.send_modify(|v| *v = v.saturating_add(1));
-                                } else if event_type == "step_finish" {
-                                    // All tools for this step completed — reset depth.
-                                    tx.send_modify(|v| *v = 0);
-                                } else if event_type == "step_start" {
-                                    // New step starting — ensure depth is clean.
-                                    tx.send_modify(|v| *v = 0);
-                                }
-                            }
-
-                            // Handle plain opencode --format json events.
-                            // Plain opencode emits: step_start, text, step_finish
-                            // (different from message.part.updated/completion)
-                            if event_type == "text" {
-                                if let Some(part) = json.get("part") {
-                                    if let Some(text) =
-                                        part.get("text").and_then(|t| t.as_str())
-                                    {
-                                        // Strip <think>...</think> tags for final result
-                                        let clean_text =
-                                            if let Some(end_pos) = text.find("</think>") {
-                                                text[end_pos + 8..].trim().to_string()
-                                            } else {
-                                                text.to_string()
-                                            };
-                                        if !clean_text.is_empty() {
-                                            final_result = clean_text.clone();
-                                            let _ = text_output_tx.send(true);
-                                            // Emit text delta for Telegram streaming
-                                            let _ =
-                                                events_tx.send(AgentEvent::TextDelta {
-                                                    content: clean_text,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                        }
-                                    }
-                                }
-                            } else if event_type == "step_finish" {
-                                let reason = json
-                                    .get("part")
-                                    .and_then(|p| p.get("reason"))
-                                    .and_then(|r| r.as_str())
-                                    .unwrap_or("");
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    reason = %reason,
-                                    tool_call_steps = tool_call_step_count,
-                                    "OpenCode JSON step_finish event"
-                                );
-                                if reason == "stop" {
-                                    let _ = sse_complete_tx.send(true);
-                                } else {
-                                    // Track consecutive tool-call steps to detect runaway loops
-                                    tool_call_step_count += 1;
-                                    const MAX_TOOL_CALL_STEPS: u32 = 15;
-                                    if tool_call_step_count >= MAX_TOOL_CALL_STEPS {
-                                        tracing::warn!(
-                                            mission_id = %mission_id,
-                                            steps = tool_call_step_count,
-                                            "OpenCode tool-call step limit reached, forcing completion"
-                                        );
-                                        let _ = sse_complete_tx.send(true);
-                                    }
-                                }
-                            } else if event_type == "step_start" {
-                                // Extract session ID from step_start
-                                if let Some(sid) =
-                                    json.get("sessionID").and_then(|s| s.as_str())
-                                {
-                                    let mut guard = session_id_capture
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    if guard.is_none() {
-                                        *guard = Some(sid.to_string());
-                                    }
-                                }
-                            }
-
-                            // Handle completion and error events from OpenCode.
-                            if event_type == "completion" {
-                                tracing::info!(mission_id = %mission_id, "OpenCode JSON completion event");
-                                let _ = sse_complete_tx.send(true);
-                            } else if event_type == "error" {
-                                had_error = true;
-                                if let Some(props) = json.get("properties") {
-                                    if let Some(err) = props.get("error").and_then(|e| e.as_str()) {
-                                        tracing::warn!(mission_id = %mission_id, error = %err, "OpenCode JSON error event");
-                                        if final_result.is_empty() {
-                                            final_result = err.to_string();
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Route through SSE event parser for thinking/tool events.
-                            // Skip events already handled inline to avoid double processing
-                            // (e.g. step_finish would set message_complete in the SSE parser
-                            // even for tool-call steps, conflicting with the inline handler).
-                            let skip_sse = matches!(event_type, "step_finish" | "step_start" | "text");
-                            let current_session = session_id_capture.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            if !skip_sse {
-                            if let Some(parsed) = parse_opencode_sse_event(
-                                trimmed,
-                                None,
-                                current_session.as_deref(),
-                                &mut state,
-                                mission_id,
-                            ) {
-                                if let Some(session_id) = parsed.session_id {
-                                    let mut guard = session_id_capture.lock().unwrap_or_else(|e| e.into_inner());
-                                    if guard.is_none() {
-                                        *guard = Some(session_id);
-                                    }
-                                }
-                                if let Some(model) = parsed.model {
-                                    model_used = Some(model);
-                                }
-                                // Only accumulate usage from stdout when the dedicated SSE
-                                // curl task is not running.  When both paths are active they
-                                // can see the same `response.completed` event, which would
-                                // double-count tokens (and inflate cost estimates to ~2x).
-                                if sse_handle.is_none() {
-                                    if let Some(usage) = parsed.usage {
-                                        total_input_tokens = total_input_tokens
-                                            .saturating_add(usage.input_tokens);
-                                        total_output_tokens = total_output_tokens
-                                            .saturating_add(usage.output_tokens);
-                                        total_cache_creation_input_tokens =
-                                            total_cache_creation_input_tokens.saturating_add(
-                                                usage.cache_creation_input_tokens.unwrap_or(0),
-                                            );
-                                        total_cache_read_input_tokens = total_cache_read_input_tokens
-                                            .saturating_add(
-                                                usage.cache_read_input_tokens.unwrap_or(0),
-                                            );
-                                    }
-                                }
-                                if let Some(event) = parsed.event {
-                                    if let Ok(mut guard) = last_activity.lock() {
-                                        *guard = std::time::Instant::now();
-                                    }
-                                    if let AgentEvent::Error { ref message, .. } = event {
-                                        let mut guard = sse_error_message.lock().unwrap_or_else(|e| e.into_inner());
-                                        if guard.is_none() {
-                                            *guard = Some(message.clone());
-                                        }
-                                    }
-                                    if matches!(event, AgentEvent::Thinking { .. }) {
-                                        sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
-                                        // New thinking content arrived; reset done flag so this
-                                        // turn's thinking block will get its own done event.
-                                        sse_done_sent.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                    if matches!(event, AgentEvent::TextDelta { .. }) {
-                                        let _ = text_output_tx.send(true);
-                                        sse_emitted_text.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                    remember_tool_result_text(&event, &latest_tool_result_text);
-                                    let _ = events_tx.send(event);
-                                }
-                                for event in parsed.extra_events {
-                                    remember_tool_result_text(&event, &latest_tool_result_text);
-                                    let _ = events_tx.send(event);
-                                }
-                                if parsed.message_complete {
-                                    let _ = sse_complete_tx.send(true);
-                                    // Send thinking done signal if needed
-                                    if sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst)
-                                        && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst)
-                                    {
-                                        let _ = events_tx.send(AgentEvent::Thinking {
-                                            content: String::new(),
-                                            done: true,
-                                            mission_id: Some(mission_id),
-                                        });
-                                        sse_done_sent.store(true, std::sync::atomic::Ordering::SeqCst);
-                                    }
-                                    // Clear per-turn thinking buffers so each model turn
-                                    // gets its own thinking block in the UI.
-                                    // Note: sse_done_sent stays true here to prevent the
-                                    // end-of-session fallback from emitting a duplicate done
-                                    // event. It is reset to false when new thinking content
-                                    // arrives for the next turn (see AgentEvent::Thinking above).
-                                    state.part_buffers.retain(|k, _| {
-                                        !k.starts_with("thinking:") && !k.starts_with("reasoning:")
-                                    });
-                                    state.last_emitted_thinking = None;
-                                }
-                                if parsed.session_idle {
-                                    let _ = sse_session_idle_tx.send(true);
-                                }
-                                if parsed.session_retry {
-                                    sse_retry_tx.send_modify(|v| *v += 1);
-                                }
-                            }
-                            } // !skip_sse
-                        } else {
-                            // Non-JSON line - this is the expected output format without --format json
-                            tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode stdout");
-
-                            // Detect error lines from CLI stdout
-                            let lower = trimmed.to_lowercase();
-                            if lower.contains("session ended with error")
-                                || lower.contains("session.error")
-                            {
-                                had_error = true;
-                                if let Some(pos) = trimmed.find(": ") {
-                                    let err_part = trimmed[pos + 2..].trim();
-                                    if !err_part.is_empty() {
-                                        let mut guard = sse_error_message.lock().unwrap_or_else(|e| e.into_inner());
-                                        if guard.is_none() {
-                                            *guard = Some(err_part.to_string());
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Skip runner banner/status lines so they don't
-                            // pollute the model response (issues #147, #151).
-                            if is_opencode_banner_line(trimmed) {
-                                tracing::debug!(mission_id = %mission_id, line = %trimmed, "Skipping OpenCode banner line");
-                                continue;
-                            }
-
-                            final_result.push_str(trimmed);
-                            final_result.push('\n');
-                            let _ = text_output_tx.send(true);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Error reading from OpenCode CLI stdout: {}", e);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Wait for stderr task to complete (avoid hangs if the process won't exit)
-    if let Some(mut handle) = stderr_handle {
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                handle.abort();
-            }
-            _ = &mut handle => {}
-        }
-    }
-
-    // Wait for child process to finish and clean up (with timeout to avoid hangs)
-    let exit_status =
-        match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await {
-            Ok(status) => status,
-            Err(_) => {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "OpenCode CLI wait timed out; forcing shutdown"
-                );
-                let _ = child.kill().await;
-                had_error = true;
-                if final_result.is_empty() {
-                    final_result = "OpenCode CLI did not exit after completion".to_string();
-                }
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "OpenCode CLI wait timed out",
-                ))
-            }
-        };
-
-    sse_cancel.cancel();
-    if let Some(handle) = sse_handle {
-        handle.abort();
-        // Await the abort so the SSE task finishes any in-flight writes to
-        // sse_text_buffer before we read it in the fallback chain below.
-        let _ = handle.await;
-    }
-
-    let sse_error = sse_error_message
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let has_sse_error = sse_error.is_some();
-
-    // Check exit status.
-    // When we intentionally killed the process after seeing step_finish/completion
-    // (sse_complete_seen), don't treat the SIGKILL as an error — we have the response.
-    if let Ok(status) = exit_status {
-        if !status.success() && !sse_complete_seen {
-            had_error = true;
-            if opencode_output_needs_fallback(&final_result) {
-                if let Some(err_msg) = stderr_error_message.lock().unwrap().clone() {
-                    final_result = err_msg;
-                } else if let Ok(recent_lines) = stderr_recent_lines.lock() {
-                    if let Some(last_stderr) = summarize_recent_opencode_stderr(&recent_lines) {
-                        final_result = format!(
-                            "OpenCode CLI exited with status: {}. Last stderr: {}",
-                            status, last_stderr
-                        );
-                    } else {
-                        final_result = format!("OpenCode CLI exited with status: {}", status);
-                    }
-                } else {
-                    final_result = format!("OpenCode CLI exited with status: {}", status);
-                }
-                final_result_from_nonzero_exit = true;
-            }
-        }
-    }
-
-    // Surface SSE error messages (e.g. session.error) that were captured during streaming.
-    // These are high-confidence errors from the SSE stream and should block recovery.
-    if let Some(err_msg) = sse_error.as_ref() {
-        had_error = true;
-        if opencode_output_needs_fallback(&final_result) {
-            final_result = err_msg.clone();
-            final_result_from_nonzero_exit = false;
-        }
-    }
-
-    // Surface stderr-detected errors (e.g. JSON error payloads from provider).
-    // These are lower-confidence than SSE errors because the stderr detection
-    // uses broad pattern matching and can produce false positives.  They set
-    // had_error but do NOT write into sse_error_message, so recovery guards
-    // below can still clear had_error when valid content is recovered.
-    if !has_sse_error {
-        if let Some(err_msg) = stderr_error_message
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            had_error = true;
-            if opencode_output_needs_fallback(&final_result) {
-                final_result = err_msg;
-                final_result_from_nonzero_exit = false;
-            }
-        }
-    }
-
-    let session_id = session_id_capture
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let session_id = session_id.or_else(|| extract_opencode_session_id(&final_result));
-    let stored_message = session_id
-        .as_deref()
-        .and_then(|id| load_latest_opencode_assistant_message(workspace, id));
-
-    let mut recovered_from_stderr = false;
-    if opencode_output_needs_fallback(&final_result) {
-        if let Some(session_id) = session_id.as_deref() {
-            if let Some(message) = stored_message.as_ref() {
-                let text = strip_think_tags(&extract_text(&message.parts));
-                if !text.trim().is_empty() {
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        session_id = %session_id,
-                        text_len = text.len(),
-                        "Recovered OpenCode assistant output from storage"
-                    );
-                    final_result = text;
-                    final_result_from_nonzero_exit = false;
-                } else {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        session_id = %session_id,
-                        "OpenCode assistant output not found in storage"
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    session_id = %session_id,
-                    "OpenCode assistant output not found in storage"
-                );
-            }
-        } else {
-            tracing::warn!(
-                mission_id = %mission_id,
-                "OpenCode output was empty/banner-only and no session id was detected"
-            );
-        }
-    }
-
-    // SSE text buffer fallback: use the accumulated text from SSE TextDelta
-    // events. This is the most reliable source after stdout JSON and session
-    // storage because it contains exactly what was streamed to the dashboard,
-    // unlike stderr which truncates long content with "..." (fixes #158).
-    let mut recovered_from_sse = false;
-    if opencode_output_needs_fallback(&final_result) {
-        if let Ok(buffer) = sse_text_buffer.lock() {
-            if !buffer.trim().is_empty() {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    text_len = buffer.len(),
-                    "Recovered OpenCode assistant output from SSE text buffer"
-                );
-                final_result = buffer.clone();
-                recovered_from_sse = true;
-                final_result_from_nonzero_exit = false;
-            }
-        }
-    }
-
-    if opencode_output_needs_fallback(&final_result) {
-        if let Ok(buffer) = stderr_text_buffer.lock() {
-            if !buffer.trim().is_empty() {
-                final_result = buffer.clone();
-                recovered_from_stderr = true;
-                final_result_from_nonzero_exit = false;
-            }
-        }
-    }
-
-    // Only clear had_error from recovery if there is no real SSE error.
-    // Without this guard, a session.error followed by partial text in the
-    // SSE buffer would clear the error and return a truncated response.
-    if (recovered_from_sse || recovered_from_stderr) && !has_sse_error {
-        had_error = false;
-    }
-
-    // Clear had_error when we have real (non-banner) content and no SSE error.
-    // This avoids false failures when the CLI exited non-zero but produced real output.
-    if had_error
-        && !opencode_output_needs_fallback(&final_result)
-        && !has_sse_error
-        && !final_result_from_nonzero_exit
-    {
-        had_error = false;
-    }
-
-    // Strip inline <think>...</think> tags from final output (Minimax, DeepSeek, etc.)
-    final_result = strip_think_tags(&final_result);
-
-    // Final safeguard: reuse the same ANSI + banner sanitizer we employ for detection
-    // (fixes #151 - runner logs appearing in assistant message)
-    let cleaned_result = sanitized_opencode_stdout(&final_result);
-    if !cleaned_result.trim().is_empty() {
-        if let Cow::Owned(clean) = cleaned_result {
-            final_result = clean;
-        }
-    }
-
-    if let Ok(guard) = latest_tool_result_text.lock() {
-        if let Some(tool_output) = guard.as_deref() {
-            if let Some(repaired) =
-                replace_filepath_artifact_with_tool_output(&final_result, tool_output)
-            {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    "Replaced filepath-style OpenCode final output with latest tool result text"
-                );
-                final_result = repaired;
-            }
-        }
-    }
-
-    let mut emitted_thinking = false;
-    let sse_emitted = sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst);
-    if let Some(message) = stored_message.as_ref() {
-        if let Some(model) = message.model.clone() {
-            model_used = Some(model);
-        }
-        if !sse_emitted {
-            if let Some(reasoning) = extract_reasoning(&message.parts) {
-                let _ = events_tx.send(AgentEvent::Thinking {
-                    content: reasoning,
-                    done: false,
-                    mission_id: Some(mission_id),
-                });
-                emitted_thinking = true;
-            }
-        }
-    }
-
-    if emitted_thinking || (sse_emitted && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst))
-    {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: String::new(),
-            done: true,
-            mission_id: Some(mission_id),
-        });
-    }
-
-    // Check for banner-only output BEFORE emitting TextDelta to avoid
-    // sending runner logs as model response (fixes #151).
-    if !had_error && opencode_output_needs_fallback(&final_result) {
-        had_error = true;
-        final_result =
-            "OpenCode produced no assistant output (only runner status lines or empty). The model may not have responded.".to_string();
-    }
-
-    // Detect tool-call-only output: the model emitted tool calls but never
-    // produced a final text response. The JSON fragment should not be returned
-    // as assistant text — surface a clear error instead (fixes #148).
-    if !had_error && is_tool_call_only_output(&final_result) {
-        tracing::warn!(
-            mission_id = %mission_id,
-            result_preview = %final_result.chars().take(200).collect::<String>(),
-            "OpenCode output contains only tool-call JSON fragments with no assistant text"
-        );
-        had_error = true;
-        final_result =
-            "The model attempted tool calls but produced no final text response. This can happen when the model routing chain doesn't support tool execution.".to_string();
-    }
-
-    // Only emit TextDelta if we have actual (non-banner) content and no SSE text was emitted.
-    // This avoids sending runner logs as model response.
-    if !sse_emitted_text.load(std::sync::atomic::Ordering::SeqCst)
-        && !final_result.trim().is_empty()
-        && !had_error
-    {
-        let _ = events_tx.send(AgentEvent::TextDelta {
-            content: final_result.clone(),
-            mission_id: Some(mission_id),
-        });
-    }
-
-    // A timeout-killed OpenCode process is not a successful turn, even when it
-    // emitted partial text first. Returning partial text as TurnComplete caused
-    // Telegram to send "Je m'en occupe" followed by a warning while the actual
-    // tool-backed work never finished.
-    if killed_by_idle_timeout {
-        tracing::warn!(
-            mission_id = %mission_id,
-            result_len = final_result.len(),
-            "OpenCode idle timeout killed process; marking turn as stalled"
-        );
-        had_error = true;
-        final_result = opencode_idle_timeout_result_message(&final_result);
-    }
-
-    tracing::info!(
-        mission_id = %mission_id,
-        had_error = had_error,
-        result_len = final_result.len(),
-        "OpenCode CLI execution completed"
-    );
-
-    if let Some(objective) = opencode_goal_objective.as_deref() {
-        if let Some(status) = opencode_goal_terminal_status(&final_result) {
-            let _ = events_tx.send(AgentEvent::GoalStatus {
-                status: status.to_string(),
-                objective: objective.to_string(),
-                mission_id: Some(mission_id),
-            });
-        }
-    }
-
-    let mut result = if had_error {
-        // Use RateLimited terminal reason when rate limit was detected
-        let reason = if rate_limit_detected.load(std::sync::atomic::Ordering::SeqCst) {
-            TerminalReason::RateLimited
-        } else if killed_by_idle_timeout {
-            TerminalReason::Stalled
-        } else {
-            TerminalReason::LlmError
-        };
-        AgentResult::failure(final_result, 0).with_terminal_reason(reason)
-    } else {
-        AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::TurnComplete)
-    };
-    let success_signal = if sse_complete_seen {
-        CompletionSignal::NativeTerminal
-    } else if session_idle_seen {
-        CompletionSignal::SessionIdle
-    } else {
-        CompletionSignal::ProcessExit
-    };
-    let success_confidence = if sse_complete_seen {
-        CompletionConfidence::High
-    } else if session_idle_seen {
-        CompletionConfidence::Medium
-    } else {
-        CompletionConfidence::Low
-    };
-    let outcome = turn_outcome_for_result(&result, success_signal, success_confidence);
-    result = result.with_turn_outcome(outcome);
-    if model_used.is_none() {
-        if let Some(model) = resolved_model.as_deref() {
-            if !model.starts_with("builtin/") {
-                model_used = Some(model.to_string());
-            }
-        }
-    }
-
-    // Compute cost from accumulated token usage and model (if available)
-    if total_input_tokens > 0
-        || total_output_tokens > 0
-        || total_cache_creation_input_tokens > 0
-        || total_cache_read_input_tokens > 0
-    {
-        let usage = crate::cost::TokenUsage {
-            input_tokens: total_input_tokens,
-            output_tokens: total_output_tokens,
-            cache_creation_input_tokens: (total_cache_creation_input_tokens > 0)
-                .then_some(total_cache_creation_input_tokens),
-            cache_read_input_tokens: (total_cache_read_input_tokens > 0)
-                .then_some(total_cache_read_input_tokens),
-        };
-        let (cost_cents, cost_source) =
-            resolve_cost_cents_and_source(None, model_used.as_deref(), &usage);
-        result.cost_cents = cost_cents;
-        result.cost_source = cost_source;
-        result = result.with_usage(usage);
-        tracing::info!(
-            mission_id = %mission_id,
-            input_tokens = total_input_tokens,
-            output_tokens = total_output_tokens,
-            cost_cents = cost_cents,
-            cost_source = ?cost_source,
-            model = ?model_used,
-            "OpenCode turn cost resolved from SSE usage"
-        );
-    }
-
-    if let Some(model) = model_used {
-        result = result.with_model(model);
-    }
-
-    // Clean up the temp prompt file (best-effort; the workspace may clean it later)
-    let _ = std::fs::remove_file(&prompt_file_host);
-
-    result
-}
-
-fn grok_event_is_reasoning_type(value: &serde_json::Value) -> bool {
-    value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
-        let lower = t.to_ascii_lowercase();
-        lower == "reasoning" || lower == "thinking" || lower == "reasoning_delta"
-    })
-}
-
-fn grok_event_text(value: &serde_json::Value) -> Option<String> {
-    if grok_event_is_reasoning_type(value) {
-        return None;
-    }
-
-    if let Some(text) = value
-        .get("delta")
-        .and_then(|delta| delta.get("text").or_else(|| delta.get("content")))
-        .and_then(|v| v.as_str())
-    {
-        return Some(text.to_string());
-    }
-
-    if value
-        .get("type")
-        .and_then(|v| v.as_str())
-        .is_some_and(|t| t.eq_ignore_ascii_case("text"))
-    {
-        if let Some(text) = value.get("data").and_then(|v| v.as_str()) {
-            return Some(text.to_string());
-        }
-    }
-
-    if let Some(content) = value.get("content") {
-        if let Some(text) = content.as_str() {
-            return Some(text.to_string());
-        }
-        if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
-            return Some(text.to_string());
-        }
-    }
-
-    if let Some(text) = value.get("message").and_then(|message| {
-        message.as_str().map(str::to_string).or_else(|| {
-            message.get("content").and_then(|content| {
-                content.as_str().map(str::to_string).or_else(|| {
-                    content.as_array().map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                })
-            })
-        })
-    }) {
-        if !text.is_empty() {
-            return Some(text);
-        }
-    }
-
-    for key in ["text", "answer", "result", "output"] {
-        if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
-            return Some(text.to_string());
-        }
-    }
-
-    None
-}
-
-/// Extract Grok / xAI reasoning text from a streamed JSONL event.
-///
-/// The Grok Build CLI mostly mirrors the xAI Chat Completions stream, which
-/// puts chain-of-thought in `delta.reasoning_content` (some builds) or
-/// `delta.reasoning` (others), and sometimes wraps it as a typed event
-/// (`type: "reasoning" | "thinking"` with `data` or `text`). Field name
-/// discovery is conservative — return None if no known key is present so a
-/// CLI version bump doesn't accidentally show user-visible noise as
-/// reasoning.
-fn grok_event_reasoning(value: &serde_json::Value) -> Option<String> {
-    let is_reasoning_type = grok_event_is_reasoning_type(value);
-
-    if let Some(delta) = value.get("delta") {
-        for key in ["reasoning_content", "reasoning", "thinking"] {
-            if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    return Some(text.to_string());
-                }
-            }
-        }
-        if is_reasoning_type {
-            for key in ["text", "content"] {
-                if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        return Some(text.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    if is_reasoning_type {
-        for key in ["data", "text", "content", "reasoning"] {
-            if let Some(text) = value.get(key).and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    return Some(text.to_string());
-                }
-            }
-        }
-    }
-
-    if let Some(text) = value
-        .get("message")
-        .and_then(|m| m.get("reasoning_content").or_else(|| m.get("reasoning")))
-        .and_then(|v| v.as_str())
-    {
-        if !text.is_empty() {
-            return Some(text.to_string());
-        }
-    }
-
-    None
-}
-
-fn grok_event_session_id(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("session_id")
-        .or_else(|| value.get("sessionId"))
-        .or_else(|| value.get("session").and_then(|session| session.get("id")))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string())
-}
-
-fn grok_event_model(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("model")
-        .or_else(|| {
-            value
-                .get("message")
-                .and_then(|message| message.get("model"))
-        })
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string())
-}
-
-fn usage_value_tokens(value: &serde_json::Value, keys: &[&str]) -> u64 {
+pub(crate) fn usage_value_tokens(value: &serde_json::Value, keys: &[&str]) -> u64 {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(|v| v.as_u64()))
         .unwrap_or(0)
 }
 
-fn nested_usage_value_tokens(value: &serde_json::Value, path: &[&str]) -> u64 {
+pub(crate) fn nested_usage_value_tokens(value: &serde_json::Value, path: &[&str]) -> u64 {
     let mut current = value;
     for key in path {
         current = match current.get(*key) {
@@ -12278,80 +7583,6 @@ fn opencode_usage_from_value(usage: &serde_json::Value) -> Option<crate::cost::T
     token_usage.has_usage().then_some(token_usage)
 }
 
-fn grok_event_usage(value: &serde_json::Value) -> Option<crate::cost::TokenUsage> {
-    let usage = value
-        .get("usage")
-        .or_else(|| value.get("tokenUsage"))
-        .or_else(|| value.get("token_usage"))
-        .or_else(|| value.get("response").and_then(|r| r.get("usage")))
-        .or_else(|| value.get("message").and_then(|m| m.get("usage")))?;
-
-    let raw_input_tokens = usage_value_tokens(
-        usage,
-        &[
-            "input_tokens",
-            "inputTokens",
-            "prompt_tokens",
-            "promptTokens",
-        ],
-    );
-    let output_tokens = usage_value_tokens(
-        usage,
-        &[
-            "output_tokens",
-            "outputTokens",
-            "completion_tokens",
-            "completionTokens",
-        ],
-    );
-    let cache_creation_tokens = usage_value_tokens(
-        usage,
-        &[
-            "cache_creation_input_tokens",
-            "cacheCreationInputTokens",
-            "cache_write_input_tokens",
-            "cacheWriteInputTokens",
-        ],
-    );
-    let explicit_cache_read_tokens = usage_value_tokens(
-        usage,
-        &[
-            "cache_read_input_tokens",
-            "cacheReadInputTokens",
-            "cached_tokens",
-            "cachedTokens",
-        ],
-    );
-    let nested_cached_tokens =
-        nested_usage_value_tokens(usage, &["input_tokens_details", "cached_tokens"])
-            .saturating_add(nested_usage_value_tokens(
-                usage,
-                &["prompt_tokens_details", "cached_tokens"],
-            ));
-    let cache_read_tokens = explicit_cache_read_tokens.saturating_add(nested_cached_tokens);
-    // xAI/OpenAI-compatible usage reports usually include cached prompt
-    // tokens inside the prompt/input total. Internally we store billable
-    // non-cached input separately from discounted cache-read input, so the
-    // two buckets can be summed for display without double counting and
-    // priced at their respective rates.
-    let input_tokens = raw_input_tokens.saturating_sub(cache_read_tokens);
-    let token_usage = crate::cost::TokenUsage {
-        input_tokens,
-        output_tokens,
-        cache_creation_input_tokens: Some(cache_creation_tokens),
-        cache_read_input_tokens: Some(cache_read_tokens),
-    };
-    token_usage.has_usage().then_some(token_usage)
-}
-
-fn grok_event_is_error(value: &serde_json::Value) -> bool {
-    value
-        .get("type")
-        .and_then(|v| v.as_str())
-        .is_some_and(|t| t.eq_ignore_ascii_case("error"))
-        || value.get("error").is_some()
-}
-
 /// P3-#21 text_delta rate limiter.
 ///
 /// Streaming backends (grok, codex) emit a fresh cumulative-buffer
@@ -12364,16 +7595,16 @@ fn grok_event_is_error(value: &serde_json::Value) -> bool {
 ///
 /// Caller must perform a final unconditional emit after the loop to
 /// guarantee the last buffer state reaches the dashboard.
-struct TextDeltaCoalescer {
+pub(crate) struct TextDeltaCoalescer {
     last_emit: Option<std::time::Instant>,
 }
 
 impl TextDeltaCoalescer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { last_emit: None }
     }
 
-    fn should_emit(&mut self) -> bool {
+    pub(crate) fn should_emit(&mut self) -> bool {
         const MIN_GAP: std::time::Duration = std::time::Duration::from_millis(50);
         let now = std::time::Instant::now();
         match self.last_emit {
@@ -12406,7 +7637,7 @@ fn suffix_prefix_overlap_len(existing: &str, incoming: &str) -> usize {
     0
 }
 
-fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
+pub(crate) fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
     if fragment.is_empty() {
         return;
     }
@@ -12422,488 +7653,114 @@ fn merge_stream_fragment(buffer: &mut String, fragment: &str) {
     buffer.push_str(&fragment[overlap..]);
 }
 
-/// Detect the Grok CLI's interactive sign-in prompt. The CLI prints these to
-/// stderr when it can't authenticate non-interactively, then blocks on a local
-/// OAuth callback that never arrives in a headless mission. Matching any of
-/// these lets the runner fail fast instead of hanging.
-fn grok_line_requests_interactive_login(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("signing in with grok")
-        || lower.contains("open this url to sign in")
-        || lower.contains("oauth2/authorize")
-}
-
-fn grok_stdout_line_requests_interactive_login(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line).is_err()
-        && grok_line_requests_interactive_login(line)
-}
-
-/// Execute a turn using the Grok Build CLI backend.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_grok_turn(
-    workspace: &Workspace,
-    work_dir: &std::path::Path,
-    message: &str,
-    model: Option<&str>,
-    mission_id: Uuid,
-    events_tx: broadcast::Sender<AgentEvent>,
-    cancel: CancellationToken,
-    app_working_dir: &std::path::Path,
-    session_id: Option<&str>,
-    is_continuation: bool,
-) -> AgentResult {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
-    let cli_path =
-        get_backend_string_setting("grok", "cli_path").unwrap_or_else(|| "grok".to_string());
-    let cli_path = match ensure_grok_cli_available(&workspace_exec, work_dir, &cli_path).await {
-        Ok(cli_path) => cli_path,
-        Err(err_msg) => {
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    let mut args = Vec::new();
-    // Use `-s/--session-id` for both first-turn and continuation when we
-    // already have a session id from the mission store. Per grok headless
-    // docs, `--session-id` has upsert semantics — loads the session if it
-    // exists, creates one with that id otherwise — so it self-heals the
-    // "orphan session" case where the first turn failed before grok could
-    // persist the session and `--resume <sid>` would error with "Session
-    // does not exist". `--resume` is strict-existence-only; we only fall
-    // through to `--continue` when we have no session id at all.
-    if let Some(sid) = session_id {
-        args.push("--session-id".to_string());
-        args.push(sid.to_string());
-    } else if is_continuation {
-        args.push("--continue".to_string());
+/// Returns true if the streamed text in `accumulated` shows the same
+/// substring repeated at least `min_repeats` times in the last `window_chars`
+/// of content, where each repetition is at least `min_substring_len` characters
+/// long. Used by the degenerate-stream detector in `run_claudecode_turn` to
+/// short-circuit a model that has entered a tight "Yielding pending your
+/// choice." / "..." loop and will not emit a terminal result on its own.
+///
+/// This is intentionally conservative: a short repeated string is normal in
+/// list-style answers (e.g. "yes, yes, yes"), and so is a long literal-text
+/// quote (e.g. an LLM echoing a paragraph from a file). We only flag a
+/// substring that (a) is long enough, (b) repeats enough times, AND
+/// (c) contains at least two distinct substantive words (length >= 4) so
+/// the loop is on a meaningful phrase rather than on a single short token.
+/// Callers are also expected to gate the call on a minimum elapsed
+/// streaming duration.
+pub(crate) fn text_buffer_stream_looks_degenerate(
+    accumulated: &str,
+    window_chars: usize,
+    min_substring_len: usize,
+    min_repeats: usize,
+) -> bool {
+    if min_substring_len == 0 || min_repeats < 2 || window_chars == 0 {
+        return false;
     }
-    args.push("-p".to_string());
-    args.push(message.to_string());
-    args.push("--output-format".to_string());
-    args.push("streaming-json".to_string());
-    args.push("--always-approve".to_string());
-    args.push("--cwd".to_string());
-    args.push(workspace_exec.translate_path_for_container(work_dir));
-    if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
-        args.push("--model".to_string());
-        args.push(model.to_string());
+    let chars: Vec<char> = accumulated.chars().collect();
+    if chars.len() < min_substring_len.saturating_mul(min_repeats) {
+        return false;
     }
+    let window_end = chars.len();
+    let window_start = window_end.saturating_sub(window_chars);
+    let window = &chars[window_start..window_end];
 
-    // The Grok CLI authenticates non-interactively via the XAI_API_KEY env var.
-    // The xAI OAuth access token works as a bearer key against api.x.ai, so we
-    // capture the freshest one here and inject it below. Without it the CLI
-    // falls back to an interactive browser sign-in that never completes in a
-    // headless mission — the run then hangs forever ("Agent is working").
-    let mut oauth_access_token: Option<String> = None;
-    if let Some(entry) =
-        crate::api::ai_providers::read_oauth_token_entry(crate::ai_providers::ProviderType::Xai)
-    {
-        if crate::api::ai_providers::oauth_token_expired(entry.expires_at) {
-            match crate::api::ai_providers::refresh_oauth_token_with_lock(
-                crate::ai_providers::ProviderType::Xai,
-                entry.expires_at,
-            )
-            .await
-            {
-                Ok((access, _refresh, expires_at)) => {
-                    oauth_access_token = Some(access);
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        expires_at,
-                        "Refreshed xAI OAuth token before starting Grok Build"
-                    );
-                }
-                Err(crate::api::ai_providers::OAuthRefreshError::InvalidGrant(err)) => {
-                    return AgentResult::failure(
-                        format!(
-                            "Grok Build xAI OAuth refresh token is expired or revoked. Reconnect the xAI provider, then retry the mission. {}",
-                            err
-                        ),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
-                }
-                Err(err) => {
-                    return AgentResult::failure(
-                        format!(
-                            "Failed to refresh xAI OAuth before starting Grok Build: {}",
-                            err
-                        ),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::LlmError);
-                }
-            }
-        } else {
-            oauth_access_token = Some(entry.access_token.clone());
-            if let Err(err) = crate::api::ai_providers::write_grok_oauth_auth_file(
-                &entry.refresh_token,
-                &entry.access_token,
-                entry.expires_at,
-            ) {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    error = %err,
-                    "Failed to materialize fresh xAI OAuth token into Grok auth file"
-                );
-            }
-        }
-    }
-
-    if let Err(err) = sync_grok_oauth_auth_file(&workspace_exec, work_dir).await {
-        tracing::warn!(mission_id = %mission_id, error = %err, "Failed to sync Grok OAuth auth file");
-    }
-
-    // Authenticate the Grok CLI non-interactively via XAI_API_KEY. Priority:
-    // an explicit xAI API key, then the captured OAuth access token, then any
-    // ambient env key. Setting this is what prevents the interactive-sign-in
-    // hang; the CLI prints "You are using XAI_API_KEY" and goes straight to
-    // api.x.ai.
-    let mut env = HashMap::new();
-    let xai_api_key = crate::api::ai_providers::get_xai_api_key_for_grok(app_working_dir)
-        .or_else(|| oauth_access_token.clone())
-        .or_else(|| {
-            std::env::var("XAI_API_KEY")
-                .ok()
-                .filter(|k| !k.trim().is_empty())
-        })
-        .or_else(|| {
-            std::env::var("GROK_CODE_XAI_API_KEY")
-                .ok()
-                .filter(|k| !k.trim().is_empty())
-        });
-    if let Some(key) = xai_api_key {
-        // Newer Grok CLIs read XAI_API_KEY; keep GROK_CODE_XAI_API_KEY for
-        // backward compatibility with older builds.
-        env.insert("XAI_API_KEY".to_string(), key.clone());
-        env.insert("GROK_CODE_XAI_API_KEY".to_string(), key);
-    }
-
-    let mut child = match workspace_exec
-        .spawn_streaming(work_dir, &cli_path, &args, env)
-        .await
-    {
-        Ok(child) => child,
-        Err(e) => {
-            return AgentResult::failure(format!("Failed to start Grok Build CLI: {}", e), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-    drop(child.stdin.take());
-
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            return AgentResult::failure("Failed to capture Grok stdout".to_string(), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-    let stderr = child.stderr.take();
-    let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-    let stderr_capture_clone = stderr_capture.clone();
-    // The Grok CLI prints its interactive sign-in prompt to STDERR, then blocks
-    // on a local OAuth callback. Watch for it here and signal the main loop to
-    // abort so the mission fails fast instead of hanging forever.
-    let auth_fail = CancellationToken::new();
-    let auth_fail_signal = auth_fail.clone();
-    let mut stderr_handle = stderr.map(|stderr| {
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if grok_line_requests_interactive_login(trimmed) {
-                    auth_fail_signal.cancel();
-                }
-                let mut captured = stderr_capture_clone.lock().await;
-                if !captured.is_empty() {
-                    captured.push('\n');
-                }
-                captured.push_str(trimmed);
-            }
-        })
-    });
-
-    let mut final_result = String::new();
-    let mut had_error = false;
-    let mut model_used = model.map(str::to_string);
-    let mut last_streamed_len = 0usize;
-    let mut text_delta_coalescer = TextDeltaCoalescer::new();
-    let mut token_usage = crate::cost::TokenUsage::default();
-    // Accumulate Grok's reasoning deltas into a cumulative buffer and
-    // throttle Thinking emissions the same way text deltas are throttled.
-    // Grok's CLI delivers reasoning as incremental tokens, mirroring the
-    // text path.
-    let mut reasoning_buffer = String::new();
-    let mut last_reasoning_len = 0usize;
-    let mut reasoning_delta_coalescer = TextDeltaCoalescer::new();
-    let reader = BufReader::new(stdout);
-    let mut lines = reader.lines();
-    let mut cancelled = false;
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                let _ = child.kill().await;
-                if let Some(handle) = stderr_handle.take() {
-                    handle.abort();
-                }
-                cancelled = true;
+    // Walk every starting offset in the window. For each offset, try
+    // candidate substring lengths in `min_substring_len..=2*min_substring_len`
+    // (anything longer would have been broken up by the LLM streaming
+    // cadence). Count non-overlapping occurrences; if we find >= min_repeats
+    // we have a degenerate loop.
+    //
+    // To keep this O(window_chars * substring_len_max) per delta we cap the
+    // candidate substring length at 256 and bail out early once we have a hit.
+    let max_candidate_len = min_substring_len.saturating_mul(2).min(256);
+    for start in 0..window.len().saturating_sub(min_substring_len) {
+        for len in min_substring_len..=max_candidate_len {
+            if start + len > window.len() {
                 break;
             }
-            _ = auth_fail.cancelled() => {
-                // Grok CLI emitted an interactive sign-in prompt (it can't
-                // authenticate non-interactively). Kill it and fail fast.
-                let _ = child.kill().await;
-                if let Some(handle) = stderr_handle.take() {
-                    handle.abort();
-                }
-                return AgentResult::failure(
-                    "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
-                    0,
-                )
-                .with_terminal_reason(TerminalReason::LlmError);
+            let needle: String = window[start..start + len].iter().collect();
+            // Skip "noise" candidates that are mostly whitespace or a single
+            // character repeated (e.g. "----").
+            if !needle.chars().any(|c| c.is_alphanumeric()) {
+                continue;
             }
-            line_result = lines.next_line() => {
-                match line_result {
-                    Ok(Some(line)) => {
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        let value: serde_json::Value = match serde_json::from_str(&line) {
-                            Ok(value) => value,
-                            Err(_) => {
-                                // Fail fast on raw interactive sign-in prompts.
-                                // Valid streaming-json events may contain these
-                                // substrings as assistant/tool text, so only
-                                // inspect stdout after JSON parsing fails.
-                                if grok_stdout_line_requests_interactive_login(&line) {
-                                    let _ = child.kill().await;
-                                    if let Some(handle) = stderr_handle.take() {
-                                        handle.abort();
-                                    }
-                                    return AgentResult::failure(
-                                        "Grok Build could not authenticate non-interactively (the CLI requested a browser sign-in). Reconnect the xAI / Grok Build provider in Settings → Providers, then retry the mission.".to_string(),
-                                        0,
-                                    )
-                                    .with_terminal_reason(TerminalReason::LlmError);
-                                }
-                                if final_result.is_empty() {
-                                    final_result.push_str(&line);
-                                } else {
-                                    final_result.push('\n');
-                                    final_result.push_str(&line);
-                                }
-                                continue;
-                            }
-                        };
-                        if let Some(sid) = grok_event_session_id(&value) {
-                            let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                                session_id: sid,
-                                mission_id,
-                            });
-                        }
-                        if model_used.is_none() {
-                            model_used = grok_event_model(&value);
-                        }
-                        if let Some(usage) = grok_event_usage(&value) {
-                            token_usage.input_tokens =
-                                token_usage.input_tokens.max(usage.input_tokens);
-                            token_usage.output_tokens =
-                                token_usage.output_tokens.max(usage.output_tokens);
-                            token_usage.cache_creation_input_tokens = Some(
-                                token_usage
-                                    .cache_creation_input_tokens
-                                    .unwrap_or(0)
-                                    .max(usage.cache_creation_input_tokens.unwrap_or(0)),
-                            );
-                            token_usage.cache_read_input_tokens = Some(
-                                token_usage
-                                    .cache_read_input_tokens
-                                    .unwrap_or(0)
-                                    .max(usage.cache_read_input_tokens.unwrap_or(0)),
-                            );
-                        }
-                        if grok_event_is_error(&value) {
-                            had_error = true;
-                            if let Some(text) = grok_event_text(&value) {
-                                final_result = text;
-                            } else {
-                                final_result = value.to_string();
-                            }
-                            continue;
-                        }
-                        if let Some(reasoning) = grok_event_reasoning(&value) {
-                            if !reasoning.is_empty() {
-                                merge_stream_fragment(&mut reasoning_buffer, &reasoning);
-                                // Mirror the TextDelta coalescing strategy:
-                                // emit cumulative snapshots throttled to ~50ms.
-                                if reasoning_buffer.len() > last_reasoning_len
-                                    && reasoning_delta_coalescer.should_emit()
-                                {
-                                    last_reasoning_len = reasoning_buffer.len();
-                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                        content: reasoning_buffer.clone(),
-                                        done: false,
-                                        mission_id: Some(mission_id),
-                                    });
-                                }
-                            }
-                        }
-                        if let Some(text) = grok_event_text(&value) {
-                            if !text.is_empty() {
-                                // The first non-reasoning content marks the
-                                // boundary between thinking and answer; flush
-                                // a final Thinking { done: true } so the
-                                // dashboard collapses the reasoning panel
-                                // before streaming text deltas.
-                                if !reasoning_buffer.is_empty() {
-                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                        content: std::mem::take(&mut reasoning_buffer),
-                                        done: true,
-                                        mission_id: Some(mission_id),
-                                    });
-                                    last_reasoning_len = 0;
-                                }
-                                if value
-                                    .get("delta")
-                                    .is_some()
-                                    || value.get("type").and_then(|v| v.as_str()).is_some_and(|t| {
-                                    t.contains("delta") || t.contains("chunk") || t == "text"
-                                    })
-                                {
-                                    merge_stream_fragment(&mut final_result, &text);
-                                } else {
-                                    final_result = text;
-                                }
-                                // P3-#21: rate-limit TextDelta emissions
-                                // to at most one per ~50ms per turn. Grok
-                                // bursts can hit ~100 tokens/sec; without
-                                // this every token becomes its own SSE
-                                // frame even though the dashboard rAF
-                                // coalesces them into a single render.
-                                // The cumulative-buffer semantics mean
-                                // skipping intermediate frames loses no
-                                // content — each emit replaces the prior.
-                                if final_result.len() > last_streamed_len
-                                    && text_delta_coalescer.should_emit()
-                                {
-                                    last_streamed_len = final_result.len();
-                                    let _ = events_tx.send(AgentEvent::TextDelta {
-                                        content: final_result.clone(),
-                                        mission_id: Some(mission_id),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        had_error = true;
-                        final_result = format!("Error reading Grok stdout: {}", e);
-                        break;
-                    }
+            // Skip single-token loops (e.g. "yes, yes, yes" or
+            // "ok. ok. ok."). Require the substring to contain at least
+            // two distinct "substantive" words (length >= 4, alphabetic).
+            // This is the key differentiator between a legitimate
+            // short-token echo and a model that has lost the plot on a
+            // meaningful phrase.
+            let distinct_substantive = count_distinct_substantive_words(&needle);
+            if distinct_substantive < 2 {
+                continue;
+            }
+            let mut count = 0usize;
+            let mut idx = 0usize;
+            while let Some(found) = find_subslice(window, &needle, idx) {
+                count += 1;
+                if count >= min_repeats {
+                    return true;
                 }
+                idx = found + 1;
             }
         }
     }
+    false
+}
 
-    let exit_status = child.wait().await;
-    if let Some(handle) = stderr_handle {
-        let _ = handle.await;
-    }
-
-    // P3-#21 final flush: the coalescer may have dropped the very last
-    // delta within the trailing 50ms window. Always emit one more
-    // TextDelta carrying the full buffer so the dashboard sees the
-    // closing tokens; the AssistantMessage that follows will replace it.
-    if final_result.len() > last_streamed_len {
-        let _ = events_tx.send(AgentEvent::TextDelta {
-            content: final_result.clone(),
-            mission_id: Some(mission_id),
-        });
-        last_streamed_len = final_result.len();
-    }
-    let _ = last_streamed_len; // silence "unused after final assignment"
-
-    let reasoning_for_fallback = if reasoning_buffer.trim().is_empty() {
-        None
-    } else {
-        Some(reasoning_buffer.clone())
-    };
-
-    // Flush any remaining reasoning that never got followed by a text
-    // delta (e.g., reasoning-only turns or the trailing coalescer window).
-    // Emit done: true so the dashboard finalizes the thinking block in the
-    // event store.
-    if !reasoning_buffer.is_empty() {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: std::mem::take(&mut reasoning_buffer),
-            done: true,
-            mission_id: Some(mission_id),
-        });
-    }
-    let _ = last_reasoning_len;
-
-    let cancel_marker = if cancelled {
-        Some(cancel_or_shutdown_failure())
-    } else {
-        None
-    };
-
-    if final_result.trim().is_empty() {
-        let stderr_content = stderr_capture.lock().await;
-        if let Some(reasoning) = reasoning_for_fallback {
-            final_result = reasoning;
-        } else if let Some(marker) = cancel_marker.as_ref() {
-            final_result = marker.output.clone();
-        } else if !stderr_content.trim().is_empty() {
-            final_result = format!(
-                "Grok Build error: {}",
-                stderr_content
-                    .lines()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            );
-            had_error = true;
-        } else {
-            final_result = "Grok Build produced no output. Run `grok login` or configure an xAI provider for Grok Build.".to_string();
-            had_error = true;
+/// Count distinct "substantive" words in `s`: tokens that are at least 4
+/// characters long and made up of letters/digits. Used to differentiate a
+/// meaningful phrase like "Yielding pending your choice" (4 substantive
+/// words) from a single-token echo like "yes, yes, yes" (1 word) or
+/// "ok. ok. ok." (1 word).
+fn count_distinct_substantive_words(s: &str) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for token in s.split(|c: char| !c.is_alphanumeric()) {
+        if token.chars().count() >= 4 {
+            seen.insert(token.to_ascii_lowercase());
         }
     }
+    seen.len()
+}
 
-    let success = exit_status.map(|status| status.success()).unwrap_or(false) && !had_error;
-    let model_for_cost = model_used.as_deref().or(Some("grok-build"));
-    let (cost_cents, cost_source) =
-        resolve_cost_cents_and_source(None, model_for_cost, &token_usage);
-    let mut result = if success {
-        AgentResult::success(final_result, cost_cents)
-            .with_cost_source(cost_source)
-            .with_terminal_reason(TerminalReason::TurnComplete)
-    } else if let Some(marker) = cancel_marker {
-        AgentResult::failure(final_result, cost_cents)
-            .with_cost_source(cost_source)
-            .with_terminal_reason(marker.terminal_reason.unwrap_or(TerminalReason::Cancelled))
-    } else {
-        AgentResult::failure(final_result, cost_cents)
-            .with_cost_source(cost_source)
-            .with_terminal_reason(TerminalReason::LlmError)
-    };
-    let success_signal = CompletionSignal::ProcessExit;
-    let success_confidence = CompletionConfidence::Low;
-    let outcome = turn_outcome_for_result(&result, success_signal, success_confidence);
-    result = result.with_turn_outcome(outcome);
-    if token_usage.has_usage() {
-        result = result.with_usage(token_usage);
+/// Find the next index in `haystack` (a Vec<char>) that begins a run equal to
+/// `needle`, starting the search at `from`. Avoids allocating a substring per
+/// comparison by indexing through `chars`.
+fn find_subslice(haystack: &[char], needle: &str, from: usize) -> Option<usize> {
+    let needle_chars: Vec<char> = needle.chars().collect();
+    if needle_chars.is_empty() || from + needle_chars.len() > haystack.len() {
+        return None;
     }
-    result = result.with_model(model_used.unwrap_or_else(|| "grok-build".to_string()));
-    result
+    'outer: for i in from..=haystack.len() - needle_chars.len() {
+        for j in 0..needle_chars.len() {
+            if haystack[i + j] != needle_chars[j] {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
 }
 
 /// Compact info about a running mission (for API responses).
@@ -12953,1557 +7810,6 @@ impl From<&MissionRunner> for RunningMissionInfo {
             subtask_completed: runner.subtasks.iter().filter(|s| s.completed).count(),
         }
     }
-}
-
-fn codex_turn_requires_tool_activity(user_message: &str, assistant_message: &str) -> bool {
-    let user_request = current_user_request_for_tool_activity(user_message);
-    let user = user_request.to_ascii_lowercase();
-    let assistant = assistant_message.trim().to_ascii_lowercase();
-
-    let deferred_action_prefixes = [
-        "i'll perform",
-        "i’ll perform",
-        "i will perform",
-        "i'll run",
-        "i’ll run",
-        "i will run",
-        "i'll execute",
-        "i’ll execute",
-        "i will execute",
-        "i'll create",
-        "i’ll create",
-        "i will create",
-        "i'll inspect",
-        "i’ll inspect",
-        "i will inspect",
-        "i'll review",
-        "i’ll review",
-        "i will review",
-    ];
-    if deferred_action_prefixes
-        .iter()
-        .any(|prefix| assistant.starts_with(prefix))
-    {
-        return true;
-    }
-
-    // Advisory prompts ("how do I run tests?", "explain what cargo does")
-    // contain verbs like "run" or "test" but don't ask us to execute them.
-    // If we classified those as tool-required, a perfectly good text-only
-    // answer from Codex would get converted into a `Stalled` failure.
-    //
-    // Mixed prompts like "How do I run these tests? Please run them and
-    // fix failures." still request execution; the advisory heuristic
-    // must not bypass the imperative half. Only short-circuit when no
-    // explicit imperative follow-up is present.
-    if user_looks_advisory(&user) && !user_has_imperative_execution_request(&user) {
-        return false;
-    }
-
-    let explicit_tool_markers = [
-        "```bash",
-        "shell command",
-        "using shell",
-        "run ",
-        " run ",
-        "execute ",
-        " execute ",
-        "test ",
-        " test ",
-        "debug ",
-        " debug ",
-        "fix ",
-        " fix ",
-        "implement ",
-        " implement ",
-        "edit ",
-        " edit ",
-        "modify ",
-        " modify ",
-        "inspect ",
-        " inspect ",
-        "search ",
-        " search ",
-        " grep ",
-        " rg ",
-        " ls ",
-        " cat ",
-        " wc ",
-        " curl ",
-        " git ",
-        " npm ",
-        " bun ",
-        " cargo ",
-        " python ",
-        " pytest ",
-    ];
-    if explicit_tool_markers
-        .iter()
-        .any(|marker| user.contains(marker))
-    {
-        return true;
-    }
-
-    let action_markers = [
-        "create", "write", "read", "open", "access", "review", "inspect", "check", "update",
-        "change", "debug", "fix",
-    ];
-    let object_markers = [
-        " file",
-        " files",
-        " directory",
-        " folder",
-        " workspace",
-        " pull request",
-        " pr #",
-        " github.com/",
-        ".rs",
-        ".ts",
-        ".tsx",
-        ".js",
-        ".json",
-        ".toml",
-        ".md",
-        ".pdf",
-        "http://",
-        "https://",
-        "localhost",
-    ];
-
-    action_markers
-        .iter()
-        .any(|action| contains_ascii_word(&user, action))
-        && object_markers.iter().any(|object| user.contains(object))
-}
-
-fn codex_is_goal_request(user_message: &str) -> bool {
-    user_message.trim_start().starts_with("/goal ")
-}
-
-fn codex_missing_goal_final_response_message() -> String {
-    "Goal completed, but Codex did not emit a final assistant response. The last reasoning block was captured in the thinking panel, but it is not being promoted to the completion message."
-        .to_string()
-}
-
-/// Does the user message read as a question or request-for-explanation,
-/// rather than an imperative "go do this"? Used to suppress the
-/// `explicit_tool_markers` heuristic so advisory questions that mention
-/// common verbs ("how do I run tests", "explain cargo") don't get
-/// mis-classified as tool-required.
-fn user_looks_advisory(user_lower: &str) -> bool {
-    let trimmed = user_lower.trim_start();
-    const ADVISORY_PREFIXES: &[&str] = &[
-        "how do i ",
-        "how do you ",
-        "how to ",
-        "how can i ",
-        "how does ",
-        "how should ",
-        "how would ",
-        "how is ",
-        "how are ",
-        "what is ",
-        "what are ",
-        "what does ",
-        "what do ",
-        "what would ",
-        "what happens ",
-        "what's ",
-        "why does ",
-        "why is ",
-        "why are ",
-        "why do ",
-        "when should ",
-        "when does ",
-        "when do ",
-        "where does ",
-        "where is ",
-        "where are ",
-        "explain ",
-        "describe ",
-        "summarize ",
-        "tell me about ",
-        "tell me how ",
-        "tell me why ",
-        "can you explain ",
-        "can you describe ",
-        "could you explain ",
-        "would you explain ",
-    ];
-    ADVISORY_PREFIXES
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
-}
-
-/// Detects explicit imperative execution requests that override the
-/// advisory heuristic. Input is expected to be ASCII-lowercased.
-///
-/// Entries must be **unambiguous** — they should never match a purely
-/// explanatory question. Phrases like `run this` / `run it` are not
-/// safe to include (they appear inside questions such as "How do I
-/// run this locally?"); rely on explicit imperative framing
-/// (`please`, `actually`, `go ahead`, `then`, `now`) or on
-/// direct-object coupling with verbs that can't occur mid-question
-/// without being a command (`fix failures`, `apply the fix`).
-fn user_has_imperative_execution_request(user_lower: &str) -> bool {
-    const IMPERATIVE_PHRASES: &[&str] = &[
-        // Explicit politeness prefix — only present when the user is
-        // directing us to act.
-        "please run",
-        "please execute",
-        "please apply",
-        "please fix",
-        "please implement",
-        "please do ",
-        // "Actually" framing is also unambiguous: "actually run" only
-        // shows up as a follow-up command.
-        "actually run",
-        "actually execute",
-        "go ahead and ",
-        // Sequencing markers — if the user says "then run" or "now
-        // run" after a question, they're asking us to do it next.
-        "then run",
-        "then execute",
-        "now run",
-        "now execute",
-        "and run them",
-        "and execute them",
-        "and fix",
-        // Direct-object phrases that don't fit neatly inside an
-        // advisory question.
-        "run the tests",
-        "fix failures",
-        "fix the failures",
-        "apply the fix",
-    ];
-    IMPERATIVE_PHRASES
-        .iter()
-        .any(|phrase| user_lower.contains(phrase))
-}
-
-fn codex_final_message_looks_like_progress_update(assistant_message: &str) -> bool {
-    let assistant = assistant_message.trim().to_ascii_lowercase();
-    if assistant.is_empty() {
-        return false;
-    }
-
-    let progress_prefixes = [
-        "i'm reading",
-        "i’m reading",
-        "i am reading",
-        "i'm checking",
-        "i’m checking",
-        "i am checking",
-        "i'm inspecting",
-        "i’m inspecting",
-        "i am inspecting",
-        "i'm pulling",
-        "i’m pulling",
-        "i am pulling",
-        "i'm running",
-        "i’m running",
-        "i am running",
-        "i'll run",
-        "i’ll run",
-        "i will run",
-        "i'll execute",
-        "i’ll execute",
-        "i will execute",
-        "next i'm",
-        "next i’m",
-        "next i'll",
-        "next i’ll",
-        "now i'm",
-        "now i’m",
-    ];
-    if progress_prefixes
-        .iter()
-        .any(|prefix| assistant.starts_with(prefix))
-    {
-        return true;
-    }
-
-    assistant.contains(" i'm reading ")
-        || assistant.contains(" i’m reading ")
-        || assistant.contains(" i'm checking ")
-        || assistant.contains(" i’m checking ")
-        || assistant.contains(" i'm running ")
-        || assistant.contains(" i’m running ")
-}
-
-fn current_user_request_for_tool_activity(prompt: &str) -> &str {
-    let Some((_, after_user)) = prompt.rsplit_once("User:\n") else {
-        return prompt;
-    };
-    after_user
-        .split_once("\n\nInstructions:")
-        .map(|(current, _)| current)
-        .unwrap_or(after_user)
-}
-
-fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return false;
-    }
-    let haystack = haystack.as_bytes();
-    let needle = needle.as_bytes();
-    if haystack.len() < needle.len() {
-        return false;
-    }
-    for idx in 0..=haystack.len() - needle.len() {
-        if &haystack[idx..idx + needle.len()] != needle {
-            continue;
-        }
-        let before = idx.checked_sub(1).and_then(|prev| haystack.get(prev));
-        let after = haystack.get(idx + needle.len());
-        if before.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
-            && after.is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
-        {
-            return true;
-        }
-    }
-    false
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn run_codex_turn(
-    workspace: &Workspace,
-    mission_work_dir: &std::path::Path,
-    user_message: &str,
-    model: Option<&str>,
-    model_effort: Option<&str>,
-    agent: Option<&str>,
-    mission_id: Uuid,
-    events_tx: broadcast::Sender<AgentEvent>,
-    cancel: CancellationToken,
-    app_working_dir: &std::path::Path,
-    _session_id: Option<&str>,
-    override_credential: Option<&crate::api::ai_providers::CodexCredentialOverride<'_>>,
-) -> AgentResult {
-    use crate::backend::codex::CodexBackend;
-    use crate::backend::events::ExecutionEvent;
-    use crate::backend::{Backend, SessionConfig};
-
-    let model = model.map(str::trim).filter(|m| !m.is_empty());
-    let model_effort = model_effort.map(str::trim).filter(|m| !m.is_empty());
-    let resolved_model: Option<String> = model.map(|m| m.to_string());
-
-    tracing::info!(
-        mission_id = %mission_id,
-        requested_model = ?model,
-        resolved_model = ?resolved_model,
-        model_effort = ?model_effort,
-        agent = ?agent,
-        "Starting Codex turn"
-    );
-
-    // Best-effort: try to mint an OpenAI API key from the OAuth refresh token.
-    // If this fails (e.g. no API platform org), write_codex_credentials_for_workspace
-    // will fall back to auth_mode: "chatgpt" using the access_token directly.
-    //
-    // Skip this when the rotation layer has already selected a specific
-    // ChatGPT OAuth account. Minting an API key refreshes/rotates the same
-    // refresh token, then the selected credential can become stale before it
-    // is written into Codex auth.json.
-    let should_try_mint_api_key = !matches!(
-        override_credential,
-        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(_))
-    );
-    if should_try_mint_api_key {
-        if let Err(e) =
-            crate::api::ai_providers::ensure_openai_api_key_for_codex(app_working_dir).await
-        {
-            tracing::warn!(
-                "Could not ensure OpenAI API key for Codex (will try chatgpt auth mode): {}",
-                e
-            );
-        }
-    }
-
-    let oauth_account_to_prepare = match override_credential {
-        Some(crate::api::ai_providers::CodexCredentialOverride::OAuth(account)) => {
-            Some((*account).clone())
-        }
-        Some(crate::api::ai_providers::CodexCredentialOverride::ApiKey(_)) => None,
-        None => {
-            if crate::api::ai_providers::get_openai_api_key_for_codex_default(app_working_dir)
-                .is_none()
-            {
-                crate::api::ai_providers::get_all_openai_oauth_accounts(app_working_dir)
-                    .into_iter()
-                    .next()
-            } else {
-                None
-            }
-        }
-    };
-    let prepared_oauth_account = match oauth_account_to_prepare.as_ref() {
-        Some(account) => {
-            match crate::api::ai_providers::prepare_codex_oauth_account_for_launch(
-                app_working_dir,
-                account,
-            )
-            .await
-            {
-                Ok(account) => Some(account),
-                Err(e) => {
-                    tracing::error!("Failed to prepare Codex OAuth credentials: {}", e);
-                    return AgentResult::failure(
-                        format!("Failed to prepare Codex OAuth credentials: {}", e),
-                        0,
-                    )
-                    .with_terminal_reason(TerminalReason::AuthError);
-                }
-            }
-        }
-        None => None,
-    };
-    let prepared_override = prepared_oauth_account
-        .as_ref()
-        .map(crate::api::ai_providers::CodexCredentialOverride::OAuth);
-    let workspace_override = prepared_override.as_ref().or(override_credential);
-
-    // Ensure Codex auth.json is present in the workspace context (host or container).
-    if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(
-        workspace,
-        app_working_dir,
-        workspace_override,
-    ) {
-        tracing::error!("Failed to write Codex credentials: {}", e);
-        return AgentResult::failure(
-            format!("Failed to configure Codex authentication: {}", e),
-            0,
-        )
-        .with_terminal_reason(TerminalReason::LlmError);
-    }
-
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
-    let cli_path = get_backend_string_setting("codex", "cli_path")
-        .or_else(|| std::env::var("CODEX_CLI_PATH").ok())
-        .unwrap_or_else(|| "codex".to_string());
-    let cli_path = match ensure_codex_cli_available(&workspace_exec, mission_work_dir, &cli_path)
-        .await
-    {
-        Ok(path) => path,
-        Err(err_msg) => {
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    tracing::info!(
-        mission_id = %mission_id,
-        workspace_type = ?workspace.workspace_type,
-        cli_path = %cli_path,
-        model = ?model,
-        "Starting Codex execution via WorkspaceExec"
-    );
-
-    let codex_config = crate::backend::codex::client::CodexConfig {
-        cli_path,
-        model_effort: model_effort.map(|s| s.to_string()),
-        external_chatgpt_auth: prepared_oauth_account.as_ref().map(|account| {
-            crate::backend::codex::client::CodexExternalChatgptAuth {
-                access_token: account.access_token.clone(),
-                chatgpt_account_id: account.chatgpt_account_id.clone(),
-                chatgpt_plan_type: None,
-                working_dir: app_working_dir.to_path_buf(),
-            }
-        }),
-        ..Default::default()
-    };
-
-    // Create Codex backend
-    let backend = CodexBackend::with_config_and_workspace(codex_config, workspace_exec);
-
-    // Create session
-    let session = match backend
-        .create_session(SessionConfig {
-            directory: mission_work_dir.to_string_lossy().to_string(),
-            title: Some(format!("Mission {}", mission_id)),
-            model: resolved_model.clone(),
-            agent: agent.map(|s| s.to_string()),
-        })
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("Failed to create Codex session: {}", e);
-            return AgentResult::failure(format!("Failed to start Codex: {}", e), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    // Send message streaming
-    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            let message = format!("Codex execution failed: {}", e);
-            tracing::error!("Failed to send message to Codex: {}", e);
-            let reason = if is_capacity_limited_error(&message) {
-                TerminalReason::CapacityLimited
-            } else if is_rate_limited_error(&message) {
-                TerminalReason::RateLimited
-            } else {
-                TerminalReason::LlmError
-            };
-            return AgentResult::failure(message, 0).with_terminal_reason(reason);
-        }
-    };
-
-    // Process events until completion or cancellation
-    let mut assistant_message = String::new();
-    let mut text_delta_coalescer = TextDeltaCoalescer::new();
-    let mut text_delta_pending = false;
-    let mut success = false;
-    let mut error_message: Option<String> = None;
-    let mut pending_tools: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut thinking_emitted = false;
-    let mut thinking_done_emitted = false;
-    let mut thinking_accumulated = String::new();
-    // Tracks which codex reasoning item `thinking_accumulated` currently
-    // belongs to. When a Thinking event arrives with a different `item_id`,
-    // we finalize the existing buffer and start a fresh one — codex emits
-    // multiple reasoning items per turn (each with its own cumulative
-    // snapshots), and merging them into one buffer produced concatenated
-    // thoughts in stored history (see mission dbc8a7e9 seq 6651).
-    let mut thinking_item: Option<String> = None;
-    let mut last_summary: Option<String> = None;
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
-    let mut tool_events_seen: usize = 0;
-    // Set when the cancellation token fires mid-turn. Instead of returning a
-    // synthetic "Mission cancelled" failure and discarding everything the
-    // model already produced (the common shape for /goal missions, where the
-    // closing audit lives in `thinking_accumulated`), we break out of the
-    // loop and let the post-loop finalization recover whatever it can.
-    let mut cancelled = false;
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!("Codex turn cancelled for mission {}", mission_id);
-                // Note: Codex process will be cleaned up automatically when the event stream task ends
-                cancelled = true;
-                break;
-            }
-            Some(event) = event_rx.recv() => {
-                match event {
-                    ExecutionEvent::TextDelta { content } => {
-                        // For Codex backend, TextDelta is handled as the latest snapshot for
-                        // the currently active assistant message item. Replacing here avoids
-                        // concatenating intermediate assistant updates into the final message.
-                        assistant_message = content;
-                        // P3-#21: rate-limit to ≤1 emit per ~50ms. Skipped
-                        // deltas are not lost because the buffer is
-                        // cumulative — the next emit replaces it.
-                        if text_delta_coalescer.should_emit() {
-                            text_delta_pending = false;
-                            let _ = events_tx.send(AgentEvent::TextDelta {
-                                content: assistant_message.clone(),
-                                mission_id: Some(mission_id),
-                            });
-                        } else {
-                            text_delta_pending = true;
-                        }
-                    }
-                    ExecutionEvent::Thinking { content, item_id } => {
-                        if thinking_overlaps_visible_answer(&content, &assistant_message) {
-                            tracing::debug!(
-                                thinking_len = content.len(),
-                                assistant_len = assistant_message.len(),
-                                "Dropping Codex thinking event that duplicates visible assistant text"
-                            );
-                            continue;
-                        }
-                        // Codex emits per-item cumulative snapshots: every
-                        // emit with the same `item_id` contains the previous
-                        // emit as a prefix. When `item_id` changes we're on a
-                        // new reasoning item — finalize the existing buffer
-                        // as `done: true` so it persists as its own thought,
-                        // and start fresh. Falling back to `merge_stream_fragment`
-                        // (the pre-fix behaviour) concatenated unrelated items
-                        // into one buffer because it only knows about byte
-                        // overlap, not item identity.
-                        let item_changed = match (&thinking_item, &item_id) {
-                            (Some(prev), Some(cur)) => prev != cur,
-                            // First event of the turn, or backend doesn't
-                            // expose item IDs: treat as continuation.
-                            _ => false,
-                        };
-                        if item_changed && !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
-                            thinking_done_emitted = true;
-                        }
-                        if item_id.is_some() {
-                            thinking_item = item_id;
-                            // Per-item cumulative: each new snapshot replaces
-                            // the buffer (longest wins; shorter echoes are
-                            // dropped to keep the buffer monotone).
-                            if content.len() >= thinking_accumulated.len() {
-                                thinking_accumulated = content;
-                            }
-                        } else {
-                            // Unknown-item backends still use overlap-based
-                            // merging so a CLI that resends a partial
-                            // snapshot doesn't double words.
-                            merge_stream_fragment(&mut thinking_accumulated, &content);
-                        }
-                        let _ = events_tx.send(AgentEvent::Thinking {
-                            content: thinking_accumulated.clone(),
-                            done: false,
-                            mission_id: Some(mission_id),
-                        });
-                        if !thinking_accumulated.is_empty() {
-                            thinking_done_emitted = false;
-                        }
-                        thinking_emitted = true;
-                    }
-                    ExecutionEvent::ToolCall { id, name, args } => {
-                        tool_events_seen = tool_events_seen.saturating_add(1);
-                        // Flush accumulated thinking as done before tool call,
-                        // so the event logger persists the full thought block.
-                        if !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
-                            thinking_done_emitted = true;
-                        }
-                        thinking_item = None;
-                        pending_tools.insert(id.clone(), name.clone());
-                        let _ = events_tx.send(AgentEvent::ToolCall {
-                            tool_call_id: id,
-                            name,
-                            args,
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::ToolResult { id, name, result } => {
-                        tool_events_seen = tool_events_seen.saturating_add(1);
-                        pending_tools.remove(&id);
-                        let _ = events_tx.send(AgentEvent::ToolResult {
-                            tool_call_id: id,
-                            name,
-                            result,
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::TurnSummary { content } => {
-                        if !content.trim().is_empty() {
-                            last_summary = Some(content);
-                        }
-                    }
-                    ExecutionEvent::Usage { input_tokens, output_tokens } => {
-                        total_input_tokens = total_input_tokens.saturating_add(input_tokens);
-                        total_output_tokens = total_output_tokens.saturating_add(output_tokens);
-                    }
-                    ExecutionEvent::GoalIteration { iteration, objective } => {
-                        let _ = events_tx.send(AgentEvent::GoalIteration {
-                            iteration,
-                            objective,
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::GoalStatus { status, objective } => {
-                        let _ = events_tx.send(AgentEvent::GoalStatus {
-                            status,
-                            objective,
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::Error { message } => {
-                        // Codex CLI emits two kinds of post-response errors we
-                        // want to treat as non-fatal:
-                        //   1. Internal hiccups like "Failed to shutdown rollout
-                        //      recorder" that fire after a clean turn.
-                        //   2. OpenAI backend returning a 500 mid-stream after
-                        //      real content has already been produced; Codex
-                        //      retries 5× and then exits with status 1. Our
-                        //      client wraps that in "Codex CLI exited before
-                        //      completing the turn (exit_status: exit status:
-                        //      1). Stderr: <empty> | Stdout: <empty>". The
-                        //      earlier assistant_message already captured the
-                        //      real response, so the exit error is a downstream
-                        //      consequence of the in-stream disconnect we
-                        //      already decided to swallow.
-                        //
-                        // Rule: if we have assistant output and no pending
-                        // tools, ignore the error. The empty-output branch
-                        // still surfaces startup / auth / config failures
-                        // (which produce no text at all). If a tool call is
-                        // still pending, the assistant's text is only a
-                        // progress update; swallowing a provider error would
-                        // mark unfinished work as completed.
-                        //
-                        // When we do surface an error, prefer the *first*
-                        // meaningful message we saw — Codex CLI usually emits
-                        // a specific TurnFailed (e.g. "You've hit your usage
-                        // limit. ... try again at Apr 28th, 2026 10:03 PM")
-                        // before its outer wrapper "Codex CLI exited before
-                        // completing the turn (exit_status: exit status: 1).
-                        // Stderr: <empty> | Stdout: <empty>". The wrapper is
-                        // a generic post-mortem that hides the real cause;
-                        // overwriting the specific message with the wrapper
-                        // forces the user (and our `is_*_error` classifiers)
-                        // to debug from log lines instead of the surfaced
-                        // assistant_message.
-                        if let Some(surfaced_message) =
-                            codex_error_message_to_surface(&assistant_message, &pending_tools, &message)
-                        {
-                            let recorded = record_codex_error_message(
-                                &mut error_message,
-                                surfaced_message.clone(),
-                            );
-                            if recorded {
-                                if pending_tools.is_empty() {
-                                    tracing::error!("Codex error: {}", surfaced_message);
-                                } else {
-                                    tracing::warn!(
-                                        pending_tool_count = pending_tools.len(),
-                                        "Treating post-response Codex error as fatal because tool calls are still pending: {}",
-                                        surfaced_message
-                                    );
-                                }
-                            } else {
-                                tracing::warn!(
-                                    "Keeping prior specific Codex error over generic exit wrapper: existing={}, ignored={}",
-                                    error_message.as_deref().unwrap_or(""),
-                                    message
-                                );
-                            }
-                        } else {
-                            tracing::warn!(
-                                "Ignoring post-response Codex error (have {}B assistant output): {}",
-                                assistant_message.len(),
-                                message
-                            );
-                        }
-                    }
-                    ExecutionEvent::MessageComplete { session_id: _ } => {
-                        success = error_message.is_none();
-                        break;
-                    }
-                }
-            }
-            else => {
-                // Channel closed
-                break;
-            }
-        }
-    }
-
-    // P3-#21 final flush: ensure the closing delta the coalescer may
-    // have suppressed reaches the dashboard. AssistantMessage emits
-    // below will replace it, so this is purely a safety net for clients
-    // that render the streaming buffer ahead of completion.
-    if text_delta_pending {
-        let _ = events_tx.send(AgentEvent::TextDelta {
-            content: assistant_message.clone(),
-            mission_id: Some(mission_id),
-        });
-    }
-
-    // Capture a copy of the accumulated reasoning before the flush below
-    // moves it into the broadcast event. /goal missions frequently end with
-    // the model emitting a self-audit as reasoning and then calling
-    // `update_goal { status: "complete" }` without a closing chat message;
-    // in that case `assistant_message` is empty (or stale from an earlier
-    // iteration) and the only place the audit lives is `thinking_accumulated`.
-    let thinking_for_fallback = if thinking_accumulated.trim().is_empty() {
-        None
-    } else {
-        Some(thinking_accumulated.clone())
-    };
-
-    // Flush any remaining accumulated thinking with full content so
-    // the event logger persists it for replay/history.
-    if thinking_emitted && !thinking_done_emitted {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: thinking_accumulated,
-            done: true,
-            mission_id: Some(mission_id),
-        });
-    }
-
-    let no_output = assistant_message.trim().is_empty()
-        && last_summary.is_none()
-        && thinking_for_fallback.is_none();
-    if no_output && error_message.is_none() && !cancelled {
-        success = false;
-        error_message = Some(
-            "Codex produced no output. This usually means the Codex CLI failed before emitting JSON (often authentication). Check that the host has a valid `~/.codex/auth.json` and that the backend can access it."
-                .to_string(),
-        );
-    }
-
-    // Snapshot the cancel marker (output + terminal_reason) once. The marker
-    // reads `is_shutdown_initiated()` internally, and a shutdown signal
-    // arriving between two reads could pair "Mission cancelled" text with a
-    // ServerShutdown reason (or vice versa) — TOCTOU race flagged by bugbot.
-    let cancel_marker = if cancelled {
-        Some(cancel_or_shutdown_failure())
-    } else {
-        None
-    };
-
-    let mut final_message = if let Some(err) = error_message {
-        err
-    } else if !assistant_message.is_empty() {
-        assistant_message
-    } else if let Some(summary) = last_summary {
-        summary
-    } else if let Some(thinking_text) = thinking_for_fallback {
-        if success && codex_is_goal_request(user_message) && !cancelled {
-            codex_missing_goal_final_response_message()
-        } else {
-            // Surface the model's reasoning as the assistant message so the
-            // dashboard's final-message slot matches what's already visible in
-            // the thinking panel.
-            thinking_text
-        }
-    } else if let Some(marker) = cancel_marker.as_ref() {
-        // Mid-turn cancellation with nothing accumulated — preserve the
-        // historical "Mission cancelled" / shutdown text for the UI.
-        marker.output.clone()
-    } else {
-        "No response from Codex".to_string()
-    };
-
-    let tool_activity_required = codex_turn_requires_tool_activity(user_message, &final_message);
-    let stopped_before_required_tools = success && tool_events_seen == 0 && tool_activity_required;
-    let stopped_on_progress_update = success
-        && tool_activity_required
-        && codex_final_message_looks_like_progress_update(&final_message);
-    let stopped_with_pending_tool_error =
-        !success && final_message.starts_with(CODEX_PENDING_TOOLS_ERROR_PREFIX);
-    if stopped_before_required_tools || stopped_on_progress_update {
-        tracing::warn!(
-            mission_id = %mission_id,
-            output_len = final_message.len(),
-            tool_events_seen = tool_events_seen,
-            stopped_on_progress_update = stopped_on_progress_update,
-            "Codex turn completed before satisfying a tool-required prompt"
-        );
-        success = false;
-        final_message = format!(
-            "Codex stopped before completing required workspace/tool steps. Last response:\n\n{}",
-            final_message.trim()
-        );
-    }
-
-    let lower_final = final_message.to_lowercase();
-    if lower_final.contains("does not exist or you do not have access")
-        || lower_final.contains("model_not_found")
-    {
-        final_message.push_str("\n\nTry model `gpt-5.5` or `gpt-5-codex` for Codex missions.");
-        if matches!(
-            model,
-            Some("gpt-5.3-codex" | "gpt-5.4-codex" | "gpt-5.5-codex")
-        ) {
-            final_message.push_str(
-                "\n\nIf you expected this Codex model to work, your Codex CLI may be outdated. \
-Update it to the latest version (`npm install -g @openai/codex@latest`) and retry.",
-            );
-        }
-    }
-
-    let usage = crate::cost::TokenUsage {
-        input_tokens: total_input_tokens,
-        output_tokens: total_output_tokens,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-    };
-
-    let model_for_cost = resolved_model.as_deref();
-    let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
-
-    let mut result = if let Some(marker) = cancel_marker {
-        // Cancellation outranks success/error classification: keep the partial
-        // assistant_message / thinking content as the visible final message
-        // but mark the mission Interrupted (or ServerShutdown) so the
-        // dashboard renders the resume affordance and not a fake completion.
-        // Reusing the marker from the final-message picker keeps the
-        // text/reason pair consistent if shutdown fires mid-finalize.
-        let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
-        AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
-    } else if success {
-        AgentResult::success(final_message, cost_cents)
-            .with_terminal_reason(TerminalReason::TurnComplete)
-    } else {
-        // Distinguish provider concurrency exhaustion from classic rate limits.
-        // Refresh-token reuse (ChatGPT OAuth races between sibling missions)
-        // is_auth_error-classified so the codex arm rotates to another
-        // configured account instead of surfacing the bare error.
-        let reason = if stopped_before_required_tools || stopped_on_progress_update {
-            TerminalReason::Stalled
-        } else if is_capacity_limited_error(&final_message) {
-            TerminalReason::CapacityLimited
-        } else if is_rate_limited_error(&final_message) {
-            TerminalReason::RateLimited
-        } else if is_auth_error(&final_message) {
-            TerminalReason::AuthError
-        } else if stopped_with_pending_tool_error {
-            TerminalReason::Stalled
-        } else {
-            TerminalReason::LlmError
-        };
-        AgentResult::failure(final_message, cost_cents).with_terminal_reason(reason)
-    };
-
-    let outcome = turn_outcome_for_result(
-        &result,
-        CompletionSignal::NativeTerminal,
-        CompletionConfidence::High,
-    );
-    result = result.with_turn_outcome(outcome);
-    result = result.with_cost_source(cost_source);
-    if usage.has_usage() {
-        result = result.with_usage(usage);
-    }
-    if let Some(m) = resolved_model.as_deref() {
-        result = result.with_model(m.to_string());
-    }
-
-    result
-}
-
-/// Run a single Gemini CLI turn for a mission.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_gemini_turn(
-    workspace: &Workspace,
-    mission_work_dir: &std::path::Path,
-    user_message: &str,
-    model: Option<&str>,
-    agent: Option<&str>,
-    mission_id: Uuid,
-    events_tx: broadcast::Sender<AgentEvent>,
-    cancel: CancellationToken,
-    app_working_dir: &std::path::Path,
-    _session_id: Option<&str>,
-) -> AgentResult {
-    use crate::backend::events::ExecutionEvent;
-    use crate::backend::gemini::GeminiBackend;
-    use crate::backend::{Backend, SessionConfig};
-
-    let model = model.map(str::trim).filter(|m| !m.is_empty());
-    let resolved_model: Option<String> = model.map(|m| m.to_string());
-
-    tracing::info!(
-        mission_id = %mission_id,
-        requested_model = ?model,
-        resolved_model = ?resolved_model,
-        agent = ?agent,
-        "Starting Gemini CLI turn"
-    );
-
-    // Get Google credentials for Gemini CLI
-    let gemini_creds = get_google_credentials_for_gemini(app_working_dir);
-    match &gemini_creds {
-        GeminiCredentials::ApiKey(k) => {
-            tracing::info!(
-                "Using Gemini API key (prefix: {}...)",
-                k.chars().take(8).collect::<String>()
-            );
-        }
-        GeminiCredentials::OAuth { .. } => {
-            tracing::info!("Using Google OAuth credentials for Gemini CLI");
-        }
-        GeminiCredentials::None => {
-            tracing::warn!(
-                "No Google credentials found for Gemini CLI; will rely on CLI's own auth"
-            );
-        }
-    }
-
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
-    let cli_path = get_backend_string_setting("gemini", "cli_path")
-        .or_else(|| std::env::var("GEMINI_CLI_PATH").ok())
-        .unwrap_or_else(|| "gemini".to_string());
-
-    // Ensure Gemini CLI is available, auto-install if needed
-    let cli_path =
-        match ensure_gemini_cli_available(&workspace_exec, mission_work_dir, &cli_path).await {
-            Ok(path) => path,
-            Err(e) => {
-                tracing::error!("Gemini CLI not available: {}", e);
-                return AgentResult::failure(format!("Gemini CLI not available: {}", e), 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
-            }
-        };
-
-    // Ensure ~/.gemini directory exists (gemini CLI needs it for projects.json and settings).
-    // Use $HOME so this works for non-root users in host workspaces.
-    let gemini_dir_result = workspace_exec
-        .output(
-            mission_work_dir,
-            "/bin/sh",
-            &[
-                "-c".to_string(),
-                r#"mkdir -p "${HOME:-/root}/.gemini""#.to_string(),
-            ],
-            std::collections::HashMap::new(),
-        )
-        .await;
-    if let Err(e) = &gemini_dir_result {
-        tracing::warn!("Failed to create ~/.gemini directory: {}", e);
-    }
-
-    // Configure auth in the container based on credential type
-    let api_key = match &gemini_creds {
-        GeminiCredentials::ApiKey(key) => {
-            // Write settings.json for API key auth
-            if let Err(e) = workspace_exec
-                .output(
-                    mission_work_dir,
-                    "/bin/sh",
-                    &[
-                        "-c".to_string(),
-                        r#"echo '{"security":{"auth":{"selectedType":"gemini-api-key"}}}' > "${HOME:-/root}/.gemini/settings.json""#.to_string(),
-                    ],
-                    std::collections::HashMap::new(),
-                )
-                .await
-            {
-                tracing::warn!("Failed to write Gemini settings.json: {}", e);
-            }
-            Some(key.clone())
-        }
-        GeminiCredentials::OAuth {
-            access_token,
-            refresh_token,
-            expires_at,
-        } => {
-            // Write settings.json for OAuth auth
-            if let Err(e) = workspace_exec
-                .output(
-                    mission_work_dir,
-                    "/bin/sh",
-                    &[
-                        "-c".to_string(),
-                        r#"echo '{"security":{"auth":{"selectedType":"oauth-personal"}}}' > "${HOME:-/root}/.gemini/settings.json""#.to_string(),
-                    ],
-                    std::collections::HashMap::new(),
-                )
-                .await
-            {
-                tracing::warn!("Failed to write Gemini settings.json for OAuth: {}", e);
-            }
-            // Write OAuth credentials file for the CLI to pick up
-            let oauth_creds = serde_json::json!({
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "token_type": "Bearer",
-                "expiry_date": expires_at
-            });
-            let creds_json = serde_json::to_string(&oauth_creds).unwrap_or_default();
-            // Escape single quotes in the JSON for shell
-            let escaped = creds_json.replace('\'', "'\\''");
-            if let Err(e) = workspace_exec
-                .output(
-                    mission_work_dir,
-                    "/bin/sh",
-                    &[
-                        "-c".to_string(),
-                        format!(
-                            r#"echo '{}' > "${{HOME:-/root}}/.gemini/oauth_creds.json""#,
-                            escaped
-                        ),
-                    ],
-                    std::collections::HashMap::new(),
-                )
-                .await
-            {
-                tracing::warn!("Failed to write Gemini OAuth credentials: {}", e);
-            }
-            // Don't set GEMINI_API_KEY for OAuth - the CLI uses its own credential store
-            None
-        }
-        GeminiCredentials::None => None,
-    };
-
-    tracing::info!(
-        mission_id = %mission_id,
-        workspace_type = ?workspace.workspace_type,
-        cli_path = %cli_path,
-        model = ?model,
-        has_api_key = api_key.is_some(),
-        auth_type = ?gemini_creds.auth_type_str(),
-        "Starting Gemini CLI execution via WorkspaceExec"
-    );
-
-    let gemini_config = crate::backend::gemini::client::GeminiConfig {
-        cli_path,
-        api_key,
-        default_model: resolved_model.clone(),
-        force_file_storage: matches!(gemini_creds, GeminiCredentials::OAuth { .. }),
-    };
-
-    let backend = GeminiBackend::with_config_and_workspace(gemini_config, workspace_exec);
-
-    // Create session
-    let session = match backend
-        .create_session(SessionConfig {
-            directory: mission_work_dir.to_string_lossy().to_string(),
-            title: Some(format!("Mission {}", mission_id)),
-            model: resolved_model.clone(),
-            agent: agent.map(|s| s.to_string()),
-        })
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("Failed to create Gemini session: {}", e);
-            return AgentResult::failure(format!("Failed to start Gemini CLI: {}", e), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    // Send message streaming
-    let (mut event_rx, handle) = match backend.send_message_streaming(&session, user_message).await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::error!("Failed to send message to Gemini CLI: {}", e);
-            return AgentResult::failure(format!("Gemini CLI execution failed: {}", e), 0)
-                .with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    // Process events until completion or cancellation
-    // Gemini usually emits incremental token deltas. Keep canonical
-    // cumulative buffers anyway so a future CLI snapshot event cannot
-    // duplicate streamed words in the UI.
-    let mut assistant_message = String::new();
-    let mut success = false;
-    let mut error_message: Option<String> = None;
-    let mut pending_tools: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut thinking_emitted = false;
-    let mut thinking_done_emitted = false;
-    let mut thinking_accumulated = String::new();
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
-    // See run_codex_turn: on cancellation we break instead of returning so
-    // the post-loop fallback can surface accumulated text / reasoning as the
-    // final assistant message.
-    let mut cancelled = false;
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!("Gemini turn cancelled for mission {}", mission_id);
-                // Kill the Gemini CLI child process to stop consuming API resources
-                backend.kill().await;
-                // Abort the event-conversion task
-                handle.abort();
-                cancelled = true;
-                break;
-            }
-            Some(event) = event_rx.recv() => {
-                match event {
-                    ExecutionEvent::TextDelta { content } => {
-                        merge_stream_fragment(&mut assistant_message, &content);
-                        let _ = events_tx.send(AgentEvent::TextDelta {
-                            content: assistant_message.clone(),
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::Thinking { content, item_id: _ } => {
-                        if thinking_overlaps_visible_answer(&content, &assistant_message) {
-                            tracing::debug!(
-                                thinking_len = content.len(),
-                                assistant_len = assistant_message.len(),
-                                "Dropping Gemini thinking event that duplicates visible assistant text"
-                            );
-                            continue;
-                        }
-                        merge_stream_fragment(&mut thinking_accumulated, &content);
-                        // Stream the canonical cumulative buffer for real-time UI.
-                        let _ = events_tx.send(AgentEvent::Thinking {
-                            content: thinking_accumulated.clone(),
-                            done: false,
-                            mission_id: Some(mission_id),
-                        });
-                        if !thinking_accumulated.is_empty() {
-                            thinking_done_emitted = false;
-                        }
-                        thinking_emitted = true;
-                    }
-                    ExecutionEvent::ToolCall { id, name, args } => {
-                        // Flush accumulated thinking before tool call
-                        if !thinking_accumulated.is_empty() {
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: std::mem::take(&mut thinking_accumulated),
-                                done: true,
-                                mission_id: Some(mission_id),
-                            });
-                            thinking_done_emitted = true;
-                        }
-                        pending_tools.insert(id.clone(), name.clone());
-                        let _ = events_tx.send(AgentEvent::ToolCall {
-                            tool_call_id: id,
-                            name,
-                            args,
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::ToolResult { id, name, result } => {
-                        pending_tools.remove(&id);
-                        let _ = events_tx.send(AgentEvent::ToolResult {
-                            tool_call_id: id,
-                            name,
-                            result,
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::TurnSummary { content } => {
-                        if !content.trim().is_empty() {
-                            tracing::debug!("Gemini turn summary: {}", content);
-                        }
-                    }
-                    ExecutionEvent::Usage { input_tokens, output_tokens } => {
-                        total_input_tokens = total_input_tokens.saturating_add(input_tokens);
-                        total_output_tokens = total_output_tokens.saturating_add(output_tokens);
-                    }
-                    // Goal events don't apply to Gemini today (no /goal
-                    // continuation loop for that backend), but we still
-                    // forward them so a future Gemini integration that
-                    // adds goal mode just works.
-                    ExecutionEvent::GoalIteration { iteration, objective } => {
-                        let _ = events_tx.send(AgentEvent::GoalIteration {
-                            iteration,
-                            objective,
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::GoalStatus { status, objective } => {
-                        let _ = events_tx.send(AgentEvent::GoalStatus {
-                            status,
-                            objective,
-                            mission_id: Some(mission_id),
-                        });
-                    }
-                    ExecutionEvent::Error { message } => {
-                        error_message = Some(message.clone());
-                        tracing::error!("Gemini CLI error: {}", message);
-                    }
-                    ExecutionEvent::MessageComplete { session_id: _ } => {
-                        success = error_message.is_none();
-                        break;
-                    }
-                }
-            }
-            else => {
-                break;
-            }
-        }
-    }
-
-    // See run_codex_turn: capture thinking before the flush below moves it,
-    // so the final-message picker can surface it when no text was produced.
-    let thinking_for_fallback = if thinking_accumulated.trim().is_empty() {
-        None
-    } else {
-        Some(thinking_accumulated.clone())
-    };
-
-    // Flush any remaining accumulated thinking with full content
-    if thinking_emitted && !thinking_done_emitted {
-        let _ = events_tx.send(AgentEvent::Thinking {
-            content: thinking_accumulated,
-            done: true,
-            mission_id: Some(mission_id),
-        });
-    }
-
-    let no_output = assistant_message.trim().is_empty() && thinking_for_fallback.is_none();
-    if no_output && error_message.is_none() && !cancelled {
-        success = false;
-        error_message = Some(
-            "Gemini CLI produced no output. Check that the Gemini CLI is installed and configured with valid credentials (GEMINI_API_KEY or Google OAuth)."
-                .to_string(),
-        );
-    }
-
-    // See run_codex_turn: snapshot the cancel marker once to keep the
-    // output/terminal_reason pair consistent if shutdown fires mid-finalize.
-    let cancel_marker = if cancelled {
-        Some(cancel_or_shutdown_failure())
-    } else {
-        None
-    };
-
-    let final_message = if let Some(err) = error_message {
-        err
-    } else if !assistant_message.is_empty() {
-        assistant_message
-    } else if let Some(thinking_text) = thinking_for_fallback {
-        thinking_text
-    } else if let Some(marker) = cancel_marker.as_ref() {
-        marker.output.clone()
-    } else {
-        "No response from Gemini CLI".to_string()
-    };
-
-    let usage = crate::cost::TokenUsage {
-        input_tokens: total_input_tokens,
-        output_tokens: total_output_tokens,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
-    };
-
-    let model_for_cost = resolved_model.as_deref();
-    let (cost_cents, cost_source) = resolve_cost_cents_and_source(None, model_for_cost, &usage);
-
-    let mut result = if let Some(marker) = cancel_marker {
-        let cancel_reason = marker.terminal_reason.unwrap_or(TerminalReason::Cancelled);
-        AgentResult::failure(final_message, cost_cents).with_terminal_reason(cancel_reason)
-    } else if success {
-        AgentResult::success(final_message, cost_cents)
-            .with_terminal_reason(TerminalReason::TurnComplete)
-    } else {
-        let reason = if is_rate_limited_error(&final_message) {
-            TerminalReason::RateLimited
-        } else {
-            TerminalReason::LlmError
-        };
-        AgentResult::failure(final_message, cost_cents).with_terminal_reason(reason)
-    };
-
-    let outcome = turn_outcome_for_result(
-        &result,
-        CompletionSignal::ProcessExit,
-        CompletionConfidence::Low,
-    );
-    result = result.with_turn_outcome(outcome);
-    result = result.with_cost_source(cost_source);
-    if usage.has_usage() {
-        result = result.with_usage(usage);
-    }
-    if let Some(m) = resolved_model.as_deref() {
-        result = result.with_model(m.to_string());
-    }
-
-    result
-}
-
-/// Credentials for the Gemini CLI backend.
-#[derive(Debug)]
-enum GeminiCredentials {
-    /// A Gemini API key (from ai_providers.json or GEMINI_API_KEY env var)
-    ApiKey(String),
-    /// Google OAuth credentials (access token + refresh token from credentials store)
-    OAuth {
-        access_token: String,
-        refresh_token: String,
-        expires_at: i64,
-    },
-    /// No credentials found
-    None,
-}
-
-impl GeminiCredentials {
-    fn auth_type_str(&self) -> &'static str {
-        match self {
-            GeminiCredentials::ApiKey(_) => "api-key",
-            GeminiCredentials::OAuth { .. } => "oauth",
-            GeminiCredentials::None => "none",
-        }
-    }
-}
-
-/// Get Google credentials for the Gemini CLI backend.
-///
-/// Checks (in order):
-/// 1. Environment variables (GEMINI_API_KEY, GOOGLE_API_KEY, etc.)
-/// 2. AI provider store for a Google provider with an API key
-/// 3. Sandboxed-sh credentials store for Google OAuth credentials
-/// 4. OpenCode's auth.json for Google API key or OAuth credentials
-fn get_google_credentials_for_gemini(working_dir: &std::path::Path) -> GeminiCredentials {
-    // 1. Check environment variables first (most explicit)
-    if let Some(key) = env_google_api_key() {
-        return GeminiCredentials::ApiKey(key);
-    }
-
-    let google_targets_gemini = crate::api::ai_providers::provider_targets_backend(
-        working_dir,
-        crate::ai_providers::ProviderType::Google,
-        "gemini",
-    );
-
-    if !google_targets_gemini {
-        tracing::info!(
-            "Google provider does not target 'gemini' backend; skipping provider credentials"
-        );
-        return GeminiCredentials::None;
-    }
-    // 2. Try to get API key from the AI provider store
-    let store_path = working_dir.join(crate::util::AI_PROVIDERS_PATH);
-    if let Ok(store) = std::fs::read_to_string(&store_path) {
-        if let Ok(providers) = serde_json::from_str::<serde_json::Value>(&store) {
-            if let Some(providers_arr) = providers.as_array() {
-                for provider in providers_arr {
-                    let pt = match provider.get("provider_type").and_then(|v| v.as_str()) {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    if pt != "google" {
-                        continue;
-                    }
-                    let enabled = provider
-                        .get("enabled")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    if !enabled {
-                        continue;
-                    }
-                    if let Some(key) = provider.get("api_key").and_then(|v| v.as_str()) {
-                        if !key.is_empty() {
-                            tracing::info!("Using Google API key from ai_providers.json");
-                            return GeminiCredentials::ApiKey(key.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Try sandboxed-sh credentials store for OAuth
-    if let Some(creds) = read_google_oauth_from_credentials() {
-        return creds;
-    }
-
-    // 4. Try OpenCode's auth.json
-    if let Some(creds) = read_google_credentials_from_opencode_auth() {
-        return creds;
-    }
-
-    GeminiCredentials::None
-}
-
-/// Read Google OAuth credentials from the sandboxed-sh credentials store.
-fn read_google_oauth_from_credentials() -> Option<GeminiCredentials> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let candidates = [
-        std::path::PathBuf::from(&home)
-            .join(".sandboxed-sh")
-            .join("credentials.json"),
-        std::path::PathBuf::from("/var/lib/opencode")
-            .join(".sandboxed-sh")
-            .join("credentials.json"),
-    ];
-    let creds_path = candidates.iter().find(|p| p.exists())?;
-    let contents = std::fs::read_to_string(creds_path).ok()?;
-    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
-
-    for key_name in ["google", "gemini"] {
-        let entry = match auth.get(key_name) {
-            Some(e) => e,
-            None => continue,
-        };
-        let access_token = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
-        let refresh_token = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
-        let expires_at = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
-
-        if access_token.is_empty() || refresh_token.is_empty() {
-            continue;
-        }
-
-        tracing::info!("Using Google OAuth credentials from credentials.json for Gemini CLI");
-        return Some(GeminiCredentials::OAuth {
-            access_token: access_token.to_string(),
-            refresh_token: refresh_token.to_string(),
-            expires_at,
-        });
-    }
-    None
-}
-
-/// Read Google API key or OAuth credentials from OpenCode's auth.json.
-fn read_google_credentials_from_opencode_auth() -> Option<GeminiCredentials> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let mut candidates = Vec::new();
-    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
-        candidates.push(
-            std::path::PathBuf::from(data_home)
-                .join("opencode")
-                .join("auth.json"),
-        );
-    }
-    candidates.push(
-        std::path::PathBuf::from(&home)
-            .join(".local")
-            .join("share")
-            .join("opencode")
-            .join("auth.json"),
-    );
-    candidates.push(
-        std::path::PathBuf::from("/var/lib/opencode")
-            .join(".local")
-            .join("share")
-            .join("opencode")
-            .join("auth.json"),
-    );
-    let auth_path = candidates.iter().find(|p| p.exists())?;
-    let contents = std::fs::read_to_string(auth_path).ok()?;
-    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
-
-    for key_name in ["google", "gemini"] {
-        if let Some(entry) = auth.get(key_name) {
-            // Check for API key first
-            for field in ["key", "api_key"] {
-                if let Some(key) = entry.get(field).and_then(|v| v.as_str()) {
-                    if !key.is_empty() {
-                        let entry_type = entry.get("type").and_then(|v| v.as_str());
-                        if entry_type != Some("oauth") {
-                            tracing::info!("Using Google API key from OpenCode auth.json");
-                            return Some(GeminiCredentials::ApiKey(key.to_string()));
-                        }
-                    }
-                }
-            }
-            // Check for OAuth credentials
-            let access = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
-            let refresh = entry.get("refresh").and_then(|v| v.as_str()).unwrap_or("");
-            let expires = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
-            if !access.is_empty() && !refresh.is_empty() {
-                tracing::info!(
-                    "Using Google OAuth credentials from OpenCode auth.json for Gemini CLI"
-                );
-                return Some(GeminiCredentials::OAuth {
-                    access_token: access.to_string(),
-                    refresh_token: refresh.to_string(),
-                    expires_at: expires,
-                });
-            }
-        }
-    }
-    None
-}
-
-/// Get Google API key from environment variables.
-fn env_google_api_key() -> Option<String> {
-    for var in [
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "GOOGLE_GENERATIVE_AI_API_KEY",
-    ] {
-        if let Ok(key) = std::env::var(var) {
-            let key = key.trim().to_string();
-            if !key.is_empty() {
-                return Some(key);
-            }
-        }
-    }
-    None
 }
 
 /// Generate a concise summary of recent conversation turns for session rotation.
@@ -14655,27 +7961,33 @@ mod tests {
         claudecode_malformed_startup_message, claudecode_pre_turn_transport_message,
         claudecode_resume_current_session_message, claudecode_transport_failure_data,
         claudecode_transport_failure_stage, claudecode_transport_failure_stage_for_incomplete_turn,
-        claudecode_transport_recovery_strategy, codex_chatgpt_fallback_for_result,
-        codex_chatgpt_fallback_model, codex_error_message_to_surface,
+        claudecode_transport_recovery_strategy, clear_codex_account_cooldown,
+        codex_account_cooldown_remaining, codex_chatgpt_fallback_for_result,
+        codex_chatgpt_fallback_model, codex_cooldown_for_reason, codex_error_message_to_surface,
         codex_final_message_looks_like_progress_update, codex_is_goal_request,
         codex_key_fingerprint, codex_missing_goal_final_response_message,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
         custom_opencode_provider_definition, ensure_opencode_provider_for_model,
-        extract_model_from_message, extract_opencode_session_id, extract_part_text, extract_str,
-        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        extract_codex_reset_window, extract_model_from_message, extract_opencode_session_id,
+        extract_part_text, extract_str, extract_think_content, is_capacity_limited_error,
+        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_opencode_session_id,
         is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
         is_success_path_auth_error, is_success_path_provider_payload_error,
         is_success_path_rate_limited_error, is_tool_call_only_output,
         opencode_goal_terminal_status, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
-        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
-        replace_filepath_artifact_with_tool_output, resolve_cost_cents_and_source, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, thinking_overlaps_visible_answer,
-        use_thinking_only_fallback, ClaudeIncompleteTurnContext, ClaudeTransportFailureStage,
-        ClaudeTransportRecoveryStrategy, ClaudeTurnWaitState, MissionHealth, MissionRunState,
-        MissionStallSeverity, OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        opencode_output_needs_fallback, opencode_session_exists_in_data_home,
+        opencode_session_token_from_line, parse_opencode_goal_objective,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        preferred_model_for_cost, record_codex_error_message,
+        replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
+        set_codex_account_cooldown, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
+        strip_think_tags, summarize_codex_usage_caps, summarize_recent_opencode_stderr,
+        text_buffer_stream_looks_degenerate, thinking_overlaps_visible_answer,
+        truncate_garbled_output, use_thinking_only_fallback, utf8_safe_prefix,
+        ClaudeIncompleteTurnContext, ClaudeTransportFailureStage, ClaudeTransportRecoveryStrategy,
+        ClaudeTurnWaitState, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, CODEX_AUTH_ERROR_COOLDOWN, CODEX_CAPACITY_COOLDOWN,
+        CODEX_RATE_LIMIT_COOLDOWN, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use super::{
         extract_telegram_instructions, grok_event_reasoning, grok_event_text, grok_event_usage,
@@ -14683,12 +7995,54 @@ mod tests {
         localhost_api_base_url, merge_stream_fragment, public_api_base_url,
     };
     use crate::agents::{AgentResult, CostSource, TerminalReason};
+    use crate::cost::resolve_cost_cents_and_source;
     use crate::library::types::CommandParam;
     use serde_json::json;
     use std::borrow::Cow;
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn extract_codex_reset_window_pulls_the_reset_time() {
+        let msg = "You've hit your usage limit. Visit \
+                   https://chatgpt.com/codex/settings/usage to purchase more credits \
+                   or try again at Jun 11th, 2026 3:00 AM.";
+        assert_eq!(
+            extract_codex_reset_window(msg).as_deref(),
+            Some("Jun 11th, 2026 3:00 AM")
+        );
+        assert_eq!(extract_codex_reset_window("some other error"), None);
+    }
+
+    #[test]
+    fn summarize_codex_usage_caps_reports_earliest_reset() {
+        // Two distinct accounts, different reset windows. The summary should
+        // name the soonest (2:26 AM), not whichever was tried last.
+        let outputs = vec![
+            "You've hit your usage limit. … try again at Jun 11th, 2026 3:00 AM.".to_string(),
+            "You've hit your usage limit. … try again at Jun 11th, 2026 2:26 AM.".to_string(),
+        ];
+        let summary = summarize_codex_usage_caps(&outputs, 2);
+        assert!(
+            summary.contains("All 2 connected Codex accounts are at their ChatGPT usage limit"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
+            summary.contains("Earliest reset at Jun 11th, 2026 2:26 AM."),
+            "should report the soonest reset: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_codex_usage_caps_single_window_uses_resets_at() {
+        let outputs = vec![
+            "hit your usage limit … try again at Jun 11th, 2026 3:00 AM.".to_string(),
+            "hit your usage limit … try again at Jun 11th, 2026 3:00 AM.".to_string(),
+        ];
+        let summary = summarize_codex_usage_caps(&outputs, 2);
+        assert!(summary.contains("Usage resets at Jun 11th, 2026 3:00 AM."));
+    }
 
     #[test]
     fn grok_typed_reasoning_event_is_not_answer_text() {
@@ -15067,6 +8421,57 @@ mod tests {
     }
 
     #[test]
+    fn codex_account_cooldown_set_query_clear() {
+        let fp = "test:cooldown-roundtrip";
+        assert!(codex_account_cooldown_remaining(fp).is_none());
+        set_codex_account_cooldown(fp, std::time::Duration::from_secs(60));
+        let remaining = codex_account_cooldown_remaining(fp).expect("cooldown set");
+        assert!(remaining <= std::time::Duration::from_secs(60));
+        assert!(remaining > std::time::Duration::from_secs(50));
+        clear_codex_account_cooldown(fp);
+        assert!(codex_account_cooldown_remaining(fp).is_none());
+    }
+
+    #[test]
+    fn codex_account_cooldown_expires() {
+        let fp = "test:cooldown-expiry";
+        set_codex_account_cooldown(fp, std::time::Duration::from_millis(0));
+        // A zero-duration cooldown is immediately lapsed.
+        assert!(codex_account_cooldown_remaining(fp).is_none());
+        clear_codex_account_cooldown(fp);
+    }
+
+    #[test]
+    fn utf8_safe_prefix_respects_char_boundaries() {
+        // The exact production crash: em-dash (3 bytes) straddling byte 100.
+        let msg = format!("{}\u{2014}maybe using a few workflows", "a".repeat(98));
+        let prefix = utf8_safe_prefix(&msg, 100);
+        assert_eq!(prefix.len(), 98); // backs off to before the em-dash
+        assert!(prefix.chars().all(|c| c == 'a'));
+        // Boundary-exact and short inputs pass through untouched.
+        assert_eq!(utf8_safe_prefix("abc", 100), "abc");
+        assert_eq!(utf8_safe_prefix("abcd", 4), "abcd");
+        assert_eq!(utf8_safe_prefix("ab\u{2014}", 3), "ab");
+    }
+
+    #[test]
+    fn codex_cooldown_reason_mapping() {
+        assert_eq!(
+            codex_cooldown_for_reason(&TerminalReason::RateLimited),
+            Some(CODEX_RATE_LIMIT_COOLDOWN)
+        );
+        assert_eq!(
+            codex_cooldown_for_reason(&TerminalReason::CapacityLimited),
+            Some(CODEX_CAPACITY_COOLDOWN)
+        );
+        assert_eq!(
+            codex_cooldown_for_reason(&TerminalReason::AuthError),
+            Some(CODEX_AUTH_ERROR_COOLDOWN)
+        );
+        assert_eq!(codex_cooldown_for_reason(&TerminalReason::Cancelled), None);
+    }
+
+    #[test]
     fn success_path_error_detection_requires_explicit_provider_failures() {
         assert!(is_success_path_rate_limited_error(
             "You've hit your limit · resets 9pm"
@@ -15117,14 +8522,69 @@ mod tests {
     }
 
     #[test]
-    fn opencode_idle_timeout_result_discards_partial_success_text() {
-        let message =
-            opencode_idle_timeout_result_message("Je m'en occupe ! Je te fais ça en parallèle.");
+    fn opencode_idle_timeout_result_does_not_leak_model_fragment() {
+        // The previous version echoed a snippet of the model's last text
+        // fragment (often a half-finished `<think>` tail) into the assistant
+        // bubble, which read as a corrupted reply. The new message must not
+        // contain that fragment.
+        let model_fragment = "Je m'en occupe ! Je te fais ça en parallèle.";
+        let message = opencode_idle_timeout_result_message(model_fragment);
 
-        assert!(message.starts_with("OpenCode idle timeout:"));
-        assert!(message.contains("Partial output was discarded"));
-        assert!(message.contains("Je m'en occupe"));
-        assert!(!message.contains("La réponse a été interrompue"));
+        assert!(
+            message.starts_with("OpenCode turn aborted"),
+            "expected clean turn-aborted header, got: {message}"
+        );
+        assert!(
+            !message.contains(model_fragment),
+            "idle-timeout error must not leak the model fragment: {message}"
+        );
+        assert!(message.contains("Resume") || message.contains("retry"));
+    }
+
+    #[test]
+    fn opencode_idle_timeout_result_with_empty_partial() {
+        let message = opencode_idle_timeout_result_message("");
+        assert!(message.starts_with("OpenCode turn aborted"));
+        assert!(message.contains("Resume") || message.contains("retry"));
+    }
+
+    #[test]
+    fn truncate_garbled_output_leaves_normal_long_text_alone() {
+        // 30 unique lines, no repetition — should not be touched.
+        let text = (0..30)
+            .map(|i| format!("This is line number {i} with some unique content here."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(truncate_garbled_output(&text).is_none());
+    }
+
+    #[test]
+    fn truncate_garbled_output_truncates_repeated_block_dump() {
+        // Simulate the production bug: a model echoing an nvidia-smi table
+        // over and over, prefixed by a short non-repeated intro.
+        let intro = "Let me check the GPU state on the DGX.\n";
+        let block = "\
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+|  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC  |";
+        let repeated = vec![block; 30].join("\n");
+        let text = format!("{intro}{repeated}");
+
+        let truncated = truncate_garbled_output(&text).expect("garbling detected");
+        // The intro is preserved; the repeated block is cut.
+        assert!(truncated.starts_with(intro.trim_end()));
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.len() < text.len());
+    }
+
+    #[test]
+    fn truncate_garbled_output_ignores_short_inputs() {
+        // Anything below the MIN_LENGTH threshold (2000) is left alone —
+        // the heuristic is only safe on long outputs where repetition is
+        // statistically meaningful.
+        let text = "this is repeated\n".repeat(50);
+        assert!(truncate_garbled_output(&text).is_none());
     }
 
     #[test]
@@ -15319,6 +8779,39 @@ mod tests {
         assert_eq!(opencode_session_token_from_line("session=foo_bar"), None);
         assert_eq!(opencode_session_token_from_line("session id: short"), None);
         assert_eq!(opencode_session_token_from_line("no session here"), None);
+    }
+
+    #[test]
+    fn is_opencode_session_id_accepts_ses_prefix_alphanumeric() {
+        // Real OpenCode session ids: `ses_` prefix + base62/alphanumeric body.
+        assert!(is_opencode_session_id("ses_14ecf17a4ffezc57OUz1Zz9Noc"));
+        assert!(is_opencode_session_id("ses_abc123"));
+        assert!(is_opencode_session_id("ses_ZZ9a0bC1"));
+    }
+
+    #[test]
+    fn is_opencode_session_id_rejects_claude_code_uuid() {
+        // Mission creation pre-assigns a UUID for Claude Code conversation
+        // persistence. Handing that to the opencode CLI causes
+        // 'Error: Session not found', so we must NOT treat it as an
+        // OpenCode session id.
+        let uuid = "71082b52-ccc7-4845-b7a4-f96dbaf6020e";
+        assert!(!is_opencode_session_id(uuid));
+        assert!(!is_opencode_session_id(
+            "b5e8d8d9-11ad-4870-8b37-fe9c33b32c8f"
+        ));
+    }
+
+    #[test]
+    fn is_opencode_session_id_rejects_garbage() {
+        assert!(!is_opencode_session_id(""));
+        assert!(!is_opencode_session_id("ses_")); // missing body
+        assert!(!is_opencode_session_id("ses")); // missing prefix
+        assert!(!is_opencode_session_id("session_abc")); // wrong prefix
+        assert!(!is_opencode_session_id("ses_abc-def")); // hyphens not allowed
+                                                         // Whitespace is trimmed before the prefix check, so leading/trailing
+                                                         // spaces do not disqualify a valid id.
+        assert!(is_opencode_session_id("  ses_abc123  "));
     }
 
     #[test]
@@ -15656,7 +9149,13 @@ mod tests {
         )
         .expect("write provider store");
 
-        ensure_opencode_provider_for_model(&config_dir, &app_dir, "spark/qwen3.5-397b");
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "spark/qwen3.5-397b",
+            "127.0.0.1",
+            None,
+        );
 
         let opencode_json: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
@@ -15670,6 +9169,69 @@ mod tests {
             opencode_json["provider"]["spark"]["options"]["baseURL"],
             "https://spark-de79.gazella-vector.ts.net/v1"
         );
+    }
+
+    #[test]
+    fn opencode_session_exists_checks_per_mission_store() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let data_home = temp.path().join(".local/share");
+
+        // Empty store → session not found (legacy pre-XDG-isolation session).
+        assert!(!opencode_session_exists_in_data_home(
+            &data_home,
+            "ses_abc123"
+        ));
+
+        // Session info file present (nested layout) → found.
+        let info_dir = data_home.join("opencode/storage/session/proj");
+        fs::create_dir_all(&info_dir).unwrap();
+        fs::write(info_dir.join("ses_abc123.json"), "{}").unwrap();
+        assert!(opencode_session_exists_in_data_home(
+            &data_home,
+            "ses_abc123"
+        ));
+
+        // Message dir layout also counts.
+        let temp2 = tempfile::tempdir().expect("temp dir");
+        let data_home2 = temp2.path().join(".local/share");
+        fs::create_dir_all(data_home2.join("opencode/storage/message/ses_xyz")).unwrap();
+        assert!(opencode_session_exists_in_data_home(&data_home2, "ses_xyz"));
+    }
+
+    #[test]
+    fn ensure_opencode_provider_builtin_uses_workspace_host_ip() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("ws");
+        let app_dir = temp.path().join("app");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // Private-network container case: the proxy must be addressed via
+        // the veth gateway, not the container's own loopback.
+        ensure_opencode_provider_for_model(
+            &config_dir,
+            &app_dir,
+            "builtin/smart",
+            "10.88.0.1",
+            Some("00000000-0000-0000-0000-000000000123"),
+        );
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let base_url = opencode_json["provider"]["builtin"]["options"]["baseURL"]
+            .as_str()
+            .expect("baseURL");
+        assert!(
+            base_url.starts_with("http://10.88.0.1:"),
+            "expected veth gateway baseURL, got {base_url}"
+        );
+        let mission_header = opencode_json["provider"]["builtin"]["options"]["headers"]
+            [crate::api::proxy_liveness::MISSION_ID_HEADER]
+            .as_str()
+            .expect("mission id header");
+        assert_eq!(mission_header, "00000000-0000-0000-0000-000000000123");
     }
 
     // ── extract_part_text tests ───────────────────────────────────────
@@ -15903,6 +9465,76 @@ mod tests {
         let input = "before<think>🛡 reasoning 🎯</think>after";
         let result = strip_think_tags(input);
         assert_eq!(result, "beforeafter");
+    }
+
+    // ── extract_think_content tests ───────────────────────────────────
+
+    #[test]
+    fn extract_think_content_closed_tag() {
+        let text = "<think>secret reasoning</think>\n\nvisible answer";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("secret reasoning")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_unclosed_tag() {
+        let text = "<think>still thinking...";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("still thinking...")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_no_tags() {
+        assert!(extract_think_content("no think tags here").is_none());
+    }
+
+    #[test]
+    fn extract_think_content_empty() {
+        assert_eq!(
+            extract_think_content("<think></think>").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_concatenates_multiple_blocks() {
+        // The model emits two reasoning chunks separated by visible text —
+        // both blocks should land in the same Thinking event.
+        let text = "<think>first reasoning</think> visible <think>second reasoning</think>";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("first reasoning\nsecond reasoning")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_handles_unclosed_then_closed() {
+        // Edge case: a previous unclosed opener (we'll just include the rest)
+        // then a new closed block. Order is preserved.
+        let text = "<think>still going...<think>fresh start</think>";
+        // First opener has no close, so we include everything from after it
+        // until end of input. The second opener is inside that region so we
+        // re-enter the loop on the next iteration.
+        let got = extract_think_content(text).expect("some opener found");
+        assert!(got.contains("still going..."), "got: {got}");
+        assert!(got.contains("fresh start"), "got: {got}");
+    }
+
+    #[test]
+    fn extract_think_content_case_insensitive_open() {
+        // Some models emit <Think> (capitalised) — we already match openers
+        // case-insensitively, but close-tag handling must too. Pin the
+        // current contract: OPEN tag is case-insensitive, close tag follows
+        // suit because both go through find_ci.
+        let text = "<Think>mixed case reasoning</Think>";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("mixed case reasoning")
+        );
     }
 
     #[test]
@@ -17317,5 +10949,66 @@ mod tests {
             localhost_api_base_url(Some(" 3000 ")).as_deref(),
             Some("http://127.0.0.1:3000")
         );
+    }
+
+    // ── Degenerate-stream detector ────────────────────────────────
+    //
+    // Reproduces the ab260b2e incident: Claude Code streamed "Yielding
+    // pending your choice." (or similar short repeated string) for 50+ min
+    // before the model hit max_tokens. The detector should fire on a loop
+    // large enough to matter, and NOT fire on a normal response that
+    // happens to contain repeated short strings (e.g. "yes, yes, yes").
+
+    #[test]
+    fn degenerate_detector_flags_long_repeated_phrase() {
+        let phrase = "Yielding pending your choice between the three options. ";
+        let mut s = String::new();
+        for _ in 0..50 {
+            s.push_str(phrase);
+        }
+        assert!(
+            text_buffer_stream_looks_degenerate(&s, 4096, 40, 3),
+            "should detect a 50x repetition of a 50-char phrase"
+        );
+    }
+
+    #[test]
+    fn degenerate_detector_does_not_flag_normal_paragraph() {
+        let s = "I'll first look at the file, then summarize the trade-offs, and finally \
+                 recommend a course of action. The first step is to read the relevant docs.";
+        assert!(
+            !text_buffer_stream_looks_degenerate(s, 4096, 40, 3),
+            "normal prose should not trigger the detector"
+        );
+    }
+
+    #[test]
+    fn degenerate_detector_does_not_flag_short_repetitions() {
+        // "yes, yes, yes" is too short (3 chars) to trigger the 40-char floor.
+        let s = "yes, ".repeat(200);
+        assert!(
+            !text_buffer_stream_looks_degenerate(&s, 4096, 40, 3),
+            "sub-threshold repetitions must not trigger the detector"
+        );
+    }
+
+    #[test]
+    fn degenerate_detector_does_not_flag_insufficient_repeats() {
+        // 40-char phrase repeated only 2x; min_repeats is 3.
+        let phrase = "Yielding pending your choice between the three. ";
+        let s = format!("{phrase}{phrase}{phrase}");
+        // Now 3x of a 50-char phrase, so should trigger.
+        assert!(text_buffer_stream_looks_degenerate(&s, 4096, 40, 3));
+        // But only 2x should not.
+        let s2 = format!("{phrase}{phrase}");
+        assert!(!text_buffer_stream_looks_degenerate(&s2, 4096, 40, 3));
+    }
+
+    #[test]
+    fn degenerate_detector_handles_partial_window() {
+        // Long, normal answer followed by a degenerate tail.
+        let mut s = String::from("Here is the plan: A, B, C. We should pick B. ");
+        s.push_str(&"Yielding pending your choice. ".repeat(20));
+        assert!(text_buffer_stream_looks_degenerate(&s, 4096, 40, 3));
     }
 }

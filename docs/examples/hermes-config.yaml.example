@@ -30,10 +30,15 @@ mcp_servers:
         - list_missions
         - get_mission
         - get_mission_events
+        - get_mission_health
+        - get_mission_diagnostics
         - start_mission
         - send_message_to_mission
+        - update_mission_settings
+        - resume_mission
         - cancel_mission
         - list_workspaces
+        - workspace_bash
       prompts: false
       resources: false
 

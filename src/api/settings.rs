@@ -23,6 +23,7 @@ use super::routes::AppState;
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(get_settings).put(update_settings))
+        .route("/llm-roles", get(get_llm_roles))
         .route("/library-remote", put(update_library_remote))
         .route("/backup", get(download_backup))
         .route("/restore", post(restore_backup))
@@ -38,6 +39,7 @@ pub struct SettingsResponse {
     pub auto_cleanup_enabled: Option<bool>,
     pub auto_cleanup_days: Option<u32>,
     pub ask_assistant_model: Option<String>,
+    pub metadata_model: Option<String>,
 }
 
 impl From<Settings> for SettingsResponse {
@@ -50,6 +52,7 @@ impl From<Settings> for SettingsResponse {
             auto_cleanup_enabled: settings.auto_cleanup_enabled,
             auto_cleanup_days: settings.auto_cleanup_days,
             ask_assistant_model: settings.ask_assistant_model,
+            metadata_model: settings.metadata_model,
         }
     }
 }
@@ -72,6 +75,10 @@ pub struct UpdateSettingsRequest {
     /// Double-Option so a present `null` clears it (back to env/default).
     #[serde(default)]
     pub ask_assistant_model: Option<Option<String>>,
+    /// Model override for mission titles & status. Same clear semantics as
+    /// `ask_assistant_model`; only routable values are honored at runtime.
+    #[serde(default)]
+    pub metadata_model: Option<Option<String>>,
 }
 
 /// Request to update library remote specifically.
@@ -97,6 +104,77 @@ pub struct UpdateLibraryRemoteResponse {
 async fn get_settings(State(state): State<Arc<AppState>>) -> Json<SettingsResponse> {
     let settings = state.settings.get().await;
     Json(settings.into())
+}
+
+/// Where the assistant model came from: an explicit Settings override, the
+/// `ASK_ASSISTANT_MODEL` env var, or automatic resolution (built-in default
+/// or provider-ladder fallback).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AssistantModelSource {
+    Settings,
+    Env,
+    Auto,
+}
+
+/// Response for the LLM roles status endpoint.
+#[derive(Debug, Serialize)]
+struct LlmRolesResponse {
+    /// The Ask sidecar co-pilot.
+    assistant: super::metadata_llm::LlmRoleStatus,
+    assistant_source: AssistantModelSource,
+    /// Mission titles & status lines.
+    metadata: super::metadata_llm::LlmRoleStatus,
+    metadata_source: AssistantModelSource,
+}
+
+/// GET /api/settings/llm-roles
+/// Sanitized view of which provider/model each backend LLM role resolves to.
+async fn get_llm_roles(State(state): State<Arc<AppState>>) -> Json<LlmRolesResponse> {
+    let model_override = state.settings.get().await.ask_assistant_model;
+
+    let assistant = super::metadata_llm::assistant_role_status(
+        &state.ai_providers,
+        &state.chain_store,
+        model_override.clone(),
+    )
+    .await;
+    let metadata_override = state.settings.get().await.metadata_model;
+    let metadata = super::metadata_llm::metadata_role_status(
+        &state.ai_providers,
+        &state.chain_store,
+        metadata_override.clone(),
+    )
+    .await;
+    let metadata_source = match metadata_override.filter(|m| !m.trim().is_empty()) {
+        Some(model) if metadata.model.as_deref() == Some(model.trim()) => {
+            AssistantModelSource::Settings
+        }
+        _ => AssistantModelSource::Auto,
+    };
+
+    // The override is honored only when the resolved model actually matches it
+    // (a non-Cerebras ladder fallback serves its own model namespace).
+    let explicit = model_override
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| (AssistantModelSource::Settings, m))
+        .or_else(|| {
+            std::env::var("ASK_ASSISTANT_MODEL")
+                .ok()
+                .filter(|m| !m.trim().is_empty())
+                .map(|m| (AssistantModelSource::Env, m))
+        });
+    let assistant_source = match explicit {
+        Some((source, model)) if assistant.model.as_deref() == Some(model.trim()) => source,
+        _ => AssistantModelSource::Auto,
+    };
+
+    Json(LlmRolesResponse {
+        assistant,
+        assistant_source,
+        metadata,
+        metadata_source,
+    })
 }
 
 /// PUT /api/settings
@@ -146,6 +224,11 @@ async fn update_settings(
         }
         new_settings.auto_cleanup_days = Some(value);
     }
+    let mut metadata_model_changed = false;
+    if let Some(value) = req.metadata_model {
+        new_settings.metadata_model = value.filter(|s| !s.trim().is_empty());
+        metadata_model_changed = true;
+    }
     if let Some(value) = req.ask_assistant_model {
         // Normalize empty string to None (fall back to env/default).
         new_settings.ask_assistant_model = value.filter(|s| !s.trim().is_empty());
@@ -156,6 +239,18 @@ async fn update_settings(
         .update(new_settings.clone())
         .await
         .map_err(internal_error)?;
+
+    // Apply the metadata override to the live summarizer client without a
+    // restart (the assistant client re-resolves per turn; metadata is a
+    // long-lived singleton).
+    if metadata_model_changed {
+        super::metadata_llm::refresh_metadata_llm_config(
+            &state.ai_providers,
+            &state.chain_store,
+            new_settings.metadata_model.clone(),
+        )
+        .await;
+    }
 
     Ok(Json(new_settings.into()))
 }

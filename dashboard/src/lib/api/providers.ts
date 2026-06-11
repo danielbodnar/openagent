@@ -316,6 +316,19 @@ export interface ProviderUsage {
   coding_plan?: Record<string, unknown>;
   // Z.AI last call usage
   last_call_usage?: Record<string, unknown>;
+  // Codex (OpenAI ChatGPT subscription) limits — primary = 5h window,
+  // secondary = weekly (7d) window. Reset fields are unix epoch seconds.
+  codex_plan_type?: string;
+  codex_active_limit?: string;
+  codex_primary_used_percent?: number;
+  codex_primary_window_minutes?: number;
+  codex_primary_reset_at?: number;
+  codex_secondary_used_percent?: number;
+  codex_secondary_window_minutes?: number;
+  codex_secondary_reset_at?: number;
+  codex_credits_balance?: number;
+  codex_credits_unlimited?: boolean;
+  codex_source?: "probe" | "passive";
   // Any additional fields
   [key: string]: unknown;
 }

@@ -646,11 +646,19 @@ final class APIService {
         let _: EmptyResponse = try await delete("/api/control/queue/\(messageId)")
     }
 
-    func clearQueue() async throws -> Int {
+    /// Clear queued messages. When `missionId` is given, only messages
+    /// targeting that mission are cleared — without it the backend wipes
+    /// every mission's queue.
+    func clearQueue(missionId: String? = nil) async throws -> Int {
         struct ClearResponse: Decodable {
             let cleared: Int
         }
-        let response: ClearResponse = try await delete("/api/control/queue")
+        var path = "/api/control/queue"
+        if let missionId,
+           let encoded = missionId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            path += "?mission_id=\(encoded)"
+        }
+        let response: ClearResponse = try await delete(path)
         return response.cleared
     }
 

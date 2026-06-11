@@ -407,10 +407,87 @@ impl ResultEvent {
 
 // ── Event conversion ──────────────────────────────────────────────
 
+/// Marker emitted for thinking blocks whose content never reaches us in
+/// plaintext (OAuth-encrypted / signature-only extended thinking).
+pub const ENCRYPTED_THINKING_MARKER: &str = "[encrypted thinking]";
+
+/// Per-turn audit of the thinking stream.
+///
+/// The stream parsers historically dropped unrecognized delta types with a
+/// silent `_ => {}`, which made "thinking block opened but zero thinking
+/// decoded" (e.g. OAuth signature-only blocks) invisible: no events, no logs,
+/// an empty thoughts panel. This tracks what was seen so the turn end can
+/// log one warning and surface a marker instead of nothing.
+#[derive(Debug, Default)]
+pub struct ThinkingDeltaAudit {
+    /// Count of undecoded delta payloads per delta_type.
+    pub undecoded: HashMap<String, u64>,
+    /// A content block of type "thinking" or "redacted_thinking" was opened.
+    pub saw_thinking_block: bool,
+    /// At least one plaintext thinking delta was decoded and emitted.
+    pub emitted_thinking: bool,
+}
+
+impl ThinkingDeltaAudit {
+    pub fn note_block_start(&mut self, block_type: &str) {
+        if matches!(block_type, "thinking" | "redacted_thinking") {
+            self.saw_thinking_block = true;
+        }
+    }
+
+    pub fn note_undecoded_delta(&mut self, delta_type: &str) {
+        *self.undecoded.entry(delta_type.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn note_emitted_thinking(&mut self) {
+        self.emitted_thinking = true;
+    }
+
+    /// Close out the turn: warn once about undecoded delta types and return
+    /// the encrypted-thinking marker when a thinking block produced no
+    /// decodable content. Resets state for the next turn.
+    pub fn finish_turn(&mut self) -> Option<String> {
+        if !self.undecoded.is_empty() {
+            let mut types: Vec<String> = self
+                .undecoded
+                .iter()
+                .map(|(t, n)| format!("{t}×{n}"))
+                .collect();
+            types.sort();
+            tracing::warn!(
+                undecoded_delta_types = %types.join(", "),
+                "Stream contained delta types the parser does not decode; \
+                 thinking/text may be incomplete for this turn"
+            );
+        }
+        let marker = if self.saw_thinking_block && !self.emitted_thinking {
+            Some(ENCRYPTED_THINKING_MARKER.to_string())
+        } else {
+            None
+        };
+        *self = Self::default();
+        marker
+    }
+}
+
 /// Convert a CLI event to backend-agnostic ExecutionEvents.
+///
+/// Test/back-compat wrapper around [`convert_cli_event_audited`] that
+/// discards the thinking audit.
 pub fn convert_cli_event(
     event: CliEvent,
     pending_tools: &mut HashMap<String, String>,
+) -> Vec<ExecutionEvent> {
+    let mut audit = ThinkingDeltaAudit::default();
+    convert_cli_event_audited(event, pending_tools, &mut audit)
+}
+
+/// Convert a CLI event to backend-agnostic ExecutionEvents, recording
+/// thinking-stream anomalies in `audit` (see [`ThinkingDeltaAudit`]).
+pub fn convert_cli_event_audited(
+    event: CliEvent,
+    pending_tools: &mut HashMap<String, String>,
+    audit: &mut ThinkingDeltaAudit,
 ) -> Vec<ExecutionEvent> {
     let mut results = vec![];
 
@@ -424,28 +501,37 @@ pub fn convert_cli_event(
 
         CliEvent::StreamEvent(wrapper) => match wrapper.event {
             StreamEvent::ContentBlockDelta { delta, .. } => {
+                let mut decoded = false;
                 if let Some(text) = delta.text {
                     if !text.is_empty() {
                         results.push(ExecutionEvent::TextDelta { content: text });
                     }
+                    decoded = true;
                 }
                 if let Some(thinking) = delta.thinking {
                     if !thinking.is_empty() {
+                        audit.note_emitted_thinking();
                         results.push(ExecutionEvent::Thinking {
                             content: thinking,
                             item_id: None,
                         });
                     }
+                    decoded = true;
                 }
                 if let Some(partial) = delta.partial_json {
                     debug!("Tool input delta: {}", partial);
+                    decoded = true;
+                }
+                if !decoded {
+                    audit.note_undecoded_delta(&delta.delta_type);
                 }
             }
-            StreamEvent::ContentBlockStart { content_block, .. }
-                if content_block.block_type == "tool_use" =>
-            {
-                if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                    pending_tools.insert(id, name);
+            StreamEvent::ContentBlockStart { content_block, .. } => {
+                audit.note_block_start(&content_block.block_type);
+                if content_block.block_type == "tool_use" {
+                    if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
+                        pending_tools.insert(id, name);
+                    }
                 }
             }
             _ => {}
@@ -469,13 +555,20 @@ pub fn convert_cli_event(
                     }
                     ContentBlock::Thinking { thinking } => {
                         if !thinking.is_empty() {
+                            audit.note_emitted_thinking();
                             results.push(ExecutionEvent::Thinking {
                                 content: thinking,
                                 item_id: None,
                             });
                         }
                     }
-                    ContentBlock::ToolResult { .. } | ContentBlock::RedactedThinking { .. } => {}
+                    ContentBlock::RedactedThinking { .. } => {
+                        // Encrypted thinking: content is opaque. Record the
+                        // block so finish_turn() can surface a marker instead
+                        // of an empty thoughts panel.
+                        audit.note_block_start("redacted_thinking");
+                    }
+                    ContentBlock::ToolResult { .. } => {}
                 }
             }
         }
@@ -549,6 +642,47 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap;
+
+    // ── ThinkingDeltaAudit ──────────────────────────────────────────
+
+    #[test]
+    fn thinking_delta_audit_emits_encrypted_marker() {
+        let mut audit = ThinkingDeltaAudit::default();
+        audit.note_block_start("thinking");
+        audit.note_undecoded_delta("signature_delta");
+        assert_eq!(
+            audit.finish_turn().as_deref(),
+            Some(ENCRYPTED_THINKING_MARKER)
+        );
+        // finish_turn resets for the next turn.
+        assert!(audit.finish_turn().is_none());
+    }
+
+    #[test]
+    fn thinking_delta_audit_no_marker_when_thinking_was_emitted() {
+        let mut audit = ThinkingDeltaAudit::default();
+        audit.note_block_start("thinking");
+        audit.note_emitted_thinking();
+        assert!(audit.finish_turn().is_none());
+    }
+
+    #[test]
+    fn thinking_delta_audit_ignores_non_thinking_blocks() {
+        let mut audit = ThinkingDeltaAudit::default();
+        audit.note_block_start("tool_use");
+        audit.note_block_start("text");
+        assert!(audit.finish_turn().is_none());
+    }
+
+    #[test]
+    fn thinking_delta_audit_marks_redacted_blocks() {
+        let mut audit = ThinkingDeltaAudit::default();
+        audit.note_block_start("redacted_thinking");
+        assert_eq!(
+            audit.finish_turn().as_deref(),
+            Some(ENCRYPTED_THINKING_MARKER)
+        );
+    }
 
     // ── ToolResultContent::to_string_lossy ─────────────────────────
 

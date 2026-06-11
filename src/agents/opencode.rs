@@ -8,7 +8,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::agents::{Agent, AgentContext, AgentId, AgentResult, AgentType, TerminalReason};
-use crate::api::control::{AgentEvent, AgentTreeNode, ControlRunState};
+use crate::api::control::{AgentEvent, AgentTreeNode, ControlRunState, FrontendToolHub};
 use crate::config::Config;
 use crate::opencode::{extract_reasoning, extract_text, OpenCodeClient, OpenCodeEvent};
 use crate::task::Task;
@@ -116,6 +116,7 @@ impl OpenCodeAgent {
                 resumable: ctx.mission_id.is_some(), // Can resume if within a mission
             },
             OpenCodeEvent::MessageComplete { .. } => return, // Don't forward completion marker
+            OpenCodeEvent::Cancelled => return,              // Runner handles cancellation state
             OpenCodeEvent::TurnSummary { .. } => return,     // Summary is handled elsewhere
             OpenCodeEvent::Usage { .. } => return,           // Usage tracked at runner level
             // Goal events are codex-only today; OpenCode missions never
@@ -266,10 +267,18 @@ impl OpenCodeAgent {
                     });
                 }
             }
+            // Keep the mission marked as waiting on the user so the
+            // stuck-mission watchdog does not interrupt it while it is parked
+            // here awaiting an answer. The guard clears the mark on every exit
+            // path (answered or the channel closing).
+            let wait_guard = mission_id.map(|mid| FrontendToolHub::begin_waiting(&tool_hub, mid));
             let rx = tool_hub.register(tool_call_id.clone()).await;
             let Ok(result) = rx.await else {
                 return;
             };
+            // Answer received — the mission resumes emitting events; release
+            // the watchdog exemption.
+            drop(wait_guard);
             if let (Some(status), Some(events), Some(mid)) =
                 (&control_status, &events_tx, mission_id)
             {

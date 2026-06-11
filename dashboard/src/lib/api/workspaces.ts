@@ -155,3 +155,57 @@ export async function getWorkspaceInitLog(id: string): Promise<InitLogResponse> 
   }
   return res.json();
 }
+
+// ---------------------------------------------------------------------------
+// Memory / resources
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceMemoryStats {
+  workspace_id: string;
+  workspace_name: string;
+  workspace_type: string;
+  memory_current_bytes: number | null;
+  memory_peak_bytes: number | null;
+  memory_limit_bytes: number | null;
+  memory_available_bytes: number | null;
+  memory_current_mb: number | null;
+  memory_peak_mb: number | null;
+  memory_limit_mb: string | null;
+  container_name: string | null;
+  error: string | null;
+}
+
+export async function getWorkspaceMemory(id: string): Promise<WorkspaceMemoryStats> {
+  return apiGet(`/api/workspaces/${id}/memory`, "Failed to fetch workspace memory");
+}
+
+export interface UpdateWorkspaceResourcesRequest {
+  /** e.g. "24G", "infinity"; "" clears the override (global default). */
+  memory_max?: string;
+  memory_high?: string;
+  memory_swap_max?: string;
+  /** Persist as a workspace env override (default true). */
+  persist?: boolean;
+  /** Retune currently-running scopes live (default true). */
+  apply_live?: boolean;
+}
+
+export interface UpdateWorkspaceResourcesResponse {
+  applied_units: string[];
+  failed_units: string[];
+  persisted: boolean;
+  memory_max: string | null;
+  memory_high: string | null;
+  memory_swap_max: string | null;
+}
+
+export async function updateWorkspaceResources(
+  id: string,
+  data: UpdateWorkspaceResourcesRequest
+): Promise<UpdateWorkspaceResourcesResponse> {
+  return apiPost(
+    `/api/workspaces/${id}/resources`,
+    data,
+    "Failed to update workspace resources"
+  );
+}

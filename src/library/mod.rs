@@ -1754,10 +1754,6 @@ impl LibraryStore {
         let claudecode_settings_path = profile_dir.join(".claudecode").join("settings.json");
         let sandboxed_config_path = profile_dir.join(".sandboxed-sh").join("config.json");
 
-        // Legacy paths for backward compatibility
-        let legacy_sandboxed_path = profile_dir.join("sandboxed").join("config.json");
-        let legacy_claudecode_path = profile_dir.join("claudecode").join("config.json");
-
         // Collect all files in the profile for file-based editing
         let mut files = Vec::new();
 
@@ -1775,18 +1771,10 @@ impl LibraryStore {
             serde_json::json!({})
         };
 
-        // Load Sandboxed config (try new path first, then legacy)
+        // Load Sandboxed config. (Legacy `sandboxed/config.json` fallback
+        // removed — migration to dot-prefixed paths completed in 2025.)
         let sandboxed_config = if sandboxed_config_path.exists() {
             let content = fs::read_to_string(&sandboxed_config_path)
-                .await
-                .context("Failed to read sandboxed config")?;
-            files.push(ConfigProfileFile {
-                path: ".sandboxed-sh/config.json".to_string(),
-                content: content.clone(),
-            });
-            serde_json::from_str(&content).unwrap_or_default()
-        } else if legacy_sandboxed_path.exists() {
-            let content = fs::read_to_string(&legacy_sandboxed_path)
                 .await
                 .context("Failed to read sandboxed config")?;
             files.push(ConfigProfileFile {
@@ -1798,18 +1786,10 @@ impl LibraryStore {
             SandboxedConfig::default()
         };
 
-        // Load Claude Code config (try new path first, then legacy)
+        // Load Claude Code config. (Legacy `claudecode/config.json` fallback
+        // removed — migration to dot-prefixed paths completed in 2025.)
         let claudecode_config = if claudecode_settings_path.exists() {
             let content = fs::read_to_string(&claudecode_settings_path)
-                .await
-                .context("Failed to read claudecode config")?;
-            files.push(ConfigProfileFile {
-                path: ".claudecode/settings.json".to_string(),
-                content: content.clone(),
-            });
-            serde_json::from_str(&content).unwrap_or_default()
-        } else if legacy_claudecode_path.exists() {
-            let content = fs::read_to_string(&legacy_claudecode_path)
                 .await
                 .context("Failed to read claudecode config")?;
             files.push(ConfigProfileFile {

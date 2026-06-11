@@ -486,16 +486,21 @@ function FilePreviewModalContent({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 md:p-8"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm pointer-events-none" />
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm pointer-events-none" />
       <div
         onClick={(e) => e.stopPropagation()}
         className={cn(
           "relative rounded-2xl bg-[#1a1a1a] border border-white/[0.06] shadow-xl",
           "animate-in fade-in zoom-in-95 duration-200",
-          isImage || canTextPreview ? "max-w-4xl w-full" : "max-w-md w-full"
+          // Previewable files open as a full-page reader (the whole viewport
+          // minus padding) so the document clearly sits over the page rather
+          // than reading as a chat-width inline expansion.
+          isImage || canTextPreview
+            ? "flex h-full w-full max-w-6xl flex-col"
+            : "max-w-md w-full"
         )}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
@@ -527,10 +532,15 @@ function FilePreviewModalContent({
           </div>
         </div>
 
-        <div className="p-5">
+        <div
+          className={cn(
+            "p-5",
+            (isImage || canTextPreview) && "flex min-h-0 flex-1 flex-col"
+          )}
+        >
           {isImage ? (
-            <div className="space-y-4">
-              <div className="relative min-h-[200px] rounded-xl overflow-hidden bg-black/20 flex items-center justify-center">
+            <div className="flex min-h-0 flex-1 flex-col gap-4">
+              <div className="relative min-h-[200px] flex-1 rounded-xl overflow-hidden bg-black/20 flex items-center justify-center">
                 {loading && (
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
                     <div className="w-full max-w-[300px] h-[200px] rounded-lg bg-white/[0.03] animate-pulse" />
@@ -547,7 +557,7 @@ function FilePreviewModalContent({
                 )}
                 {imageUrl && !loading && (
                   /* eslint-disable-next-line @next/next/no-img-element */
-                  <img src={imageUrl} alt={fileName} className="max-w-full max-h-[60vh] object-contain" />
+                  <img src={imageUrl} alt={fileName} className="max-w-full max-h-full object-contain" />
                 )}
               </div>
               <div className="flex items-center justify-between pt-2 border-t border-white/[0.06]">
@@ -567,8 +577,8 @@ function FilePreviewModalContent({
               </div>
             </div>
           ) : canTextPreview ? (
-            <div className="space-y-4">
-              <div className="relative rounded-xl overflow-hidden bg-black/20 border border-white/[0.06]">
+            <div className="flex min-h-0 flex-1 flex-col gap-4">
+              <div className="relative min-h-0 flex-1 rounded-xl overflow-hidden bg-black/20 border border-white/[0.06]">
                 {textLoading && (
                   <div className="p-4">
                     <div className="h-4 w-2/3 rounded bg-white/[0.04] animate-pulse mb-2" />
@@ -586,7 +596,7 @@ function FilePreviewModalContent({
                   </div>
                 )}
                 {textContent != null && !textLoading && (
-                  <div className="max-h-[60vh] overflow-auto p-4">
+                  <div className="h-full overflow-auto p-4">
                     {isMarkdown ? (
                       <div className="prose-glass text-sm [&_p]:my-2">
                         <Markdown

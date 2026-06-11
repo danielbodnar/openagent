@@ -45,6 +45,7 @@ import { cn } from '@/lib/utils';
 import { useToast } from '@/components/toast';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
 import { EnvVarsEditor, type EnvRow, toEnvRows, envRowsToMap, getEncryptedKeys } from '@/components/env-vars-editor';
+import { WorkspaceResources } from '@/components/workspace-resources';
 
 // The nil UUID represents the default "host" workspace which cannot be deleted
 const DEFAULT_WORKSPACE_ID = '00000000-0000-0000-0000-000000000000';
@@ -684,6 +685,11 @@ export default function WorkspacesPage() {
                         <p className="text-sm text-red-300">{extractErrorSummary(selectedWorkspace.error_message)}</p>
                       </div>
                     </div>
+                  )}
+
+                  {/* Live memory usage + caps for container workspaces */}
+                  {selectedWorkspace.workspace_type === 'container' && (
+                    <WorkspaceResources workspaceId={selectedWorkspace.id} />
                   )}
 
                   {/* Network settings for container workspaces */}

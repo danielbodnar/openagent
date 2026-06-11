@@ -50,6 +50,7 @@ import {
   Check,
   Pencil,
   Sparkles,
+  Eraser,
 } from 'lucide-react';
 import { cn, formatRelativeTime } from '@/lib/utils';
 
@@ -301,6 +302,41 @@ function EntryEditor({
 // Chain Card
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Minimal pill switch matching the dashboard's indigo accent + radius scale. */
+function Toggle({
+  checked,
+  onChange,
+  disabled,
+  label,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+  label?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={cn(
+        'relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors cursor-pointer active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed',
+        checked ? 'bg-indigo-500' : 'bg-white/[0.12] hover:bg-white/[0.18]'
+      )}
+    >
+      <span
+        className={cn(
+          'inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-sm transition-transform',
+          checked ? 'translate-x-[18px]' : 'translate-x-[3px]'
+        )}
+      />
+    </button>
+  );
+}
+
 function ChainCard({
   chain,
   onUpdate,
@@ -309,11 +345,23 @@ function ChainCard({
   providers,
 }: {
   chain: ModelChain;
-  onUpdate: (id: string, data: { name?: string; entries?: ChainEntry[]; is_default?: boolean }) => Promise<void>;
+  onUpdate: (id: string, data: { name?: string; entries?: ChainEntry[]; is_default?: boolean; strip_thinking?: boolean }) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
   onSetDefault: (id: string) => Promise<void>;
   providers: Provider[];
 }) {
+  const [savingStrip, setSavingStrip] = useState(false);
+
+  const handleToggleStrip = async (next: boolean) => {
+    setSavingStrip(true);
+    try {
+      await onUpdate(chain.id, { strip_thinking: next });
+    } catch {
+      // onUpdate surfaces the error toast.
+    } finally {
+      setSavingStrip(false);
+    }
+  };
   const [expanded, setExpanded] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(chain.name);
@@ -410,6 +458,22 @@ function ChainCard({
 
       {expanded && (
         <div className="border-t border-white/[0.04] px-3 py-3 space-y-3">
+          {/* Post-processing: strip reasoning tags */}
+          <div className="flex items-center gap-3 rounded-lg border border-white/[0.05] bg-white/[0.015] px-3 py-2">
+            <Eraser className="h-3.5 w-3.5 text-indigo-400/70 flex-shrink-0" />
+            <div className="min-w-0 flex-1">
+              <p className="text-xs text-white/70">Strip reasoning tags</p>
+              <p className="mt-0.5 text-[10px] leading-snug text-white/35">
+                Removes <code className="rounded bg-white/[0.06] px-1 py-px font-mono text-white/55">&lt;think&gt;…&lt;/think&gt;</code> blocks and stray closing tags from replies. For models that leak reasoning into content (MiniMax, GLM).
+              </p>
+            </div>
+            <Toggle
+              checked={chain.strip_thinking}
+              onChange={handleToggleStrip}
+              disabled={savingStrip}
+              label="Strip reasoning tags"
+            />
+          </div>
           {editing ? (
             <>
               <div>
@@ -635,6 +699,7 @@ export default function ModelRoutingPage() {
     name: '',
     entries: [{ provider_id: '', model_id: '' }] as ChainEntry[],
     is_default: false,
+    strip_thinking: false,
   });
 
   const {
@@ -688,6 +753,7 @@ export default function ModelRoutingPage() {
         name: createForm.name.trim(),
         entries: validEntries,
         is_default: createForm.is_default,
+        strip_thinking: createForm.strip_thinking,
       });
       toast.success('Chain created');
       setShowCreate(false);
@@ -696,6 +762,7 @@ export default function ModelRoutingPage() {
         name: '',
         entries: [{ provider_id: '', model_id: '' }],
         is_default: false,
+        strip_thinking: false,
       });
       mutateChains();
     } catch (err) {
@@ -705,7 +772,7 @@ export default function ModelRoutingPage() {
 
   const handleUpdate = async (
     id: string,
-    data: { name?: string; entries?: ChainEntry[]; is_default?: boolean }
+    data: { name?: string; entries?: ChainEntry[]; is_default?: boolean; strip_thinking?: boolean }
   ) => {
     try {
       await updateModelChain(id, data);
@@ -937,22 +1004,34 @@ export default function ModelRoutingPage() {
                 providers={providers}
               />
               <div className="flex items-center justify-between pt-1">
-                <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={createForm.is_default}
-                    onChange={(e) =>
-                      setCreateForm({ ...createForm, is_default: e.target.checked })
-                    }
-                    className="rounded border-white/20 cursor-pointer"
-                  />
-                  Set as default chain
-                </label>
+                <div className="flex items-center gap-4">
+                  <label className="flex items-center gap-2 text-xs text-white/60 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={createForm.is_default}
+                      onChange={(e) =>
+                        setCreateForm({ ...createForm, is_default: e.target.checked })
+                      }
+                      className="rounded border-white/20 cursor-pointer"
+                    />
+                    Set as default chain
+                  </label>
+                  <span className="flex items-center gap-2 text-xs text-white/60">
+                    <Toggle
+                      checked={createForm.strip_thinking}
+                      onChange={(next) =>
+                        setCreateForm({ ...createForm, strip_thinking: next })
+                      }
+                      label="Strip reasoning tags"
+                    />
+                    Strip reasoning tags
+                  </span>
+                </div>
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => {
                       setShowCreate(false);
-                      setCreateForm({ id: '', name: '', entries: [{ provider_id: '', model_id: '' }], is_default: false });
+                      setCreateForm({ id: '', name: '', entries: [{ provider_id: '', model_id: '' }], is_default: false, strip_thinking: false });
                     }}
                     className="rounded-lg px-3 py-1.5 text-xs text-white/60 hover:text-white/80 transition-colors cursor-pointer"
                   >

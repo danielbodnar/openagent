@@ -144,6 +144,16 @@ pub struct StoredEvent {
     pub metadata: serde_json::Value,
 }
 
+/// Persisted summary for one tool call across all of its stored events.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallSummary {
+    pub has_result: bool,
+    pub result_sequence: Option<i64>,
+    pub result_timestamp: Option<String>,
+    pub call_content_bytes: usize,
+    pub result_content_bytes: usize,
+}
+
 /// Aggregated AI token/cost usage for a single (normalized) model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelUsageStats {
@@ -1340,6 +1350,39 @@ pub trait MissionStore: Send + Sync {
         Ok(vec![])
     }
 
+    /// Get all persisted events for a specific tool call, ordered by
+    /// sequence ASC. Used by lazy history hydration.
+    async fn get_events_for_tool_call(
+        &self,
+        mission_id: Uuid,
+        tool_call_id: &str,
+    ) -> Result<Vec<StoredEvent>, String> {
+        let _ = (mission_id, tool_call_id);
+        Ok(vec![])
+    }
+
+    /// Get the most recent distinct tool call ids for a mission, ordered by
+    /// their latest event sequence descending. Used to keep conversation
+    /// profile trace tails stable across paged event responses.
+    async fn get_recent_tool_call_ids(
+        &self,
+        mission_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let _ = (mission_id, limit);
+        Ok(vec![])
+    }
+
+    /// Get persisted summaries for specific tool calls.
+    async fn get_tool_call_summaries(
+        &self,
+        mission_id: Uuid,
+        tool_call_ids: &[String],
+    ) -> Result<HashMap<String, ToolCallSummary>, String> {
+        let _ = (mission_id, tool_call_ids);
+        Ok(HashMap::new())
+    }
+
     /// Count events for a mission, optionally filtered by type.
     async fn count_events(
         &self,
@@ -1423,6 +1466,43 @@ pub trait MissionStore: Send + Sync {
     /// Aggregate AI usage per UTC hour. Buckets with no usage are omitted.
     /// Returned timestamps are in `YYYY-MM-DDTHH` form (no minutes/seconds).
     async fn get_usage_by_hour(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<HourlyUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Record one OpenAI-compatible /v1 router request's token usage.
+    /// `model` should already be normalized (see `crate::cost::normalized_model`).
+    async fn record_proxy_usage(
+        &self,
+        _model: &str,
+        _input_tokens: u64,
+        _output_tokens: u64,
+        _cost_cents: u64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Aggregate /v1 router usage per model. Merged with mission usage by the
+    /// usage summary endpoint.
+    async fn get_proxy_usage_by_model(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<ModelUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate /v1 router usage per UTC day.
+    async fn get_proxy_usage_by_day(
+        &self,
+        _since: Option<&str>,
+    ) -> Result<Vec<DailyUsageStats>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate /v1 router usage per UTC hour (`YYYY-MM-DDTHH`).
+    async fn get_proxy_usage_by_hour(
         &self,
         _since: Option<&str>,
     ) -> Result<Vec<HourlyUsageStats>, String> {

@@ -46,6 +46,25 @@ export class LibraryUnavailableError extends Error {
   }
 }
 
+/** Error carrying the HTTP status code, for callers that need to branch on it
+ * (e.g. treating a 404 on DELETE as "already gone" rather than a failure). */
+export class HttpStatusError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "HttpStatusError";
+    this.status = status;
+  }
+}
+
+export function isHttpStatusError(
+  error: unknown,
+  status: number,
+): error is HttpStatusError {
+  return error instanceof HttpStatusError && error.status === status;
+}
+
 // ---------------------------------------------------------------------------
 // Base Fetch with Auth
 // ---------------------------------------------------------------------------

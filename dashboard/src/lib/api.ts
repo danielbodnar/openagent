@@ -33,6 +33,7 @@ import {
   libPut,
   libDel,
   ensureLibraryResponse,
+  HttpStatusError,
 } from "./api/core";
 
 // Types that remain in this file (not yet migrated to modules)
@@ -448,12 +449,15 @@ export async function postControlToolResult(payload: {
   tool_call_id: string;
   name: string;
   result: unknown;
-}): Promise<void> {
-  return apiPost(
+}): Promise<{ ok: boolean; delivered: boolean }> {
+  const res = await apiPost<{ ok?: boolean; delivered?: boolean } | undefined>(
     "/api/control/tool_result",
     payload,
     "Failed to post tool result",
   );
+  // Older backends returned a bare `{ ok: true }` with no delivery signal;
+  // treat a missing flag as delivered so we don't false-alarm against them.
+  return { ok: res?.ok ?? true, delivered: res?.delivered ?? true };
 }
 
 export async function cancelControl(): Promise<void> {
@@ -482,14 +486,26 @@ export async function getQueue(): Promise<QueuedMessage[]> {
 }
 
 export async function removeFromQueue(messageId: string): Promise<void> {
-  return apiDel(
-    `/api/control/queue/${messageId}`,
-    "Failed to remove from queue",
-  );
+  const res = await apiFetch(`/api/control/queue/${messageId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    // Carry the status so callers can treat 404 ("message not in queue")
+    // as already-removed instead of a hard failure.
+    throw new HttpStatusError("Failed to remove from queue", res.status);
+  }
 }
 
-export async function clearQueue(): Promise<{ cleared: number }> {
-  return apiDel("/api/control/queue", "Failed to clear queue");
+/** Clear queued messages. When `missionId` is given, only messages targeting
+ * that mission are cleared — without it the backend wipes every mission's
+ * queue. */
+export async function clearQueue(
+  missionId?: string,
+): Promise<{ cleared: number }> {
+  const path = missionId
+    ? `/api/control/queue?mission_id=${encodeURIComponent(missionId)}`
+    : "/api/control/queue";
+  return apiDel(path, "Failed to clear queue");
 }
 
 // ── Ask assistant (non-interrupting sidecar co-pilot) ──────────────────────
@@ -3033,6 +3049,7 @@ export interface SettingsResponse {
   auto_cleanup_enabled: boolean | null;
   auto_cleanup_days: number | null;
   ask_assistant_model: string | null;
+  metadata_model: string | null;
 }
 
 export interface UpdateLibraryRemoteResponse {
@@ -3044,6 +3061,30 @@ export interface UpdateLibraryRemoteResponse {
 // Get all settings
 export async function getSettings(): Promise<SettingsResponse> {
   return apiGet("/api/settings", "Failed to get settings");
+}
+
+/** Sanitized resolved config for one backend LLM role (no API key). */
+export interface LlmRoleStatus {
+  available: boolean;
+  provider?: string;
+  model?: string;
+  base_url?: string;
+}
+
+export interface LlmRolesResponse {
+  /** The Ask sidecar co-pilot. */
+  assistant: LlmRoleStatus;
+  /** Where the assistant model came from. */
+  assistant_source: "settings" | "env" | "auto";
+  /** Mission titles & status lines. */
+  metadata: LlmRoleStatus;
+  /** Where the metadata model came from. */
+  metadata_source: "settings" | "env" | "auto";
+}
+
+// Get the resolved provider/model for each backend LLM role
+export async function getLlmRoles(): Promise<LlmRolesResponse> {
+  return apiGet("/api/settings/llm-roles", "Failed to get LLM roles");
 }
 
 export async function updateSettings(
@@ -3118,9 +3159,11 @@ export async function getBackend(id: string): Promise<Backend> {
 // List agents for a specific backend
 export async function listBackendAgents(
   backendId: string,
+  profile?: string | null,
 ): Promise<BackendAgent[]> {
+  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
   return apiGet(
-    `/api/backends/${encodeURIComponent(backendId)}/agents`,
+    `/api/backends/${encodeURIComponent(backendId)}/agents${query}`,
     "Failed to list backend agents",
   );
 }

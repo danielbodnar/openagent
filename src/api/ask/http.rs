@@ -117,14 +117,16 @@ pub async fn ask_send(
 
     // Resolve the assistant model/config (Settings override → env → default).
     let model_override = state.settings.get().await.ask_assistant_model;
-    let cfg =
-        crate::api::metadata_llm::build_assistant_llm_config(&state.ai_providers, model_override)
-            .await
-            .ok_or((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No assistant LLM configured (set a Cerebras key or ASK_ASSISTANT_MODEL)"
-                    .to_string(),
-            ))?;
+    let cfg = crate::api::metadata_llm::build_assistant_llm_config(
+        &state.ai_providers,
+        &state.chain_store,
+        model_override,
+    )
+    .await
+    .ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No assistant LLM configured (set a Cerebras key or ASK_ASSISTANT_MODEL)".to_string(),
+    ))?;
 
     let ask_store = super::ask_store(&state.config).await.map_err(internal)?;
 
@@ -181,6 +183,7 @@ pub async fn ask_send(
     let used_sandbox = sandbox_dir.is_some();
     let work_dir = sandbox_dir.clone().unwrap_or_else(|| base_work_dir.clone());
 
+    let workspace_id = workspace.id;
     let turn = AskTurn {
         ask_store: Arc::clone(&ask_store),
         mission_store: Arc::clone(&control.mission_store),
@@ -190,6 +193,11 @@ pub async fn ask_send(
         mission_id,
         thread_id: thread.id,
         sandbox: used_sandbox,
+        workspaces: Arc::clone(&state.workspaces),
+        workspace_id,
+        proxy_keys: Arc::clone(&state.proxy_api_keys),
+        control_cmd_tx: control.cmd_tx.clone(),
+        events_tx: control.events_tx.clone(),
     };
 
     let answer_result = run_ask_turn(&turn, &req.content).await;
@@ -236,9 +244,11 @@ pub async fn ask_send_stream(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Mission not found".to_string()))?;
 
-    let cfg = crate::api::metadata_llm::build_assistant_llm_config(&state.ai_providers, {
-        state.settings.get().await.ask_assistant_model
-    })
+    let cfg = crate::api::metadata_llm::build_assistant_llm_config(
+        &state.ai_providers,
+        &state.chain_store,
+        state.settings.get().await.ask_assistant_model,
+    )
     .await
     .ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -299,6 +309,7 @@ pub async fn ask_send_stream(
     let used_sandbox = sandbox_dir.is_some();
     let work_dir = sandbox_dir.clone().unwrap_or_else(|| base_work_dir.clone());
 
+    let workspace_id = workspace.id;
     let turn = AskTurn {
         ask_store: Arc::clone(&ask_store),
         mission_store: Arc::clone(&control.mission_store),
@@ -308,6 +319,11 @@ pub async fn ask_send_stream(
         mission_id,
         thread_id: thread.id,
         sandbox: used_sandbox,
+        workspaces: Arc::clone(&state.workspaces),
+        workspace_id,
+        proxy_keys: Arc::clone(&state.proxy_api_keys),
+        control_cmd_tx: control.cmd_tx.clone(),
+        events_tx: control.events_tx.clone(),
     };
 
     let content = req.content.clone();

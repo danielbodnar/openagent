@@ -650,6 +650,15 @@ pub struct ModelChain {
     /// Whether this is the default chain.
     #[serde(default)]
     pub is_default: bool,
+    /// Strip model "thinking" markup from response content before returning
+    /// it: `<think>…</think>` blocks and stray orphan `</think>` tags, in both
+    /// streaming and non-streaming responses. Some reasoning models (MiniMax,
+    /// GLM) emit these tags inline in `content` rather than a separate
+    /// `reasoning_content` field, leaking raw reasoning into clients that
+    /// render content verbatim (e.g. the Hermes Telegram gateway). Off by
+    /// default; toggled per chain.
+    #[serde(default)]
+    pub strip_thinking: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -849,6 +858,7 @@ impl ModelChainStore {
                     },
                 ],
                 is_default: true,
+                strip_thinking: false,
                 created_at: now,
                 updated_at: now,
             });
@@ -888,6 +898,17 @@ impl ModelChainStore {
                     changed = true;
                     tracing::info!("Migrated builtin/smart model IDs to current defaults");
                 }
+                // Force strip_thinking=false: the backend now extracts <think>
+                // content as thinking events before stripping. Keeping it true
+                // discards reasoning at the proxy level.
+                if chain.strip_thinking {
+                    chain.strip_thinking = false;
+                    chain.updated_at = now;
+                    changed = true;
+                    tracing::info!(
+                        "Reset builtin/smart strip_thinking to false (backend handles extraction)"
+                    );
+                }
             }
         }
 
@@ -900,6 +921,7 @@ impl ModelChainStore {
                     model_id: "glm-4.7".to_string(),
                 }],
                 is_default: false,
+                strip_thinking: false,
                 created_at: now,
                 updated_at: now,
             });
@@ -915,6 +937,7 @@ impl ModelChainStore {
                     model_id: "glm-5-turbo".to_string(),
                 }],
                 is_default: false,
+                strip_thinking: false,
                 created_at: now,
                 updated_at: now,
             });
@@ -942,6 +965,9 @@ impl ModelChainStore {
                     },
                 ],
                 is_default: false,
+                // MiniMax/GLM leak `<think>` tags into content; strip them so
+                // the Hermes gateway doesn't render raw reasoning.
+                strip_thinking: true,
                 created_at: now,
                 updated_at: now,
             });
@@ -965,6 +991,7 @@ impl ModelChainStore {
                         model_id: "zai-glm-4.7".to_string(),
                     },
                 ];
+                chain.strip_thinking = true;
                 chain.updated_at = now;
                 changed = true;
                 tracing::info!("Healed builtin/assistant chain to visible-content providers");
@@ -1449,6 +1476,7 @@ mod tests {
                 name: chain_id.to_string(),
                 entries,
                 is_default: false,
+                strip_thinking: false,
                 created_at: now,
                 updated_at: now,
             })
@@ -1475,6 +1503,7 @@ mod tests {
             name: id.to_string(),
             entries,
             is_default,
+            strip_thinking: false,
             created_at: now,
             updated_at: now,
         };

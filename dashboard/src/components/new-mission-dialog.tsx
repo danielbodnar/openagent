@@ -9,6 +9,7 @@ import useSWR from 'swr';
 import { getVisibleAgents, getSandboxedConfig, listBackends, listBackendAgents, getClaudeCodeConfig, listBackendModelOptions, listProviders, type Backend, type BackendAgent, type BackendModelOption, type ModelEffort, type Provider } from '@/lib/api';
 import type { Workspace } from '@/lib/api';
 import { isBackendAvailable, useBackendConfigs } from '@/lib/use-backend-configs';
+import { toast } from '@/components/toast';
 
 const KNOWN_BACKEND_IDS = ['opencode', 'claudecode', 'codex', 'gemini', 'grok'] as const;
 
@@ -176,10 +177,22 @@ export function NewMissionDialog({
     return backends?.filter((b) => isBackendAvailable(backendConfigs[b.id])) || [];
   }, [backends, backendConfigs]);
 
-  // SWR: fetch agents for each enabled backend
+  const workspaceProfile = useMemo(() => {
+    const targetWorkspace = newMissionWorkspace
+      ? workspaces.find((workspace) => workspace.id === newMissionWorkspace)
+      : workspaces.find((workspace) => workspace.id === '00000000-0000-0000-0000-000000000000')
+        || workspaces.find((workspace) => workspace.workspace_type === 'host');
+    return targetWorkspace?.config_profile || null;
+  }, [newMissionWorkspace, workspaces]);
+
+  // SWR: fetch agents for each enabled backend.  OpenCode agents are
+  // profile-aware: native `.opencode/agents/*.md` files live under the
+  // selected workspace's library config profile.
   const { data: opencodeAgents, mutate: mutateOpencodeAgents } = useSWR<BackendAgent[]>(
-    open && enabledBackends.some(b => b.id === 'opencode') ? 'backend-opencode-agents' : null,
-    () => listBackendAgents('opencode'),
+    open && enabledBackends.some(b => b.id === 'opencode')
+      ? `backend-opencode-agents:${workspaceProfile ?? 'default'}`
+      : null,
+    () => listBackendAgents('opencode', workspaceProfile),
     { revalidateOnFocus: true, dedupingInterval: 5000 }
   );
   const { data: claudecodeAgents, mutate: mutateClaudecodeAgents } = useSWR<BackendAgent[]>(
@@ -219,14 +232,6 @@ export function NewMissionDialog({
     getClaudeCodeConfig,
     { revalidateOnFocus: false, dedupingInterval: 30000 }
   );
-
-  const workspaceProfile = useMemo(() => {
-    const targetWorkspace = newMissionWorkspace
-      ? workspaces.find((workspace) => workspace.id === newMissionWorkspace)
-      : workspaces.find((workspace) => workspace.id === '00000000-0000-0000-0000-000000000000')
-        || workspaces.find((workspace) => workspace.workspace_type === 'host');
-    return targetWorkspace?.config_profile || null;
-  }, [newMissionWorkspace, workspaces]);
 
   // Combine all agents from enabled backends
   const allAgents = useMemo((): CombinedAgent[] => {
@@ -609,6 +614,13 @@ export function NewMissionDialog({
 
   const handleCreate = async (openInNewTab: boolean) => {
     if (disabled || submitting) return;
+    if (newMissionWorkspace) {
+      const ws = workspaces.find(w => w.id === newMissionWorkspace);
+      if (ws && ws.status !== 'ready') {
+        toast.error(`Workspace "${ws.name}" is not ready (status: ${ws.status}). Please wait for it to finish provisioning.`);
+        return;
+      }
+    }
     const pendingTab = openInNewTab ? window.open('about:blank', '_blank') : null;
     if (pendingTab) {
       pendingTab.opener = null;
@@ -729,20 +741,27 @@ export function NewMissionDialog({
                 {workspaces
                   .filter(
                     (ws) =>
-                      ws.status === 'ready' &&
                       ws.id !== '00000000-0000-0000-0000-000000000000'
                   )
                   .map((workspace) => (
                     <option
                       key={workspace.id}
                       value={workspace.id}
+                      disabled={workspace.status !== 'ready'}
                       className="bg-[#1a1a1a]"
                     >
-                      {workspace.name} ({formatWorkspaceType(workspace.workspace_type)})
+                      {workspace.name} ({formatWorkspaceType(workspace.workspace_type)}){workspace.status !== 'ready' ? ` — ${workspace.status}` : ''}
                     </option>
                   ))}
               </select>
-              <p className="text-xs text-white/30 mt-1.5">Where the mission will run</p>
+              {workspaces.filter(ws => ws.id !== '00000000-0000-0000-0000-000000000000' && ws.status !== 'ready').length > 0 && (
+                <p className="text-xs text-amber-400/60 mt-1.5">
+                  {workspaces.filter(ws => ws.id !== '00000000-0000-0000-0000-000000000000' && ws.status !== 'ready').length} workspace(s) unavailable (not ready). Start them first.
+                </p>
+              )}
+              {workspaces.filter(ws => ws.id !== '00000000-0000-0000-0000-000000000000' && ws.status !== 'ready').length === 0 && (
+                <p className="text-xs text-white/30 mt-1.5">Where the mission will run</p>
+              )}
             </div>
 
             {/* Agent selection (includes backend) */}
@@ -859,7 +878,7 @@ export function NewMissionDialog({
               <p className="text-xs text-white/30 mt-1.5">
                 {selectedBackend === 'opencode'
                     ? 'Use provider/model format (e.g., openai/gpt-5-codex).'
-                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-opus-4-8).'}
+                    : 'Use the raw model ID (e.g., gpt-5-codex or claude-fable-5).'}
               </p>
             </div>
 

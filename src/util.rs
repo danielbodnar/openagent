@@ -95,6 +95,22 @@ pub fn build_history_context(history: &[(String, String)], max_chars: usize) -> 
     result
 }
 
+/// Frame a turn prompt so the model cannot mistake replayed history for the
+/// live request. The bare `USER:`-style history followed by a near-identical
+/// `User:` label made models (observed: codex gpt-5.5) resume unfinished work
+/// from the history and conclude the turn without ever addressing the actual
+/// new message. History goes into an explicitly-fenced context block; the
+/// current message is labeled as this turn's task.
+pub fn frame_turn_prompt(history_context: &str, user_message: &str) -> String {
+    if history_context.trim().is_empty() {
+        return format!("User:\n{user_message}");
+    }
+    format!(
+        "## Conversation history (context only)\n\n{history_context}\
+         ## Current user request (your task for this turn)\n\n{user_message}"
+    )
+}
+
 /// Deduplicate and trim a list of skill names, preserving order.
 pub fn sanitize_skill_list(skills: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
@@ -446,6 +462,27 @@ mod tests {
         let history: Vec<(String, String)> = vec![];
         let result = build_history_context(&history, 10000);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn frame_turn_prompt_fences_history_and_labels_current_request() {
+        let history = "USER: Go ahead and update the issues\n\nASSISTANT: Done. Issue Cleanup\n\n";
+        let result = frame_turn_prompt(history, "what's the most important issue?");
+        assert!(result.starts_with("## Conversation history (context only)"));
+        assert!(result.contains("ASSISTANT: Done. Issue Cleanup"));
+        // The live request must be unambiguously separated from the replayed
+        // history (a bare "User:" label let models resume old work instead).
+        assert!(result.contains("## Current user request (your task for this turn)"));
+        assert!(result
+            .trim_end()
+            .ends_with("what's the most important issue?"));
+    }
+
+    #[test]
+    fn frame_turn_prompt_without_history_keeps_plain_label() {
+        let result = frame_turn_prompt("", "first message");
+        assert_eq!(result, "User:\nfirst message");
+        assert!(!result.contains("## Conversation history"));
     }
 
     #[test]

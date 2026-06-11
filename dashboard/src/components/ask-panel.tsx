@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Sparkles,
   X,
@@ -9,6 +9,8 @@ import {
   Send,
   Loader,
   ChevronDown,
+  ChevronRight,
+  ChevronUp,
   CornerUpLeft,
   Terminal,
   User,
@@ -475,9 +477,17 @@ export function AskPanel({
             </p>
           </div>
         )}
-        {messages.map((m) => (
-          <AskBubble key={m.id} message={m} onSendToAgent={onSendToAgent} />
-        ))}
+        {groupToolRuns(messages).map((item) =>
+          item.kind === "msg" ? (
+            <AskBubble
+              key={item.msg.id}
+              message={item.msg}
+              onSendToAgent={onSendToAgent}
+            />
+          ) : (
+            <AskToolRun key={item.msgs[0].id} messages={item.msgs} />
+          ),
+        )}
         {loading && (
           <div className="flex animate-fade-in justify-start">
             <div className="inline-flex items-center gap-1.5 rounded-full border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--copilot)/0.1)] px-2.5 py-1">
@@ -523,6 +533,92 @@ export function AskPanel({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+type RenderedItem =
+  | { kind: "msg"; msg: AskMessage }
+  | { kind: "run"; msgs: AskMessage[] };
+
+/** Group consecutive tool_call/tool_result rows into runs so each run gets a
+    single collapse affordance (mirrors the main chat's previous-tools fold). */
+function groupToolRuns(messages: AskMessage[]): RenderedItem[] {
+  const out: RenderedItem[] = [];
+  for (const m of messages) {
+    if (m.role === "tool_call" || m.role === "tool_result") {
+      const last = out[out.length - 1];
+      if (last?.kind === "run") last.msgs.push(m);
+      else out.push({ kind: "run", msgs: [m] });
+    } else {
+      out.push({ kind: "msg", msg: m });
+    }
+  }
+  return out;
+}
+
+/** A run of consecutive tool steps with a subtle fold toggle underneath.
+    Expanded by default (the steps are useful context); one quiet click hides
+    the run behind a single summary row. */
+function AskToolRun({ messages }: { messages: AskMessage[] }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const callCount = messages.filter((m) => m.role === "tool_call").length;
+
+  // Keep the toggle pinned under the cursor across fold/unfold (mirrors the
+  // main chat's previous-tools fold): steps reveal *upward* into history and
+  // the content below the toggle never moves. The toggle's viewport position
+  // is captured on click and the scroller re-aligned pre-paint.
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const anchorTopRef = useRef<number | null>(null);
+
+  const setFolded = (next: boolean) => {
+    anchorTopRef.current =
+      toggleRef.current?.getBoundingClientRect().top ?? null;
+    setCollapsed(next);
+  };
+
+  useLayoutEffect(() => {
+    const anchorTop = anchorTopRef.current;
+    if (anchorTop == null) return;
+    anchorTopRef.current = null;
+    const el = toggleRef.current;
+    if (!el) return;
+    const scroller = el.closest(".overflow-y-auto");
+    if (!scroller) return;
+    const delta = el.getBoundingClientRect().top - anchorTop;
+    if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
+  }, [collapsed]);
+
+  if (collapsed) {
+    return (
+      <button
+        ref={toggleRef}
+        type="button"
+        onClick={() => setFolded(false)}
+        className="ml-8 flex items-center gap-1 text-[11px] text-[rgb(var(--foreground)/0.35)] transition-colors hover:text-[rgb(var(--foreground)/0.6)]"
+        title="Show tool steps (they reveal above)"
+      >
+        <ChevronUp className="h-3 w-3" />
+        {callCount} tool step{callCount === 1 ? "" : "s"} hidden
+      </button>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {messages.map((m) => (
+        <AskBubble key={m.id} message={m} />
+      ))}
+      <button
+        ref={toggleRef}
+        type="button"
+        onClick={() => setFolded(true)}
+        className="ml-8 flex items-center gap-1 text-[10px] text-[rgb(var(--foreground)/0.3)] transition-colors hover:text-[rgb(var(--foreground)/0.55)]"
+        title="Hide tool steps"
+      >
+        <ChevronRight className="h-3 w-3" />
+        Hide tool steps
+      </button>
     </div>
   );
 }

@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+// Control event/command types (Phase 6 of the decomposition).
+pub mod events;
+pub use events::*;
+
 use axum::{
     body::Bytes,
     extract::{
@@ -34,6 +38,11 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[allow(unused_imports)]
+use super::supervision::{
+    ack_promotion_loop, cleanup_stale_active_missions_once, recover_server_shutdown_missions,
+    stale_mission_cleanup_loop, stuck_mission_watchdog_loop,
+};
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
@@ -50,26 +59,27 @@ use super::mission_store::{
 };
 use super::routes::AppState;
 
-const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
+pub(crate) const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
 
 /// Silence threshold before declaring a mission stuck. Conservative so
 /// legitimately long codex turns (Lean compiles, CI polls) don't trigger
 /// false positives. Shared between the watchdog loop and the actor's
 /// CancelMission re-check to keep the two views of "stalled" consistent.
-const STUCK_SECONDS: u64 = 900;
+pub(crate) const STUCK_SECONDS: u64 = 900;
 
 /// Grace period after the user first opens an `AwaitingUser` mission before
 /// the ack-promotion tick auto-archives it to `Acknowledged` (Finished).
 /// Resets whenever the user sends a new message (status returns to Active and
 /// `first_viewed_at` is cleared).
-const ACK_GRACE_SECONDS: u64 = 3600;
+pub(crate) const ACK_GRACE_SECONDS: u64 = 3600;
 
 /// How often the ack-promotion tick scans for stale `AwaitingUser` missions.
-const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
-pub(super) fn safe_truncate_index(s: &str, max: usize) -> usize {
+pub(crate) fn safe_truncate_index(s: &str, max: usize) -> usize {
     if s.len() <= max {
         return s.len();
     }
@@ -2056,7 +2066,7 @@ fn status_requires_metadata_milestone_refresh(status: MissionStatus) -> bool {
     !matches!(status, MissionStatus::Pending | MissionStatus::Active)
 }
 
-fn maybe_schedule_mission_metadata_refresh_for_status(
+pub(crate) fn maybe_schedule_mission_metadata_refresh_for_status(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &broadcast::Sender<AgentEvent>,
     mission_id: Uuid,
@@ -2297,7 +2307,7 @@ pub(crate) async fn resolve_claudecode_default_model(
 ) -> Option<String> {
     // Keep this fallback aligned with Anthropic's model catalog:
     // https://docs.anthropic.com/en/docs/about-claude/models/overview
-    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-opus-4-8";
+    const CLAUDECODE_DEFAULT_MODEL: &str = "claude-fable-5";
 
     let lib = {
         let guard = library.read().await;
@@ -2680,491 +2690,6 @@ async fn validate_rich_tags(
     files
 }
 
-/// A structured event emitted by the control session.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentEvent {
-    Status {
-        state: ControlRunState,
-        queue_len: usize,
-        /// Mission this status applies to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    UserMessage {
-        id: Uuid,
-        content: String,
-        /// Whether this message is queued (not yet being processed).
-        #[serde(default)]
-        queued: bool,
-        /// Mission this message belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    AssistantMessage {
-        id: Uuid,
-        content: String,
-        success: bool,
-        cost_cents: u64,
-        cost_source: crate::agents::CostSource,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        usage: Option<crate::cost::TokenUsage>,
-        model: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_normalized: Option<String>,
-        /// Mission this message belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-        /// Files shared in this message (images, documents, etc.)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        shared_files: Option<Vec<SharedFile>>,
-        /// Whether the mission can be resumed after this failure (only relevant when success=false)
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        resumable: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        completion_evidence: Option<crate::agents::CompletionEvidence>,
-    },
-    /// Agent thinking/reasoning (streaming)
-    Thinking {
-        /// Incremental thinking content
-        content: String,
-        /// Whether this is the final thinking chunk
-        done: bool,
-        /// Mission this thinking belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Text content delta (streaming assistant response)
-    TextDelta {
-        /// Accumulated text content so far
-        content: String,
-        /// Mission this text belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// CRDT-style text operations for streaming assistant content.
-    TextOp {
-        mission_id: Uuid,
-        bubble_id: String,
-        ops: Vec<TextOp>,
-    },
-    ToolCall {
-        tool_call_id: String,
-        name: String,
-        args: serde_json::Value,
-        /// Mission this tool call belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    ToolResult {
-        tool_call_id: String,
-        name: String,
-        result: serde_json::Value,
-        /// Mission this result belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    Error {
-        message: String,
-        /// Mission this error belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-        /// Whether the mission can be resumed after this error
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        resumable: bool,
-    },
-    /// Goal-mode iteration marker — fired once per turn while a codex
-    /// `/goal` continuation loop is active. UI renders as "iter N" pill.
-    GoalIteration {
-        iteration: u32,
-        objective: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Goal status transitioned. Carries the canonical status string from
-    /// codex's `thread/goal/updated`: `active`, `paused`, `budgetLimited`,
-    /// `complete`, or `cleared` when the goal was explicitly aborted.
-    GoalStatus {
-        status: String,
-        objective: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Mission status changed (by agent or user)
-    MissionStatusChanged {
-        mission_id: Uuid,
-        status: MissionStatus,
-        summary: Option<String>,
-    },
-    /// Mission title changed (by user)
-    MissionTitleChanged { mission_id: Uuid, title: String },
-    /// Mission metadata changed (title/short description refresh)
-    MissionMetadataUpdated {
-        mission_id: Uuid,
-        title: Option<String>,
-        short_description: Option<String>,
-        metadata_updated_at: Option<String>,
-        updated_at: Option<String>,
-        metadata_source: Option<String>,
-        metadata_model: Option<String>,
-        metadata_version: Option<String>,
-    },
-    /// Mission run settings changed (backend/model/agent/config profile)
-    MissionSettingsUpdated {
-        mission_id: Uuid,
-        backend: String,
-        agent: Option<String>,
-        model_override: Option<String>,
-        model_effort: Option<String>,
-        config_profile: Option<String>,
-        session_id: Option<String>,
-        updated_at: String,
-    },
-    /// Agent phase update (for showing preparation steps)
-    AgentPhase {
-        /// Phase name: "executing", "delegating", etc.
-        phase: String,
-        /// Optional details about what's happening
-        detail: Option<String>,
-        /// Agent name (for hierarchical display)
-        agent: Option<String>,
-        /// Mission this phase belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Agent tree update (for real-time tree visualization)
-    AgentTree {
-        /// The full agent tree structure
-        tree: AgentTreeNode,
-        /// Mission this tree belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Execution progress update (for progress indicator)
-    Progress {
-        /// Total number of subtasks
-        total_subtasks: usize,
-        /// Number of completed subtasks
-        completed_subtasks: usize,
-        /// Currently executing subtask description (if any)
-        current_subtask: Option<String>,
-        /// Current depth level (0=root, 1=subtask, 2=sub-subtask)
-        depth: u8,
-        /// Mission this progress belongs to (for parallel execution)
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// Session ID update (for backends that generate their own session IDs)
-    SessionIdUpdate {
-        /// The new session ID to use for continuation
-        session_id: String,
-        /// Mission this session ID belongs to
-        mission_id: Uuid,
-    },
-    /// Live activity label derived from the current tool call
-    MissionActivity {
-        /// Human-readable activity label (e.g., "Reading: main.rs")
-        label: String,
-        /// Tool name that generated this activity
-        tool_name: String,
-        /// Mission this activity belongs to
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mission_id: Option<Uuid>,
-    },
-    /// FIDO signing approval request forwarded to the mobile app
-    FidoSignRequest {
-        request_id: Uuid,
-        key_type: String,
-        key_fingerprint: String,
-        origin: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hostname: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        workspace: Option<String>,
-        expires_at: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TextOp {
-    Insert { pos: usize, text: String },
-    Replace { range: (usize, usize), text: String },
-    Finalize,
-}
-
-/// A node in the agent tree (for visualization)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentTreeNode {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub node_type: String, // e.g. "Root", "Worker"
-    pub name: String,
-    pub description: String,
-    pub status: String, // "pending", "running", "completed", "failed"
-    pub budget_allocated: u64,
-    pub budget_spent: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub complexity: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selected_model: Option<String>,
-    #[serde(default)]
-    pub children: Vec<AgentTreeNode>,
-}
-
-impl AgentTreeNode {
-    pub fn new(id: &str, node_type: &str, name: &str, description: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            node_type: node_type.to_string(),
-            name: name.to_string(),
-            description: description.to_string(),
-            status: "pending".to_string(),
-            budget_allocated: 0,
-            budget_spent: 0,
-            complexity: None,
-            selected_model: None,
-            children: Vec::new(),
-        }
-    }
-
-    pub fn with_budget(mut self, allocated: u64, spent: u64) -> Self {
-        self.budget_allocated = allocated;
-        self.budget_spent = spent;
-        self
-    }
-
-    pub fn with_status(mut self, status: &str) -> Self {
-        self.status = status.to_string();
-        self
-    }
-
-    pub fn with_complexity(mut self, complexity: f64) -> Self {
-        self.complexity = Some(complexity);
-        self
-    }
-
-    pub fn with_model(mut self, model: &str) -> Self {
-        self.selected_model = Some(model.to_string());
-        self
-    }
-
-    pub fn add_child(&mut self, child: AgentTreeNode) {
-        self.children.push(child);
-    }
-}
-
-impl AgentEvent {
-    pub fn event_name(&self) -> &'static str {
-        match self {
-            AgentEvent::Status { .. } => "status",
-            AgentEvent::UserMessage { .. } => "user_message",
-            AgentEvent::AssistantMessage { .. } => "assistant_message",
-            AgentEvent::Thinking { .. } => "thinking",
-            AgentEvent::TextDelta { .. } => "text_delta",
-            AgentEvent::TextOp { .. } => "text_op",
-            AgentEvent::ToolCall { .. } => "tool_call",
-            AgentEvent::ToolResult { .. } => "tool_result",
-            AgentEvent::Error { .. } => "error",
-            AgentEvent::MissionStatusChanged { .. } => "mission_status_changed",
-            AgentEvent::AgentPhase { .. } => "agent_phase",
-            AgentEvent::AgentTree { .. } => "agent_tree",
-            AgentEvent::Progress { .. } => "progress",
-            AgentEvent::SessionIdUpdate { .. } => "session_id_update",
-            AgentEvent::MissionActivity { .. } => "mission_activity",
-            AgentEvent::MissionTitleChanged { .. } => "mission_title_changed",
-            AgentEvent::MissionMetadataUpdated { .. } => "mission_metadata_updated",
-            AgentEvent::MissionSettingsUpdated { .. } => "mission_settings_updated",
-            AgentEvent::FidoSignRequest { .. } => "fido_sign_request",
-            AgentEvent::GoalIteration { .. } => "goal_iteration",
-            AgentEvent::GoalStatus { .. } => "goal_status",
-        }
-    }
-
-    pub fn mission_id(&self) -> Option<Uuid> {
-        match self {
-            AgentEvent::Status { mission_id, .. } => *mission_id,
-            AgentEvent::UserMessage { mission_id, .. } => *mission_id,
-            AgentEvent::AssistantMessage { mission_id, .. } => *mission_id,
-            AgentEvent::Thinking { mission_id, .. } => *mission_id,
-            AgentEvent::TextDelta { mission_id, .. } => *mission_id,
-            AgentEvent::TextOp { mission_id, .. } => Some(*mission_id),
-            AgentEvent::ToolCall { mission_id, .. } => *mission_id,
-            AgentEvent::ToolResult { mission_id, .. } => *mission_id,
-            AgentEvent::Error { mission_id, .. } => *mission_id,
-            AgentEvent::MissionStatusChanged { mission_id, .. } => Some(*mission_id),
-            AgentEvent::AgentPhase { mission_id, .. } => *mission_id,
-            AgentEvent::AgentTree { mission_id, .. } => *mission_id,
-            AgentEvent::Progress { mission_id, .. } => *mission_id,
-            AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
-            AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
-            AgentEvent::MissionTitleChanged { mission_id, .. } => Some(*mission_id),
-            AgentEvent::MissionMetadataUpdated { mission_id, .. } => Some(*mission_id),
-            AgentEvent::MissionSettingsUpdated { mission_id, .. } => Some(*mission_id),
-            AgentEvent::FidoSignRequest { .. } => None,
-            AgentEvent::GoalIteration { mission_id, .. } => *mission_id,
-            AgentEvent::GoalStatus { mission_id, .. } => *mission_id,
-        }
-    }
-}
-
-/// Internal control commands (queued and processed by the actor).
-#[derive(Debug)]
-pub enum ControlCommand {
-    UserMessage {
-        id: Uuid,
-        content: String,
-        /// Optional agent override for this specific message
-        agent: Option<String>,
-        /// Target mission ID - if provided and differs from running mission, start in parallel
-        target_mission_id: Option<Uuid>,
-        /// Respond with whether the message was queued (true = waiting to be processed)
-        respond: oneshot::Sender<bool>,
-    },
-    ToolResult {
-        tool_call_id: String,
-        name: String,
-        result: serde_json::Value,
-    },
-    Cancel,
-    /// Load a mission (switch to it)
-    LoadMission {
-        id: Uuid,
-        respond: oneshot::Sender<Result<Mission, String>>,
-    },
-    /// Create a new mission
-    CreateMission {
-        title: Option<String>,
-        workspace_id: Option<Uuid>,
-        /// Agent name from library (e.g., "code-reviewer")
-        agent: Option<String>,
-        /// Optional model override (provider/model)
-        model_override: Option<String>,
-        /// Optional model effort override (e.g. low/medium/high/xhigh/max)
-        model_effort: Option<String>,
-        /// Backend to use for this mission ("opencode" or "claudecode")
-        backend: Option<String>,
-        /// Config profile to use for this mission
-        config_profile: Option<String>,
-        /// Parent mission ID (for orchestrated worker missions)
-        parent_mission_id: Option<Uuid>,
-        /// Working directory override (for git worktrees etc.)
-        working_directory: Option<String>,
-        respond: oneshot::Sender<Result<Mission, String>>,
-    },
-    /// Update mission status
-    SetMissionStatus {
-        id: Uuid,
-        status: MissionStatus,
-        respond: oneshot::Sender<Result<(), String>>,
-    },
-    /// Update mission title
-    SetMissionTitle {
-        id: Uuid,
-        title: String,
-        respond: oneshot::Sender<Result<(), String>>,
-    },
-    /// Update mission run settings
-    UpdateMissionSettings {
-        id: Uuid,
-        backend: Option<String>,
-        agent: Option<Option<String>>,
-        model_override: Option<Option<String>>,
-        model_effort: Option<Option<String>>,
-        config_profile: Option<Option<String>>,
-        session_id: String,
-        respond: oneshot::Sender<Result<Mission, String>>,
-    },
-    /// Start a mission in parallel (if slots available)
-    StartParallel {
-        mission_id: Uuid,
-        content: String,
-        respond: oneshot::Sender<Result<(), String>>,
-    },
-    /// Cancel a specific mission
-    CancelMission {
-        mission_id: Uuid,
-        /// If `Some(d)`, only cancel when the runner has been idle for at
-        /// least `d`. Race-protects watchdog/cleanup from killing a
-        /// mission that has already resumed activity in the time between
-        /// the caller's "stalled" observation and the actor processing
-        /// this command. User-initiated cancels pass `None`.
-        min_idle: Option<std::time::Duration>,
-        respond: oneshot::Sender<Result<(), String>>,
-    },
-    /// List currently running missions
-    ListRunning {
-        respond: oneshot::Sender<Vec<super::mission_runner::RunningMissionInfo>>,
-    },
-    /// Resume an interrupted mission
-    ResumeMission {
-        mission_id: Uuid,
-        /// If true, clean the mission's work directory before resuming
-        clean_workspace: bool,
-        /// If true, only update status without sending the automatic resume message
-        skip_message: bool,
-        respond: oneshot::Sender<Result<Mission, String>>,
-    },
-    /// Graceful shutdown - mark running missions as interrupted
-    GracefulShutdown {
-        respond: oneshot::Sender<Vec<Uuid>>,
-    },
-    /// Get the current message queue
-    GetQueue {
-        respond: oneshot::Sender<Vec<QueuedMessage>>,
-    },
-    /// Remove a message from the queue
-    RemoveFromQueue {
-        message_id: Uuid,
-        respond: oneshot::Sender<bool>, // true if removed, false if not found
-    },
-    /// Clear all messages from the queue
-    ClearQueue {
-        respond: oneshot::Sender<usize>, // number of messages cleared
-    },
-}
-
-// ==================== Mission Types ====================
-
-/// Mission status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MissionStatus {
-    /// Mission created but hasn't received any messages yet
-    Pending,
-    Active,
-    /// Agent's turn / automation cycle finished cleanly with no follow-up
-    /// queued; mission is parked waiting for the user to read it.
-    AwaitingUser,
-    /// User opened the mission while it was AwaitingUser and the ack grace
-    /// period elapsed without a new message — mission is auto-archived.
-    Acknowledged,
-    Completed,
-    Failed,
-    /// Mission was interrupted (server shutdown, cancellation, etc.)
-    Interrupted,
-    /// Mission blocked by external factors (type mismatch, access denied, etc.)
-    Blocked,
-    /// Mission not feasible as specified (wrong assumptions in request)
-    NotFeasible,
-}
-
-impl std::fmt::Display for MissionStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pending => write!(f, "pending"),
-            Self::Active => write!(f, "active"),
-            Self::AwaitingUser => write!(f, "awaiting_user"),
-            Self::Acknowledged => write!(f, "acknowledged"),
-            Self::Completed => write!(f, "completed"),
-            Self::Failed => write!(f, "failed"),
-            Self::Blocked => write!(f, "blocked"),
-            Self::NotFeasible => write!(f, "not_feasible"),
-            Self::Interrupted => write!(f, "interrupted"),
-        }
-    }
-}
-
 // Mission and MissionHistoryEntry are now defined in mission_store module
 
 /// Metadata for a desktop session started during a mission.
@@ -3218,6 +2743,15 @@ pub struct SetMissionTitleRequest {
 pub struct FrontendToolHub {
     pending: Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>,
     early_results: Mutex<HashMap<String, serde_json::Value>>,
+    /// Missions currently blocked awaiting a human-provided frontend tool
+    /// result (e.g. `AskUserQuestion`). Ref-counted so a mission with more
+    /// than one concurrent frontend tool call is only cleared once its last
+    /// wait ends. The stuck-mission watchdog consults this so a mission that
+    /// is legitimately waiting for the user is never auto-interrupted for
+    /// "inactivity" — humans routinely take longer than the stall threshold
+    /// to answer. A `std::sync::Mutex` (not tokio) so `WaitingGuard::drop`
+    /// can release the slot synchronously on the cancellation path.
+    waiting_missions: std::sync::Mutex<HashMap<Uuid, usize>>,
 }
 
 impl FrontendToolHub {
@@ -3225,6 +2759,7 @@ impl FrontendToolHub {
         Self {
             pending: Mutex::new(HashMap::new()),
             early_results: Mutex::new(HashMap::new()),
+            waiting_missions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -3248,14 +2783,41 @@ impl FrontendToolHub {
     }
 
     /// Resolve a pending tool call by id.
-    /// If no one has registered yet, the result is cached for later pickup.
-    pub async fn resolve(&self, tool_call_id: &str, result: serde_json::Value) -> Result<(), ()> {
-        let mut pending = self.pending.lock().await;
-        if let Some(tx) = pending.remove(tool_call_id) {
-            let _ = tx.send(result);
-            return Ok(());
+    ///
+    /// Returns `true` if a live waiter received the result (the running mission
+    /// is consuming it). Returns `false` only when no waiter ever appears and
+    /// the result had to be cached in `early_results` — which, for a
+    /// human-answered question, means the mission is no longer running and the
+    /// answer was dropped on the floor.
+    ///
+    /// The harnesses broadcast the `ToolCall` to the frontend *before*
+    /// [`register`](Self::register) runs (there are a couple of `.await`
+    /// points in between), so a fast `tool_result` can race ahead of the
+    /// matching `register`. To avoid misreporting such a delivery as dropped,
+    /// we briefly wait for the imminent registration before falling back to the
+    /// cache. The wait is only ever paid when no waiter is present yet — the
+    /// common case (waiter already parked) returns immediately, and a mission
+    /// that has truly ended simply waits out the short grace window before we
+    /// correctly report the answer as undelivered.
+    pub async fn resolve(&self, tool_call_id: &str, result: serde_json::Value) -> bool {
+        // Total grace window ~250ms (10 × 25ms), only incurred when the waiter
+        // has not registered yet. Bounded so a genuinely dead mission still
+        // reports `delivered: false` promptly.
+        const REGISTER_GRACE_ATTEMPTS: u32 = 10;
+        const REGISTER_GRACE_STEP: std::time::Duration = std::time::Duration::from_millis(25);
+
+        for attempt in 0..=REGISTER_GRACE_ATTEMPTS {
+            {
+                let mut pending = self.pending.lock().await;
+                if let Some(tx) = pending.remove(tool_call_id) {
+                    let _ = tx.send(result);
+                    return true;
+                }
+            }
+            if attempt < REGISTER_GRACE_ATTEMPTS {
+                tokio::time::sleep(REGISTER_GRACE_STEP).await;
+            }
         }
-        drop(pending);
 
         let mut early = self.early_results.lock().await;
         const MAX_EARLY_RESULTS: usize = 256;
@@ -3269,13 +2831,57 @@ impl FrontendToolHub {
             }
         }
         early.insert(tool_call_id.to_string(), result);
-        Ok(())
+        false
+    }
+
+    /// Mark `mission_id` as blocked on user input. The returned guard clears
+    /// the mark when dropped, which covers both the answered path (the parked
+    /// task proceeds and drops the guard) and the cancelled path (the task
+    /// returns early and the guard drops during unwind).
+    pub fn begin_waiting(hub: &Arc<Self>, mission_id: Uuid) -> WaitingGuard {
+        {
+            let mut waiting = hub.waiting_missions.lock().unwrap();
+            *waiting.entry(mission_id).or_insert(0) += 1;
+        }
+        WaitingGuard {
+            hub: Arc::clone(hub),
+            mission_id,
+        }
+    }
+
+    /// True while a mission is parked awaiting a human-provided tool result.
+    pub fn is_waiting_for_input(&self, mission_id: Uuid) -> bool {
+        self.waiting_missions
+            .lock()
+            .unwrap()
+            .get(&mission_id)
+            .is_some_and(|count| *count > 0)
     }
 }
 
 impl Default for FrontendToolHub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// RAII guard that keeps a mission marked as "waiting for user input" in the
+/// [`FrontendToolHub`] for as long as it is held. Created via
+/// [`FrontendToolHub::begin_waiting`].
+pub struct WaitingGuard {
+    hub: Arc<FrontendToolHub>,
+    mission_id: Uuid,
+}
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        let mut waiting = self.hub.waiting_missions.lock().unwrap();
+        if let Some(count) = waiting.get_mut(&self.mission_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                waiting.remove(&self.mission_id);
+            }
+        }
     }
 }
 
@@ -3548,7 +3154,10 @@ pub async fn post_message(
         .await
         .map_err(session_unavailable)?;
     let queued = match queued_rx.await {
-        Ok(value) => value,
+        // The wire response keeps its historical bool shape: `queued` is true
+        // only when the message is waiting for the next turn boundary.
+        // Dropped messages surface as an `AgentEvent::Error` on the stream.
+        Ok(ack) => ack == UserMessageAck::Queued,
         Err(_) => {
             let status = control.status.read().await;
             status.state != ControlRunState::Idle
@@ -3574,17 +3183,26 @@ pub async fn post_tool_result(
     }
 
     let control = control_for_user(&state, &user).await;
+    let (tx, rx) = oneshot::channel();
     control
         .cmd_tx
         .send(ControlCommand::ToolResult {
             tool_call_id: req.tool_call_id,
             name: req.name,
             result: req.result,
+            respond: tx,
         })
         .await
         .map_err(session_unavailable)?;
 
-    Ok(ok_json())
+    // Surface whether the answer reached a live, parked mission. When it did
+    // not, the mission has already ended (e.g. interrupted by the watchdog)
+    // and the answer was dropped — the UI uses this to stop claiming success
+    // and offer a resume instead.
+    let delivered = rx.await.unwrap_or(false);
+    Ok(Json(
+        serde_json::json!({ "ok": true, "delivered": delivered }),
+    ))
 }
 
 /// Cancel the currently running control session task.
@@ -3653,16 +3271,30 @@ pub async fn remove_from_queue(
     }
 }
 
-/// Clear all messages from the queue.
+/// Query parameters for `clear_queue`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ClearQueueQuery {
+    /// When set, only clear messages targeting this mission instead of
+    /// wiping every mission's queue.
+    #[serde(default)]
+    pub mission_id: Option<Uuid>,
+}
+
+/// Clear queued messages (optionally scoped to a single mission via
+/// `?mission_id=`).
 pub async fn clear_queue(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Query(query): Query<ClearQueueQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let (tx, rx) = oneshot::channel();
     control
         .cmd_tx
-        .send(ControlCommand::ClearQueue { respond: tx })
+        .send(ControlCommand::ClearQueue {
+            mission_id: query.mission_id,
+            respond: tx,
+        })
         .await
         .map_err(session_unavailable)?;
     let cleared = rx.await.map_err(|_| {
@@ -4709,6 +4341,14 @@ pub struct GetEventsQuery {
     /// `X-Max-Sequence`; skipping counts avoids an extra indexed DB scan.
     #[serde(default = "default_include_event_counts")]
     pub include_counts: bool,
+    /// Optional response profile. `conversation` keeps the recent transcript
+    /// hydrated while collapsing older tool payloads into lazy stubs.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Number of recent tool call/result pairs to keep fully hydrated for
+    /// `profile=conversation`.
+    #[serde(default)]
+    pub trace_tail: Option<usize>,
 }
 
 fn default_include_event_counts() -> bool {
@@ -4716,6 +4356,7 @@ fn default_include_event_counts() -> bool {
 }
 
 const INACTIVE_EVENT_SUMMARY_AFTER: chrono::Duration = chrono::Duration::minutes(5);
+const CONVERSATION_PROFILE_TRACE_TAIL: usize = 10;
 
 #[derive(Debug, Clone)]
 struct EventSummary {
@@ -4735,8 +4376,23 @@ impl EventSummary {
     }
 }
 
-fn is_stream_summary_event(event_type: &str) -> bool {
-    matches!(event_type, "thinking" | "text_delta")
+/// Gate for the event-logger task: which broadcast events get persisted.
+///
+/// Incremental thinking deltas (`done: false`) are broadcast-only — they
+/// exist for live streaming and each carries the cumulative block buffer, so
+/// persisting them is O(n²) in storage (some missions accumulated 100k+ rows).
+/// Only the block-final `done: true` event, which carries the full block
+/// content, is persisted.
+fn should_persist_event(event: &AgentEvent) -> bool {
+    !matches!(event, AgentEvent::Thinking { done: false, .. })
+}
+
+fn thinking_event_is_done(event: &mission_store::StoredEvent) -> bool {
+    event
+        .metadata
+        .get("done")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn should_summarize_events(mission: &Mission) -> bool {
@@ -4758,30 +4414,87 @@ fn summarize_inactive_stream_events(events: Vec<mission_store::StoredEvent>) -> 
 
     let original_count = events.len();
     let mut summarized = Vec::with_capacity(events.len());
-    let mut pending: Option<mission_store::StoredEvent> = None;
+    // text_delta keeps the legacy last-wins collapse: deltas are cumulative
+    // snapshots and only the latest matters.
+    let mut pending_text: Option<mission_store::StoredEvent> = None;
+    // Thinking collapses per *block*, not per run: a `done: true` row is a
+    // block boundary and rows are never merged across it. Within a block we
+    // keep one row carrying the last non-empty content (legacy data persisted
+    // cumulative snapshots followed by an empty `done: true` finalizer;
+    // current data persists exactly one full-content `done: true` row per
+    // block, which passes through unchanged).
+    let mut pending_thinking: Option<mission_store::StoredEvent> = None;
+    let mut thinking_last_nonempty: Option<String> = None;
+
+    fn flush_thinking(
+        pending: &mut Option<mission_store::StoredEvent>,
+        last_nonempty: &mut Option<String>,
+        out: &mut Vec<mission_store::StoredEvent>,
+    ) {
+        if let Some(mut event) = pending.take() {
+            if event.content.trim().is_empty() {
+                if let Some(content) = last_nonempty.take() {
+                    event.content = content;
+                } else {
+                    // A block that never produced content (legacy empty
+                    // finalizer with no preceding deltas) — drop it.
+                    return;
+                }
+            }
+            // Force the kept row to close its block so the frontend renders
+            // it as a finished thought.
+            event.metadata["done"] = serde_json::Value::Bool(true);
+            out.push(event);
+        }
+        *last_nonempty = None;
+    }
 
     for event in events {
-        if !is_stream_summary_event(&event.event_type) {
-            if let Some(pending) = pending.take() {
+        if event.event_type == "thinking" {
+            // Preserve interleaving: an open text_delta run ends here.
+            if let Some(pending) = pending_text.take() {
                 summarized.push(pending);
             }
-            summarized.push(event);
+            let is_boundary = thinking_event_is_done(&event);
+            if !event.content.trim().is_empty() {
+                thinking_last_nonempty = Some(event.content.clone());
+            }
+            pending_thinking = Some(event);
+            if is_boundary {
+                flush_thinking(
+                    &mut pending_thinking,
+                    &mut thinking_last_nonempty,
+                    &mut summarized,
+                );
+            }
             continue;
         }
 
-        match pending.as_mut() {
-            Some(existing) if existing.event_type == event.event_type => {
-                *existing = event;
-            }
-            Some(_) => {
-                summarized.push(pending.take().expect("pending checked above"));
-                pending = Some(event);
-            }
-            None => pending = Some(event),
+        // Any non-thinking event closes an open thinking run first to
+        // preserve ordering.
+        flush_thinking(
+            &mut pending_thinking,
+            &mut thinking_last_nonempty,
+            &mut summarized,
+        );
+
+        if event.event_type == "text_delta" {
+            pending_text = Some(event);
+            continue;
         }
+
+        if let Some(pending) = pending_text.take() {
+            summarized.push(pending);
+        }
+        summarized.push(event);
     }
 
-    if let Some(pending) = pending {
+    flush_thinking(
+        &mut pending_thinking,
+        &mut thinking_last_nonempty,
+        &mut summarized,
+    );
+    if let Some(pending) = pending_text {
         summarized.push(pending);
     }
 
@@ -4790,6 +4503,115 @@ fn summarize_inactive_stream_events(events: Vec<mission_store::StoredEvent>) -> 
         summarized_count: summarized.len(),
         events: summarized,
     }
+}
+
+fn conversation_profile_enabled(profile: Option<&str>) -> bool {
+    matches!(profile, Some("conversation"))
+}
+
+fn project_conversation_events(
+    events: Vec<mission_store::StoredEvent>,
+    keep_full_tool_call_ids: &HashSet<String>,
+    tool_summaries: &HashMap<String, mission_store::ToolCallSummary>,
+) -> Vec<mission_store::StoredEvent> {
+    if events.is_empty() {
+        return events;
+    }
+
+    #[derive(Default)]
+    struct ToolPair {
+        latest_sequence: i64,
+        has_result: bool,
+        result_sequence: Option<i64>,
+        result_timestamp: Option<String>,
+        call_content_bytes: usize,
+        result_content_bytes: usize,
+    }
+
+    let mut pairs: HashMap<String, ToolPair> = HashMap::new();
+    for event in &events {
+        if !matches!(event.event_type.as_str(), "tool_call" | "tool_result") {
+            continue;
+        }
+        let Some(tool_call_id) = event.tool_call_id.as_ref() else {
+            continue;
+        };
+        let pair = pairs.entry(tool_call_id.clone()).or_default();
+        pair.latest_sequence = pair.latest_sequence.max(event.sequence);
+        if event.event_type == "tool_call" {
+            pair.call_content_bytes = event.content.len();
+        } else {
+            pair.has_result = true;
+            pair.result_sequence = Some(event.sequence);
+            pair.result_timestamp = Some(event.timestamp.clone());
+            pair.result_content_bytes = event.content.len();
+        }
+    }
+
+    let mut projected = Vec::with_capacity(events.len());
+    for mut event in events {
+        if !matches!(event.event_type.as_str(), "tool_call" | "tool_result") {
+            projected.push(event);
+            continue;
+        }
+        let Some(tool_call_id) = event.tool_call_id.clone() else {
+            projected.push(event);
+            continue;
+        };
+        if keep_full_tool_call_ids.contains(&tool_call_id) {
+            projected.push(event);
+            continue;
+        }
+        if event.event_type == "tool_result" {
+            continue;
+        }
+
+        if let Some(pair) = pairs.get(&tool_call_id) {
+            let persisted = tool_summaries.get(&tool_call_id);
+            let has_result = persisted.map_or(pair.has_result, |summary| summary.has_result);
+            if !has_result {
+                projected.push(event);
+                continue;
+            }
+            event.event_type = "tool_stub".to_string();
+            event.content.clear();
+            let mut metadata = event.metadata.as_object().cloned().unwrap_or_default();
+            metadata.insert("lazy".to_string(), serde_json::json!(true));
+            metadata.insert("has_result".to_string(), serde_json::json!(has_result));
+            metadata.insert(
+                "call_sequence".to_string(),
+                serde_json::json!(event.sequence),
+            );
+            metadata.insert(
+                "result_sequence".to_string(),
+                serde_json::json!(persisted
+                    .and_then(|summary| summary.result_sequence)
+                    .or(pair.result_sequence)),
+            );
+            metadata.insert(
+                "result_timestamp".to_string(),
+                serde_json::json!(persisted
+                    .and_then(|summary| summary.result_timestamp.clone())
+                    .or_else(|| pair.result_timestamp.clone())),
+            );
+            metadata.insert(
+                "call_content_bytes".to_string(),
+                serde_json::json!(persisted.map_or(pair.call_content_bytes, |summary| {
+                    summary.call_content_bytes
+                })),
+            );
+            metadata.insert(
+                "result_content_bytes".to_string(),
+                serde_json::json!(persisted.map_or(pair.result_content_bytes, |summary| {
+                    summary.result_content_bytes
+                })),
+            );
+            event.metadata = serde_json::Value::Object(metadata);
+        }
+        projected.push(event);
+    }
+
+    projected
 }
 
 /// Get events for a mission (for debugging/replay).
@@ -4840,11 +4662,38 @@ pub async fn get_mission_events(
             .await
             .map_err(internal_error)?
     };
-    let summary = if should_summarize_events(&mission) {
+    let mut summary = if should_summarize_events(&mission) {
         summarize_inactive_stream_events(events)
     } else {
         EventSummary::unchanged(events)
     };
+    if conversation_profile_enabled(query.profile.as_deref()) {
+        let keep_full_tool_call_ids: HashSet<String> = control
+            .mission_store
+            .get_recent_tool_call_ids(
+                mission_id,
+                query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect();
+        let tool_call_ids = summary
+            .events
+            .iter()
+            .filter_map(|event| event.tool_call_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tool_summaries = control
+            .mission_store
+            .get_tool_call_summaries(mission_id, &tool_call_ids)
+            .await
+            .map_err(internal_error)?;
+        summary.events =
+            project_conversation_events(summary.events, &keep_full_tool_call_ids, &tool_summaries);
+        summary.summarized_count = summary.events.len();
+    }
 
     // Metadata headers let the client decide whether it's caught up
     // without a second round-trip. Failures here are non-fatal — we just
@@ -4903,6 +4752,32 @@ pub async fn get_mission_events(
     );
 
     Ok(response)
+}
+
+pub async fn get_mission_tool_call_events(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path((mission_id, tool_call_id)): Path<(Uuid, String)>,
+) -> Result<Json<Vec<mission_store::StoredEvent>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mission_exists = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?;
+    if mission_exists.is_none() {
+        return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
+    }
+
+    let events = control
+        .mission_store
+        .get_events_for_tool_call(mission_id, &tool_call_id)
+        .await
+        .map_err(internal_error)?;
+    if events.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Tool call not found".to_string()));
+    }
+    Ok(Json(events))
 }
 
 const TRANSCRIPT_EVENT_TYPES: &[&str] = &[
@@ -4999,12 +4874,21 @@ pub struct MissionSnapshotResponse {
     pub running: Option<super::mission_runner::RunningMissionInfo>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnapshotQuery {
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub trace_tail: Option<usize>,
+}
+
 /// Single first-paint payload for clients. It returns the latest visible event
 /// tail plus metadata needed to avoid the old transcript-then-trace redraw.
 pub async fn get_mission_snapshot(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(mission_id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<SnapshotQuery>,
 ) -> Result<Json<MissionSnapshotResponse>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let mut mission = control
@@ -5078,11 +4962,38 @@ pub async fn get_mission_snapshot(
             .await
             .map_err(internal_error)?,
     };
-    let summary = if should_summarize_events(&mission) {
+    let mut summary = if should_summarize_events(&mission) {
         summarize_inactive_stream_events(events)
     } else {
         EventSummary::unchanged(events)
     };
+    if conversation_profile_enabled(query.profile.as_deref()) {
+        let keep_full_tool_call_ids: HashSet<String> = control
+            .mission_store
+            .get_recent_tool_call_ids(
+                mission_id,
+                query.trace_tail.unwrap_or(CONVERSATION_PROFILE_TRACE_TAIL),
+            )
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect();
+        let tool_call_ids = summary
+            .events
+            .iter()
+            .filter_map(|event| event.tool_call_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let tool_summaries = control
+            .mission_store
+            .get_tool_call_summaries(mission_id, &tool_call_ids)
+            .await
+            .map_err(internal_error)?;
+        summary.events =
+            project_conversation_events(summary.events, &keep_full_tool_call_ids, &tool_summaries);
+        summary.summarized_count = summary.events.len();
+    }
     let event_counts = control
         .mission_store
         .count_events_by_type(mission_id, Some(HISTORY_EVENT_TYPES))
@@ -6352,7 +6263,7 @@ fn spawn_control_session(
         mission_cmd_tx,
         events_tx.clone(),
         events_rx,
-        tool_hub,
+        tool_hub.clone(),
         status,
         current_mission,
         current_tree,
@@ -6401,6 +6312,8 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             state.cmd_tx.clone(),
             events_tx.clone(),
+            Arc::clone(&tool_hub),
+            workspaces.clone(),
         ));
         tokio::spawn(ack_promotion_loop(
             Arc::clone(&state.mission_store),
@@ -6413,23 +6326,89 @@ fn spawn_control_session(
         let store = Arc::clone(&state.mission_store);
         let mut event_rx = events_tx.subscribe();
         tokio::spawn(async move {
+            // Per-mission lag counter so we can spot a single noisy mission
+            // dragging the global SQLite write path. Without this, the
+            // generic "Event logger lagged by N events" warning can't tell
+            // us which mission's event stream is the culprit — critical
+            // when investigating incidents like the ab260b2e 50-minute
+            // "Yielding." turn where 396 events streamed to the SSE but
+            // never landed in the database.
+            let mut lag_total: u64 = 0;
+            let lag_per_mission: std::collections::HashMap<Uuid, u64> =
+                std::collections::HashMap::new();
+            let mut processed_total: u64 = 0;
+            let mut processed_per_type: std::collections::HashMap<&'static str, u64> =
+                std::collections::HashMap::new();
+            let mut last_stats_at = std::time::Instant::now();
+            let stats_interval = std::time::Duration::from_secs(60);
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
+                        let ev_name = event.event_name();
+                        *processed_per_type.entry(ev_name).or_insert(0) += 1;
                         // Extract mission_id from event
                         if let Some(mid) = event.mission_id() {
-                            if let Err(e) = store.log_event(mid, &event).await {
-                                tracing::warn!("Failed to log event: {}", e);
+                            if should_persist_event(&event) {
+                                processed_total += 1;
+                                if let Err(e) = store.log_event(mid, &event).await {
+                                    tracing::warn!(
+                                        mission_id = %mid,
+                                        event_type = ev_name,
+                                        "Failed to log event: {}",
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Event logger lagged by {} events", n);
+                        lag_total = lag_total.saturating_add(n);
+                        tracing::warn!(
+                            dropped = n,
+                            lag_total = lag_total,
+                            processed_total = processed_total,
+                            "Event logger lagged by {} events (next recv() resumes after the gap)",
+                            n
+                        );
+                        // Best-effort: record the lag against any missions
+                        // that emitted events immediately after the gap. We
+                        // don't know which mission the missed events belonged
+                        // to, but the next successful recv() tells us who
+                        // was active when we caught up. The Map is cleared
+                        // on every status snapshot to bound memory.
+                        let _ = lag_per_mission; // keep the field alive for the stats block
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
+
+                // Periodic stats: even on the happy path we want a heartbeat
+                // confirming the logger is keeping up. If the gap between
+                // processed and broadcast grows, the next Lagged warning
+                // gets actionable context.
+                if last_stats_at.elapsed() >= stats_interval {
+                    if processed_total > 0 || lag_total > 0 {
+                        tracing::debug!(
+                            processed_total,
+                            lag_total,
+                            by_type = ?processed_per_type,
+                            "Event logger heartbeat"
+                        );
+                    }
+                    last_stats_at = std::time::Instant::now();
+                }
             }
-            tracing::info!("Event logger task stopped");
+            // Drain stats on shutdown so the next restart can see whether
+            // the previous process lost events.
+            if lag_total > 0 || processed_total > 0 {
+                tracing::info!(
+                    processed_total,
+                    lag_total,
+                    by_type = ?processed_per_type,
+                    "Event logger task stopped"
+                );
+            } else {
+                tracing::info!("Event logger task stopped");
+            }
         });
     }
 
@@ -6459,433 +6438,6 @@ fn spawn_control_session(
     }
 
     state
-}
-
-async fn recover_server_shutdown_missions(
-    mission_store: Arc<dyn MissionStore>,
-    events_tx: broadcast::Sender<AgentEvent>,
-    cmd_tx: mpsc::Sender<ControlCommand>,
-) {
-    let mut to_resume = Vec::new();
-    let mut seen = HashSet::new();
-
-    match mission_store.get_all_active_missions().await {
-        Ok(active_missions) => {
-            for mission in active_missions {
-                if mission.mission_mode == super::mission_store::MissionMode::Assistant {
-                    tracing::debug!(
-                        mission_id = %mission.id,
-                        "Startup recovery: leaving assistant-mode active mission idle"
-                    );
-                    continue;
-                }
-
-                tracing::warn!(
-                    mission_id = %mission.id,
-                    title = %mission.title.as_deref().unwrap_or("Untitled"),
-                    updated_at = %mission.updated_at,
-                    "Startup recovery: active task mission survived restart; marking server_shutdown and auto-resuming"
-                );
-                if let Err(e) = mission_store
-                    .update_mission_status_with_reason(
-                        mission.id,
-                        MissionStatus::Interrupted,
-                        Some("server_shutdown"),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        mission_id = %mission.id,
-                        "Startup recovery: failed to mark active mission interrupted: {}",
-                        e
-                    );
-                    continue;
-                }
-
-                maybe_schedule_mission_metadata_refresh_for_status(
-                    &mission_store,
-                    &events_tx,
-                    mission.id,
-                    MissionStatus::Interrupted,
-                );
-                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                    mission_id: mission.id,
-                    status: MissionStatus::Interrupted,
-                    summary: Some(
-                        "Interrupted: server restarted while mission was active".to_string(),
-                    ),
-                });
-
-                if seen.insert(mission.id) {
-                    to_resume.push(mission.id);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Startup recovery: failed to check for active missions: {}",
-                e
-            );
-        }
-    }
-
-    match mission_store
-        .get_recent_server_shutdown_mission_ids(SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS)
-        .await
-    {
-        Ok(mission_ids) => {
-            for mission_id in mission_ids {
-                if seen.insert(mission_id) {
-                    to_resume.push(mission_id);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Startup recovery: failed to check for server-shutdown missions: {}",
-                e
-            );
-        }
-    }
-
-    if to_resume.is_empty() {
-        tracing::debug!("Startup recovery: no server-shutdown missions to auto-resume");
-        return;
-    }
-
-    tracing::warn!(
-        count = to_resume.len(),
-        "Startup recovery: auto-resuming server-shutdown mission(s)"
-    );
-
-    for mission_id in to_resume {
-        let (tx, rx) = oneshot::channel();
-        if let Err(e) = cmd_tx
-            .send(ControlCommand::ResumeMission {
-                mission_id,
-                clean_workspace: false,
-                skip_message: false,
-                respond: tx,
-            })
-            .await
-        {
-            tracing::warn!(
-                mission_id = %mission_id,
-                "Startup recovery: failed to enqueue auto-resume: {}",
-                e
-            );
-            continue;
-        }
-
-        match rx.await {
-            Ok(Ok(_)) => {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    "Startup recovery: auto-resume queued"
-                );
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "Startup recovery: auto-resume failed: {}",
-                    e
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    "Startup recovery: auto-resume response dropped: {}",
-                    e
-                );
-            }
-        }
-    }
-}
-
-/// Apply the stale-mission safety net once.
-///
-/// We intentionally do not infer "orphaned" from `MissionStatus::Active` alone here.
-/// Missions remain `active` between turns while waiting for the next user message or
-/// queued automation, so the periodic cleanup task cannot safely treat "not currently
-/// running" as an interruption without spuriously flipping healthy Claude missions to
-/// `interrupted`.
-async fn cleanup_stale_active_missions_once(
-    mission_store: &Arc<dyn MissionStore>,
-    stale_hours: u64,
-    events_tx: &broadcast::Sender<AgentEvent>,
-    cmd_tx: &mpsc::Sender<ControlCommand>,
-) {
-    match mission_store.get_stale_active_missions(stale_hours).await {
-        Ok(stale_missions) => {
-            for mission in stale_missions {
-                tracing::info!(
-                    "Auto-closing stale mission {}: '{}' (inactive since {})",
-                    mission.id,
-                    mission.title.as_deref().unwrap_or("Untitled"),
-                    mission.updated_at
-                );
-
-                // Ask the control actor to cancel any in-memory runner
-                // for this mission before we overwrite DB status. Without
-                // this, a frozen runner (e.g. stuck in `child.wait()` on
-                // an orphaned tool subprocess) would keep
-                // `running_mission_id` pinned and /api/control/running
-                // would keep reporting the mission as "running, stalled"
-                // until the daemon restarts. CancelMission is idempotent
-                // — it returns "not found" when there is no live runner,
-                // which is the common case for stale missions, and we
-                // ignore that error.
-                let (tx, rx) = oneshot::channel();
-                if cmd_tx
-                    .send(ControlCommand::CancelMission {
-                        mission_id: mission.id,
-                        min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
-                        respond: tx,
-                    })
-                    .await
-                    .is_ok()
-                {
-                    let _ = rx.await;
-                }
-
-                if let Err(e) = mission_store
-                    .update_mission_status(mission.id, MissionStatus::Completed)
-                    .await
-                {
-                    tracing::warn!("Failed to auto-close stale mission {}: {}", mission.id, e);
-                } else {
-                    maybe_schedule_mission_metadata_refresh_for_status(
-                        mission_store,
-                        events_tx,
-                        mission.id,
-                        MissionStatus::Completed,
-                    );
-                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                        mission_id: mission.id,
-                        status: MissionStatus::Completed,
-                        summary: Some(format!(
-                            "Auto-closed after {} hours of inactivity",
-                            stale_hours
-                        )),
-                    });
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to check for stale missions: {}", e);
-        }
-    }
-}
-
-/// Background task that periodically cleans up stale missions.
-/// Periodic watchdog: marks missions interrupted when the runner has
-/// stalled for too long, even if the mission row is still `Active`.
-///
-/// Two cases this catches that the boot-time orphan recovery and the
-/// daily stale-mission cleanup miss:
-/// 1. mission_runner task died mid-flight (e.g. codex stdio EOF after
-///    one of our reconnect attempts). The mission row stays Active
-///    forever because nothing emits a terminal status; the codex
-///    process can survive in its container namespace.
-/// 2. codex itself hung — process alive but `futex_wait_queue` with no
-///    events. Observed live on prod after a deploy mid-mission: 70+
-///    minutes of silence, dashboard correctly flagged "may be stuck"
-///    but no path was forcing termination.
-///
-/// Threshold is intentionally generous (15 min) so a model in the
-/// middle of a slow API turn or a long shell command isn't false-killed.
-/// Periodic ack-promotion: scans `AwaitingUser` missions whose
-/// `first_viewed_at` is older than `ACK_GRACE_SECONDS` and flips them to
-/// `Acknowledged`. Broadcasts `MissionStatusChanged` so dashboard/iOS clients
-/// move the row from "Needs You" to "Finished" without a refresh.
-async fn ack_promotion_loop(
-    mission_store: Arc<dyn MissionStore>,
-    events_tx: broadcast::Sender<AgentEvent>,
-) {
-    tracing::info!(
-        "Ack-promotion loop started: grace {}s, tick {}s",
-        ACK_GRACE_SECONDS,
-        ACK_PROMOTION_TICK_INTERVAL.as_secs()
-    );
-    loop {
-        tokio::time::sleep(ACK_PROMOTION_TICK_INTERVAL).await;
-        match mission_store
-            .acknowledge_stale_awaiting_user_missions(ACK_GRACE_SECONDS)
-            .await
-        {
-            Ok(promoted) => {
-                for mission_id in promoted {
-                    let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                        mission_id,
-                        status: MissionStatus::Acknowledged,
-                        summary: None,
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Ack-promotion tick failed: {}", e);
-            }
-        }
-    }
-}
-
-async fn stuck_mission_watchdog_loop(
-    mission_store: Arc<dyn MissionStore>,
-    cmd_tx: mpsc::Sender<ControlCommand>,
-    events_tx: broadcast::Sender<AgentEvent>,
-) {
-    use std::collections::HashSet;
-
-    const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-    tracing::info!(
-        "Stuck-mission watchdog started: threshold {}s, poll every {}s",
-        STUCK_SECONDS,
-        CHECK_INTERVAL.as_secs()
-    );
-
-    loop {
-        tokio::time::sleep(CHECK_INTERVAL).await;
-
-        // Pull the in-memory running list from the actor — same source
-        // /api/control/running serves, includes seconds_since_activity.
-        let (resp_tx, resp_rx) = oneshot::channel();
-        if cmd_tx
-            .send(ControlCommand::ListRunning { respond: resp_tx })
-            .await
-            .is_err()
-        {
-            tracing::debug!("Stuck-mission watchdog: actor channel closed; exiting");
-            return;
-        }
-        let running_list = match resp_rx.await {
-            Ok(list) => list,
-            Err(_) => continue,
-        };
-
-        // Cross-check against DB: any mission Active in the store but
-        // not in `running_list` is an orphan from a runner death.
-        let active_missions = match mission_store.get_all_active_missions().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Stuck-mission watchdog: list active failed: {}", e);
-                continue;
-            }
-        };
-
-        let running_ids: HashSet<Uuid> = running_list.iter().map(|info| info.mission_id).collect();
-
-        // Case 1 — actor reports the mission running but stalled past
-        // threshold. Cancel via the actor (clean shutdown) and mark
-        // the row Interrupted.
-        for info in &running_list {
-            if info.seconds_since_activity >= STUCK_SECONDS {
-                tracing::warn!(
-                    "Stuck-mission watchdog: cancelling {} after {}s of inactivity",
-                    info.mission_id,
-                    info.seconds_since_activity
-                );
-                let (cancel_tx, cancel_rx) = oneshot::channel();
-                if cmd_tx
-                    .send(ControlCommand::CancelMission {
-                        mission_id: info.mission_id,
-                        min_idle: Some(std::time::Duration::from_secs(STUCK_SECONDS)),
-                        respond: cancel_tx,
-                    })
-                    .await
-                    .is_ok()
-                {
-                    let _ = cancel_rx.await;
-                }
-                if let Err(e) = mission_store
-                    .update_mission_status_with_reason(
-                        info.mission_id,
-                        MissionStatus::Interrupted,
-                        Some("watchdog_stalled"),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "Stuck-mission watchdog: status update failed for {}: {}",
-                        info.mission_id,
-                        e
-                    );
-                    continue;
-                }
-                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                    mission_id: info.mission_id,
-                    status: MissionStatus::Interrupted,
-                    summary: Some(format!(
-                        "Interrupted: no agent activity for {}s (>{}s threshold)",
-                        info.seconds_since_activity, STUCK_SECONDS
-                    )),
-                });
-            }
-        }
-
-        // Case 2 — Active in DB, not in actor's running list at all.
-        // This is the "mission_runner died, row never finalized" path.
-        for mission in &active_missions {
-            if running_ids.contains(&mission.id) {
-                continue;
-            }
-            if mission.mission_mode == super::mission_store::MissionMode::Assistant {
-                tracing::debug!(
-                    mission_id = %mission.id,
-                    "Stuck-mission watchdog: leaving idle assistant-mode mission active"
-                );
-                continue;
-            }
-            tracing::warn!(
-                "Stuck-mission watchdog: orphan {} (no live runner); marking interrupted",
-                mission.id
-            );
-            if let Err(e) = mission_store
-                .update_mission_status_with_reason(
-                    mission.id,
-                    MissionStatus::Interrupted,
-                    Some("orphan_no_runner"),
-                )
-                .await
-            {
-                tracing::warn!(
-                    "Stuck-mission watchdog: status update failed for {}: {}",
-                    mission.id,
-                    e
-                );
-                continue;
-            }
-            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                mission_id: mission.id,
-                status: MissionStatus::Interrupted,
-                summary: Some(
-                    "Interrupted: mission runner exited without reporting a terminal status"
-                        .to_string(),
-                ),
-            });
-        }
-    }
-}
-
-async fn stale_mission_cleanup_loop(
-    mission_store: Arc<dyn MissionStore>,
-    stale_hours: u64,
-    cmd_tx: mpsc::Sender<ControlCommand>,
-    events_tx: broadcast::Sender<AgentEvent>,
-) {
-    // Check every 5 minutes; the stale timeout remains a safety net for missions that
-    // never receive an explicit terminal status.
-    let check_interval = std::time::Duration::from_secs(300);
-
-    tracing::info!(
-        "Mission cleanup task started: stale timeout {} hours",
-        stale_hours
-    );
-
-    loop {
-        tokio::time::sleep(check_interval).await;
-        cleanup_stale_active_missions_once(&mission_store, stale_hours, &events_tx, &cmd_tx).await;
-    }
 }
 
 /// Resolve an IANA timezone string to a chrono::FixedOffset at a given UTC instant.
@@ -8176,18 +7728,40 @@ async fn maybe_finalize_terminal_mission(
     match mission_store.get_mission(mission_id).await {
         Ok(Some(mission)) => {
             if mission.status == MissionStatus::Interrupted {
-                tracing::debug!(
+                // A turn that *succeeds* after the interruption marker was set
+                // (deploy restart mid-turn, then the drained turn completes)
+                // supersedes it: there is a fresh assistant answer, and leaving
+                // the mission "interrupted" makes the dashboard offer a resume
+                // that the still-registered runner rejects with "already
+                // running". Failure-shaped reasons keep the interrupted status
+                // (it is the more accurate cause).
+                let successful_turn = matches!(
+                    new_status,
+                    MissionStatus::AwaitingUser | MissionStatus::Completed
+                );
+                if !successful_turn {
+                    tracing::debug!(
+                        mission_id = %mission_id,
+                        reason = ?reason,
+                        context = log_context,
+                        "Skipping mission finalization because mission is already interrupted"
+                    );
+                    return;
+                }
+                tracing::info!(
                     mission_id = %mission_id,
                     reason = ?reason,
+                    new_status = ?new_status,
                     context = log_context,
-                    "Skipping mission finalization because mission is already interrupted"
+                    "Promoting interrupted mission: turn completed successfully after interruption"
                 );
-                return;
             }
 
+            // Interrupted is allowed through: the promotion check above already
+            // filtered it down to successful turns only.
             if !matches!(
                 mission.status,
-                MissionStatus::Active | MissionStatus::Pending
+                MissionStatus::Active | MissionStatus::Pending | MissionStatus::Interrupted
             ) {
                 tracing::debug!(
                     mission_id = %mission_id,
@@ -8789,7 +8363,11 @@ async fn control_actor_loop(
                     ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
-                            let _ = respond.send(status_snapshot.state != ControlRunState::Idle);
+                            let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
+                                UserMessageAck::Queued
+                            } else {
+                                UserMessageAck::Delivered
+                            });
                             continue;
                         }
 
@@ -8856,7 +8434,7 @@ async fn control_actor_loop(
                                     mission_id: goal_target_mission,
                                     resumable: true,
                                 });
-                                let _ = respond.send(false);
+                                let _ = respond.send(UserMessageAck::Dropped);
                                 continue;
                             }
                         }
@@ -8873,6 +8451,18 @@ async fn control_actor_loop(
                                         queued: was_running,
                                         mission_id: Some(tid),
                                     });
+                                    // Surface the parallel queue growth to all
+                                    // clients (Status events otherwise only
+                                    // carry the main queue length). Only when
+                                    // the message actually stays queued —
+                                    // otherwise start_next pops it right away.
+                                    if was_running {
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: ControlRunState::Running,
+                                            queue_len: runner.queue.len(),
+                                            mission_id: Some(tid),
+                                        });
+                                    }
                                     // Try to start if not already running
                                     if !runner.is_running() {
                                         runner.start_next(
@@ -8889,7 +8479,7 @@ async fn control_actor_loop(
                                             secrets.clone(),
                                         );
                                     }
-                                    let _ = respond.send(was_running);
+                                    let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                                     continue;
                                 }
                             }
@@ -8922,7 +8512,7 @@ async fn control_actor_loop(
                                         mission_id: Some(tid),
                                         resumable: true,
                                     });
-                                    let _ = respond.send(false);
+                                    let _ = respond.send(UserMessageAck::Dropped);
                                     continue;
                                 } else {
                                     // Load mission and start in parallel
@@ -8994,7 +8584,7 @@ async fn control_actor_loop(
                                             );
                                             tracing::info!("Auto-started mission {} in parallel", tid);
                                             parallel_runners.insert(tid, runner);
-                                            let _ = respond.send(false);
+                                            let _ = respond.send(UserMessageAck::Delivered);
                                             continue;
                                         }
                                         Err(e) => {
@@ -9011,7 +8601,7 @@ async fn control_actor_loop(
                                                 mission_id: Some(tid),
                                                 resumable: true,
                                             });
-                                            let _ = respond.send(false);
+                                            let _ = respond.send(UserMessageAck::Dropped);
                                             continue;
                                         }
                                     }
@@ -9329,13 +8919,21 @@ async fn control_actor_loop(
                                 set_and_emit_status(&status, &events_tx, ControlRunState::Idle, 0, None).await;
                             }
                         }
-                        let _ = respond.send(was_running);
+                        let _ = respond.send(if was_running { UserMessageAck::Queued } else { UserMessageAck::Delivered });
                     }
-                    ControlCommand::ToolResult { tool_call_id, name, result } => {
+                    ControlCommand::ToolResult { tool_call_id, name, result, respond } => {
                         // Deliver to the tool hub. resolve() caches the result if
-                        // no one has registered yet (resolve-before-register).
-                        let _ = tool_hub.resolve(&tool_call_id, result).await;
-                        tracing::debug!(tool_call_id = %tool_call_id, name = %name, "ToolResult delivered to hub");
+                        // no one has registered yet (resolve-before-register), and
+                        // reports whether a live waiter actually received it. It
+                        // may wait out a short grace window for an imminent
+                        // registration, so run it off the control loop to keep
+                        // command processing responsive.
+                        let hub = Arc::clone(&tool_hub);
+                        tokio::spawn(async move {
+                            let delivered = hub.resolve(&tool_call_id, result).await;
+                            let _ = respond.send(delivered);
+                            tracing::debug!(tool_call_id = %tool_call_id, name = %name, delivered, "ToolResult delivered to hub");
+                        });
                     }
                     ControlCommand::Cancel => {
                         if let Some(token) = &running_cancel {
@@ -10298,41 +9896,137 @@ async fn control_actor_loop(
                             });
                         }
 
-                        // Also try to remove from parallel runner queues
+                        // Also try to remove from parallel runner queues.
+                        // Emit a Status event for each affected mission so
+                        // every client (other tabs, iOS) learns the queue
+                        // changed — without this, only the deleting client
+                        // ever updates its UI.
                         for (mid, runner) in parallel_runners.iter_mut() {
                             if runner.remove_from_queue(message_id) {
                                 removed = true;
                                 tracing::info!("Removed message {} from parallel mission {}", message_id, mid);
+                                let _ = events_tx.send(AgentEvent::Status {
+                                    state: if runner.is_running() {
+                                        ControlRunState::Running
+                                    } else {
+                                        ControlRunState::Idle
+                                    },
+                                    queue_len: runner.queue.len(),
+                                    mission_id: Some(*mid),
+                                });
                             }
                         }
 
                         let _ = respond.send(removed);
                     }
-                    ControlCommand::ClearQueue { respond } => {
-                        let mut cleared = queue.len();
-                        queue.clear();
+                    ControlCommand::ClearQueue { mission_id, respond } => {
+                        let main_mission_id = if running.is_some() {
+                            running_mission_id
+                        } else {
+                            *current_mission.read().await
+                        };
 
-                        // Also clear parallel runner queues
-                        for (_mid, runner) in parallel_runners.iter_mut() {
-                            cleared += runner.clear_queue();
+                        let mut cleared = 0usize;
+                        match mission_id {
+                            Some(target) => {
+                                // Scoped clear: only drop messages targeting
+                                // this mission (main queue entries + that
+                                // mission's parallel-runner queue). Clearing
+                                // from one mission's view must not wipe other
+                                // missions' queues.
+                                let before_len = queue.len();
+                                queue.retain(|(_, _, _, target_mid)| *target_mid != Some(target));
+                                let main_removed = before_len - queue.len();
+                                cleared += main_removed;
+                                if main_removed > 0 {
+                                    let _ = events_tx.send(AgentEvent::Status {
+                                        state: if running.is_some() {
+                                            ControlRunState::Running
+                                        } else {
+                                            ControlRunState::Idle
+                                        },
+                                        queue_len: queue.len(),
+                                        mission_id: main_mission_id,
+                                    });
+                                }
+                                // Clients filter Status events by the mission
+                                // they are viewing, so the main-queue event
+                                // above is invisible to a client focused on
+                                // `target` (unless target IS the main
+                                // mission). Emit a target-scoped Status
+                                // whenever anything was cleared for it.
+                                let mut target_status_sent = false;
+                                if let Some(runner) = parallel_runners.get_mut(&target) {
+                                    let runner_cleared = runner.clear_queue();
+                                    cleared += runner_cleared;
+                                    if runner_cleared > 0 || main_removed > 0 {
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: if runner.is_running() {
+                                                ControlRunState::Running
+                                            } else {
+                                                ControlRunState::Idle
+                                            },
+                                            queue_len: runner.queue.len(),
+                                            mission_id: Some(target),
+                                        });
+                                        target_status_sent = true;
+                                    }
+                                }
+                                if main_removed > 0
+                                    && !target_status_sent
+                                    && main_mission_id != Some(target)
+                                {
+                                    // No parallel runner for `target` and it
+                                    // is not the main mission: it cannot be
+                                    // running, but its viewers still need a
+                                    // scoped event to refresh their queue.
+                                    let _ = events_tx.send(AgentEvent::Status {
+                                        state: ControlRunState::Idle,
+                                        queue_len: 0,
+                                        mission_id: Some(target),
+                                    });
+                                }
+                                tracing::info!(
+                                    "Cleared {} queued messages for mission {}",
+                                    cleared, target
+                                );
+                            }
+                            None => {
+                                cleared = queue.len();
+                                queue.clear();
+
+                                // Also clear parallel runner queues, notifying
+                                // each affected mission's viewers.
+                                for (mid, runner) in parallel_runners.iter_mut() {
+                                    let runner_cleared = runner.clear_queue();
+                                    if runner_cleared > 0 {
+                                        cleared += runner_cleared;
+                                        let _ = events_tx.send(AgentEvent::Status {
+                                            state: if runner.is_running() {
+                                                ControlRunState::Running
+                                            } else {
+                                                ControlRunState::Idle
+                                            },
+                                            queue_len: 0,
+                                            mission_id: Some(*mid),
+                                        });
+                                    }
+                                }
+
+                                // Emit event to notify frontend (main queue)
+                                let _ = events_tx.send(AgentEvent::Status {
+                                    state: if running.is_some() {
+                                        ControlRunState::Running
+                                    } else {
+                                        ControlRunState::Idle
+                                    },
+                                    queue_len: 0,
+                                    mission_id: main_mission_id,
+                                });
+
+                                tracing::info!("Cleared {} total queued messages (main + parallel)", cleared);
+                            }
                         }
-
-                        // Emit event to notify frontend (main queue only)
-                        let _ = events_tx.send(AgentEvent::Status {
-                            state: if running.is_some() {
-                                ControlRunState::Running
-                            } else {
-                                ControlRunState::Idle
-                            },
-                            queue_len: 0,
-                            mission_id: if running.is_some() {
-                                running_mission_id
-                            } else {
-                                *current_mission.read().await
-                            },
-                        });
-
-                        tracing::info!("Cleared {} total queued messages (main + parallel)", cleared);
                         let _ = respond.send(cleared);
                     }
                 }
@@ -11716,10 +11410,11 @@ async fn run_single_control_turn(
     let history_context =
         build_history_context(history_for_prompt, config.context.max_history_total_chars);
     let mut convo = String::new();
-    convo.push_str(&history_context);
-    convo.push_str("User:\n");
-    convo.push_str(&user_message);
-    convo.push_str("\n\nInstructions:\n- Continue the conversation helpfully.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
+    convo.push_str(&crate::util::frame_turn_prompt(
+        &history_context,
+        &user_message,
+    ));
+    convo.push_str("\n\nInstructions:\n- Respond to the CURRENT user request. The conversation history is context only: do not resume or continue earlier tasks from it unless the current request asks you to.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
     let _task = match crate::task::Task::new(convo.clone(), Some(1000)) {
         Ok(t) => t,
         Err(e) => {
@@ -11750,301 +11445,42 @@ async fn run_single_control_turn(
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            // Check if this is a continuation turn (has prior assistant response).
-            // Note: history may include the current user message before the turn runs,
-            // so we check for assistant messages to determine if this is truly a continuation.
-            // Also use --resume if force_session_resume is set (e.g., for mission resume operations
-            // where the session exists but history may not have assistant messages yet).
+            // Continuation: prior assistant response in history, or an
+            // explicit resume request (e.g. mission resume operations where
+            // the session exists but history may not have assistant
+            // messages yet).
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
-            let mut effective_message = user_message.clone();
-            let mut effective_session_id = session_id.clone();
-            let mut attempted_same_session_resume = false;
-            let mut attempted_session_reset = false;
-            let mut result = Box::pin(super::mission_runner::run_claudecode_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &effective_message,
-                config.default_model.as_deref(),
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel.clone(),
-                None, // secrets - not available in control context
-                &config.working_dir,
-                effective_session_id.as_deref(),
-                is_continuation,
-                Some(tool_hub.clone()),
-                Some(status.clone()),
-                None, // override_auth
+            // Full recovery orchestration (transport retries, SIGKILL OAuth
+            // refresh, stale-credential retry, account rotation) is shared
+            // with the mission dispatch via the runners layer. This arm
+            // previously carried a near-duplicate copy that was missing the
+            // SIGKILL refresh and the initial auth retry.
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(crate::api::runners::ClaudeCodeRunner.run_turn(
+                crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &user_message,
+                    model: config.default_model.as_deref(),
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel: cancel.clone(),
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation,
+                    extras: crate::api::runners::TurnExtras::ClaudeCode {
+                        secrets: None, // not available in control context
+                        tool_hub: Some(tool_hub.clone()),
+                        status: Some(status.clone()),
+                        history: &history,
+                        max_history_total_chars: config.context.max_history_total_chars,
+                    },
+                },
             ))
-            .await;
-
-            loop {
-                if cancel.is_cancelled() || super::routes::is_shutdown_initiated() {
-                    tracing::debug!(
-                        mission_id = %mid,
-                        "Skipping Claude transport recovery because execution is cancelling or shutting down"
-                    );
-                    break;
-                }
-
-                match super::mission_runner::claudecode_transport_recovery_strategy(
-                    &result,
-                    effective_session_id.is_some(),
-                    attempted_same_session_resume,
-                    attempted_session_reset,
-                ) {
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::None => break,
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResumeCurrentSession => {
-                        attempted_same_session_resume = true;
-                        tracing::warn!(
-                            mission_id = %mid,
-                            session_id = ?effective_session_id,
-                            error = %result.output,
-                            "Incomplete Claude turn detected; retrying once by continuing the current session"
-                        );
-                        effective_message =
-                            super::mission_runner::claudecode_resume_current_session_message()
-                                .to_string();
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            true,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            None,
-                        ))
-                        .await;
-                    }
-                    super::mission_runner::ClaudeTransportRecoveryStrategy::ResetSessionFresh => {
-                        attempted_session_reset = true;
-                        let new_session_id = Uuid::new_v4().to_string();
-                        tracing::warn!(
-                            mission_id = %mid,
-                            old_session_id = ?effective_session_id,
-                            new_session_id = %new_session_id,
-                            attempted_same_session_resume,
-                            error = %result.output,
-                            "Session corruption detected; resetting session and retrying once"
-                        );
-
-                        let _ = events_tx.send(AgentEvent::SessionIdUpdate {
-                            mission_id: mid,
-                            session_id: new_session_id.clone(),
-                        });
-
-                        let session_marker = ctx.working_dir.join(".claude-session-initiated");
-                        if session_marker.exists() {
-                            let _ = std::fs::remove_file(&session_marker);
-                        }
-
-                        let history_for_retry = match history.last() {
-                            Some((role, content)) if role == "user" && content == &user_message => {
-                                &history[..history.len() - 1]
-                            }
-                            _ => history.as_slice(),
-                        };
-                        let retry_message = if history_for_retry.is_empty() {
-                            user_message.clone()
-                        } else {
-                            let history_ctx = build_history_context(
-                                history_for_retry,
-                                config.context.max_history_total_chars,
-                            );
-                            format!(
-                                "## Prior conversation (session was reset due to a transient error)\n\n\
-                                 {history_ctx}\
-                                 ## Current message\n\n\
-                                 {user_message}"
-                            )
-                        };
-
-                        effective_message = retry_message;
-                        effective_session_id = Some(new_session_id);
-
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            false,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            None,
-                        ))
-                        .await;
-                    }
-                }
-            }
-
-            // Auth error recovery: if the token was revoked server-side but the
-            // local expiry hadn't passed yet, invalidate stale credentials, force
-            // an OAuth refresh, and retry once.
-            if result.terminal_reason == Some(TerminalReason::AuthError) && !cancel.is_cancelled() {
-                tracing::warn!(
-                    mission_id = %mid,
-                    "Auth error detected — invalidating stale credentials and retrying"
-                );
-
-                super::mission_runner::refresh_claude_credentials_after_auth_error(
-                    &ctx.working_dir,
-                    "control_initial_auth_error",
-                )
-                .await;
-
-                // Retry with fresh credentials
-                result = Box::pin(super::mission_runner::run_claudecode_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &effective_message,
-                    config.default_model.as_deref(),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    None,
-                    &config.working_dir,
-                    effective_session_id.as_deref(),
-                    is_continuation,
-                    Some(tool_hub.clone()),
-                    Some(status.clone()),
-                    None,
-                ))
-                .await;
-            }
-
-            // Account rotation: if rate-limited, try alternate Anthropic credentials.
-            // The first entry in the list is the highest-priority credential, which
-            // is almost certainly what the initial (override_auth=None) call used.
-            // Skip it to avoid a guaranteed duplicate rate-limit failure.
-            let mut rotated_anthropic_account = false;
-            if result.terminal_reason == Some(TerminalReason::RateLimited) && !cancel.is_cancelled()
-            {
-                let rotation_accounts = super::mission_runner::anthropic_rotation_accounts(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &config.working_dir,
-                );
-                if !rotation_accounts.accounts.is_empty() {
-                    tracing::info!(
-                        mission_id = %mid,
-                        total_accounts = rotation_accounts.total_accounts,
-                        alternate_accounts = rotation_accounts.accounts.len(),
-                        skipped_current = rotation_accounts.skipped_current,
-                        "Rate limited on primary account; trying alternate Anthropic credentials"
-                    );
-                    for (idx, alt_auth) in rotation_accounts.accounts.into_iter().enumerate() {
-                        if cancel.is_cancelled() {
-                            break;
-                        }
-                        rotated_anthropic_account = true;
-                        tracing::info!(
-                            mission_id = %mid,
-                            rotation_attempt = idx + 1,
-                            auth_type = match &alt_auth {
-                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
-                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) =>
-                                    "oauth_token",
-                            },
-                            "Rotating to alternate Anthropic account"
-                        );
-                        result = Box::pin(super::mission_runner::run_claudecode_turn(
-                            exec_workspace,
-                            &ctx.working_dir,
-                            &effective_message,
-                            config.default_model.as_deref(),
-                            requested_model_effort.as_deref(),
-                            config.opencode_agent.as_deref(),
-                            mid,
-                            events_tx.clone(),
-                            cancel.clone(),
-                            None,
-                            &config.working_dir,
-                            effective_session_id.as_deref(),
-                            is_continuation,
-                            Some(tool_hub.clone()),
-                            Some(status.clone()),
-                            Some(alt_auth),
-                        ))
-                        .await;
-                        // Only continue rotating on rate-limit errors.
-                        match result.terminal_reason {
-                            Some(TerminalReason::RateLimited) => {
-                                tracing::info!(
-                                    mission_id = %mid,
-                                    rotation_attempt = idx + 1,
-                                    "Rate limited; rotating to next account"
-                                );
-                                continue;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-
-            // Account rotation can surface a revoked/expired alternate OAuth
-            // credential. Run the same stale-credential recovery after rotation
-            // so the mission retries with freshly refreshed host credentials
-            // instead of stopping on "Invalid authentication credentials".
-            if rotated_anthropic_account
-                && result.terminal_reason == Some(TerminalReason::AuthError)
-                && !cancel.is_cancelled()
-            {
-                tracing::warn!(
-                    mission_id = %mid,
-                    "Auth error detected after credential rotation - invalidating stale credentials and retrying"
-                );
-
-                super::mission_runner::refresh_claude_credentials_after_auth_error(
-                    &ctx.working_dir,
-                    "control_rotated_auth_error",
-                )
-                .await;
-
-                result = Box::pin(super::mission_runner::run_claudecode_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    &effective_message,
-                    config.default_model.as_deref(),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel.clone(),
-                    None,
-                    &config.working_dir,
-                    effective_session_id.as_deref(),
-                    is_continuation,
-                    Some(tool_hub.clone()),
-                    Some(status.clone()),
-                    None,
-                ))
-                .await;
-            }
-
-            result
+            .await
         }
         Some("grok") => {
             let mid = match require_mission_id(mission_id, "Grok Build", &events_tx) {
@@ -12053,20 +11489,31 @@ async fn run_single_control_turn(
             };
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
-            Box::pin(super::mission_runner::run_grok_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &user_message,
-                requested_model
-                    .as_deref()
-                    .or(config.default_model.as_deref()),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-                is_continuation,
-            ))
+            let grok_message_owned: String = if user_message.trim_start().starts_with("/goal ") {
+                user_message.clone()
+            } else {
+                convo.clone()
+            };
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::GrokRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &grok_message_owned,
+                    model: requested_model
+                        .as_deref()
+                        .or(config.default_model.as_deref()),
+                    model_effort: None,
+                    agent: None,
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
             .await
         }
         Some("codex") => {
@@ -12087,92 +11534,56 @@ async fn run_single_control_turn(
                 convo.clone()
             };
             let codex_message: &str = codex_message_owned.as_str();
-            let mut result = Box::pin(super::mission_runner::run_codex_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                codex_message,
-                requested_codex_model,
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel.clone(),
-                &config.working_dir,
-                session_id.as_deref(),
-                None,
-            ))
-            .await;
-
-            if let Some(fallback_model) = super::mission_runner::codex_chatgpt_fallback_for_result(
-                requested_codex_model,
-                &result,
-            ) {
-                tracing::warn!(
-                    mission_id = %mid,
-                    requested_model = ?requested_codex_model,
-                    fallback_model,
-                    "Retrying Codex turn with fallback model for ChatGPT account compatibility (control path)"
-                );
-                result = Box::pin(super::mission_runner::run_codex_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    codex_message,
-                    Some(fallback_model),
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel,
-                    &config.working_dir,
-                    session_id.as_deref(),
-                    None,
-                ))
-                .await;
-            } else if super::mission_runner::codex_tool_stall_should_retry_with_default_model(
-                requested_codex_model,
-                &result,
-            ) {
-                tracing::warn!(
-                    mission_id = %mid,
-                    requested_model = ?requested_codex_model,
-                    "Retrying Codex turn with CLI default model after generic GPT model stopped before tool use (control path)"
-                );
-                result = Box::pin(super::mission_runner::run_codex_turn(
-                    exec_workspace,
-                    &ctx.working_dir,
-                    codex_message,
-                    None,
-                    requested_model_effort.as_deref(),
-                    config.opencode_agent.as_deref(),
-                    mid,
-                    events_tx.clone(),
-                    cancel,
-                    &config.working_dir,
-                    session_id.as_deref(),
-                    None,
-                ))
-                .await;
-            }
-
-            result
+            // Shared rotation wrapper: identical account rotation + usage-cap
+            // cooldown behaviour to the initial mission dispatch. Previously
+            // this path ran a single bare run_codex_turn with no credential
+            // override, so a follow-up/retry on a usage-capped ChatGPT
+            // account kept re-hitting the same cap instead of rotating to
+            // the next account. Fallback-model and tool-stall retries are
+            // handled inside the wrapper per attempted credential.
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::CodexRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: codex_message,
+                    model: requested_codex_model,
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel: cancel.clone(),
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: false,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
+            .await
         }
         Some("gemini") => {
             let mid = match require_mission_id(mission_id, "Gemini CLI", &events_tx) {
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            Box::pin(super::mission_runner::run_gemini_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &convo,
-                config.default_model.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
-                session_id.as_deref(),
-            ))
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(
+                crate::api::runners::GeminiRunner.run_turn(crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &convo,
+                    model: config.default_model.as_deref(),
+                    model_effort: None,
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: false,
+                    extras: crate::api::runners::TurnExtras::None,
+                }),
+            )
             .await
         }
         Some(backend) if backend != "opencode" => {
@@ -12187,17 +11598,62 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
-            Box::pin(super::mission_runner::run_opencode_turn(
-                exec_workspace,
-                &ctx.working_dir,
-                &user_message,
-                config.default_model.as_deref(),
-                requested_model_effort.as_deref(),
-                config.opencode_agent.as_deref(),
-                mid,
-                events_tx.clone(),
-                cancel,
-                &config.working_dir,
+            // A stored OpenCode-format session_id (starts with `ses_`) is
+            // itself a strong signal of a continuation even when the
+            // in-memory history has no assistant message (e.g. server
+            // restart, mission resume, history rebuild). The per-mission
+            // XDG storage still has the prior session, and we want
+            // --session/--continue to fire so we don't lose context. This
+            // mirrors the `mission_runner` arm and fixes Bugbot e8dd69f8.
+            //
+            // Note: missions also carry a *Claude Code*-style UUID
+            // session_id from mission creation, which the opencode CLI
+            // does not understand. We ignore that here (treat as no
+            // session) and let `is_opencode_session_id` in the runner
+            // filter it out as well, so the CLI never receives an invalid
+            // `--session <UUID>` and errors with "Session not found".
+            let has_opencode_session = session_id
+                .as_deref()
+                .map(super::mission_runner::is_opencode_session_id)
+                .unwrap_or(false);
+            let opencode_is_continuation = force_session_resume
+                || history.iter().any(|(role, _)| role == "assistant")
+                || has_opencode_session;
+            // Goal-mode missions drive a /goal <objective> loop and need the
+            // raw message preserved verbatim. For normal continuations, when
+            // we have a stored OpenCode session_id the opencode CLI will
+            // load prior messages from its own storage, so we send the bare
+            // user message instead of the history-framed `convo` (which
+            // would duplicate the context the session already has). When we
+            // don't have an OpenCode session_id (first turn of a brand-new
+            // mission, a legacy mission that never persisted one, or a
+            // mission that only has the Claude-Code UUID placeholder),
+            // keep using `convo` so the model still gets a history-aware
+            // prompt.
+            let is_goal_mode = user_message.trim_start().starts_with("/goal ");
+            let opencode_message_owned: String =
+                if is_goal_mode || (opencode_is_continuation && has_opencode_session) {
+                    user_message.clone()
+                } else {
+                    convo.clone()
+                };
+            use crate::api::runners::HarnessRunner as _;
+            Box::pin(crate::api::runners::OpenCodeRunner.run_turn(
+                crate::api::runners::TurnContext {
+                    workspace: exec_workspace,
+                    work_dir: &ctx.working_dir,
+                    message: &opencode_message_owned,
+                    model: config.default_model.as_deref(),
+                    model_effort: requested_model_effort.as_deref(),
+                    agent: config.opencode_agent.as_deref(),
+                    mission_id: mid,
+                    events_tx: events_tx.clone(),
+                    cancel,
+                    app_working_dir: &config.working_dir,
+                    session_id: session_id.as_deref(),
+                    is_continuation: opencode_is_continuation,
+                    extras: crate::api::runners::TurnExtras::None,
+                },
             ))
             .await
         }
@@ -14960,6 +14416,182 @@ mod tests {
             .lock()
             .expect("metadata refresh baseline lock poisoned");
         baselines.clear();
+    }
+
+    fn stored_test_event(
+        mission_id: Uuid,
+        sequence: i64,
+        event_type: &str,
+        tool_call_id: Option<&str>,
+        content: &str,
+    ) -> mission_store::StoredEvent {
+        mission_store::StoredEvent {
+            id: sequence,
+            mission_id,
+            sequence,
+            event_type: event_type.to_string(),
+            timestamp: format!("2026-06-04T10:00:{sequence:02}Z"),
+            event_id: Some(format!("event-{sequence}")),
+            tool_call_id: tool_call_id.map(ToString::to_string),
+            tool_name: tool_call_id.map(|_| "bash".to_string()),
+            content: content.to_string(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn conversation_projection_stubs_older_tool_pairs() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![
+            stored_test_event(mission_id, 1, "user_message", None, "start"),
+            stored_test_event(
+                mission_id,
+                2,
+                "tool_call",
+                Some("tool-1"),
+                "{\"cmd\":\"old\"}",
+            ),
+            stored_test_event(
+                mission_id,
+                3,
+                "tool_result",
+                Some("tool-1"),
+                "{\"ok\":true}",
+            ),
+            stored_test_event(
+                mission_id,
+                4,
+                "tool_call",
+                Some("tool-2"),
+                "{\"cmd\":\"new\"}",
+            ),
+            stored_test_event(
+                mission_id,
+                5,
+                "tool_result",
+                Some("tool-2"),
+                "{\"ok\":true}",
+            ),
+            stored_test_event(mission_id, 6, "assistant_message", None, "done"),
+        ];
+
+        let keep_full_tool_call_ids = HashSet::from(["tool-2".to_string()]);
+        let projected =
+            project_conversation_events(events, &keep_full_tool_call_ids, &HashMap::new());
+
+        assert_eq!(
+            projected
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "user_message",
+                "tool_stub",
+                "tool_call",
+                "tool_result",
+                "assistant_message"
+            ]
+        );
+        let stub = projected
+            .iter()
+            .find(|event| event.event_type == "tool_stub")
+            .expect("older tool call should be stubbed");
+        assert_eq!(stub.tool_call_id.as_deref(), Some("tool-1"));
+        assert!(stub.content.is_empty());
+        assert_eq!(stub.metadata["lazy"], serde_json::json!(true));
+        assert_eq!(stub.metadata["has_result"], serde_json::json!(true));
+        assert_eq!(stub.metadata["result_sequence"], serde_json::json!(3));
+        assert_eq!(
+            stub.metadata["call_content_bytes"],
+            serde_json::json!("{\"cmd\":\"old\"}".len())
+        );
+    }
+
+    #[test]
+    fn conversation_projection_uses_global_keep_full_set() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![
+            stored_test_event(mission_id, 20, "tool_call", Some("older-page-newest"), "{}"),
+            stored_test_event(
+                mission_id,
+                21,
+                "tool_result",
+                Some("older-page-newest"),
+                "{\"ok\":true}",
+            ),
+        ];
+
+        let projected = project_conversation_events(events, &HashSet::new(), &HashMap::new());
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event_type, "tool_stub");
+        assert_eq!(
+            projected[0].tool_call_id.as_deref(),
+            Some("older-page-newest")
+        );
+    }
+
+    #[test]
+    fn conversation_projection_uses_persisted_tool_summary_across_page_boundary() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![stored_test_event(
+            mission_id,
+            10,
+            "tool_call",
+            Some("split-tool"),
+            "{}",
+        )];
+        let summaries = HashMap::from([(
+            "split-tool".to_string(),
+            mission_store::ToolCallSummary {
+                has_result: true,
+                result_sequence: Some(11),
+                result_timestamp: Some("2026-06-04T10:00:11Z".to_string()),
+                call_content_bytes: 2,
+                result_content_bytes: 14,
+            },
+        )]);
+
+        let projected = project_conversation_events(events, &HashSet::new(), &summaries);
+
+        assert_eq!(projected.len(), 1);
+        let stub = &projected[0];
+        assert_eq!(stub.event_type, "tool_stub");
+        assert_eq!(stub.metadata["has_result"], serde_json::json!(true));
+        assert_eq!(stub.metadata["result_sequence"], serde_json::json!(11));
+        assert_eq!(
+            stub.metadata["result_timestamp"],
+            serde_json::json!("2026-06-04T10:00:11Z")
+        );
+        assert_eq!(stub.metadata["result_content_bytes"], serde_json::json!(14));
+    }
+
+    #[test]
+    fn conversation_projection_keeps_inflight_tools_full() {
+        let mission_id = Uuid::new_v4();
+        let events = vec![stored_test_event(
+            mission_id,
+            10,
+            "tool_call",
+            Some("inflight-tool"),
+            "{\"cmd\":\"long\"}",
+        )];
+        let summaries = HashMap::from([(
+            "inflight-tool".to_string(),
+            mission_store::ToolCallSummary {
+                has_result: false,
+                result_sequence: None,
+                result_timestamp: None,
+                call_content_bytes: "{\"cmd\":\"long\"}".len(),
+                result_content_bytes: 0,
+            },
+        )]);
+
+        let projected = project_conversation_events(events, &HashSet::new(), &summaries);
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].event_type, "tool_call");
+        assert_eq!(projected[0].content, "{\"cmd\":\"long\"}");
     }
 
     fn test_automation_with_mode(
@@ -18684,6 +18316,119 @@ Investigate <service/> failures.
         assert_eq!(summary.events[3].event_type, "text_delta");
         assert_eq!(summary.events[3].sequence, 7);
         assert_eq!(summary.events[3].content, "draft final");
+        // The kept thinking row must close its block for the frontend.
+        assert_eq!(summary.events[1].metadata["done"], serde_json::json!(true));
+    }
+
+    fn thinking_test_event(
+        sequence: i64,
+        event_type: &str,
+        content: &str,
+        done: Option<bool>,
+    ) -> mission_store::StoredEvent {
+        mission_store::StoredEvent {
+            id: sequence,
+            mission_id: Uuid::nil(),
+            sequence,
+            event_type: event_type.to_string(),
+            timestamp: "2026-05-19T00:00:00Z".to_string(),
+            event_id: Some(format!("{event_type}-{sequence}")),
+            tool_call_id: None,
+            tool_name: None,
+            content: content.to_string(),
+            metadata: match done {
+                Some(done) => serde_json::json!({ "done": done }),
+                None => serde_json::json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn should_persist_event_skips_incremental_thinking() {
+        let mid = Some(Uuid::nil());
+        assert!(!should_persist_event(&AgentEvent::Thinking {
+            content: "partial".to_string(),
+            done: false,
+            mission_id: mid,
+        }));
+        assert!(should_persist_event(&AgentEvent::Thinking {
+            content: "full block".to_string(),
+            done: true,
+            mission_id: mid,
+        }));
+        assert!(should_persist_event(&AgentEvent::TextDelta {
+            content: "text".to_string(),
+            mission_id: mid,
+        }));
+    }
+
+    #[test]
+    fn inactive_stream_summary_recovers_content_from_empty_done_finalizer() {
+        // Legacy claudecode pattern: cumulative snapshots followed by an
+        // empty done:true finalizer. The collapsed row must carry the last
+        // non-empty content, not the empty finalizer.
+        let events = vec![
+            thinking_test_event(1, "thinking", "a", Some(false)),
+            thinking_test_event(2, "thinking", "ab", Some(false)),
+            thinking_test_event(3, "thinking", "", Some(true)),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.summarized_count, 1);
+        assert_eq!(summary.events[0].content, "ab");
+        assert_eq!(summary.events[0].metadata["done"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn inactive_stream_summary_keeps_separate_thinking_blocks() {
+        // New block-final format: one done:true row per block. Consecutive
+        // blocks must NOT be merged.
+        let events = vec![
+            thinking_test_event(1, "thinking", "first block", Some(true)),
+            thinking_test_event(2, "thinking", "second block", Some(true)),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.summarized_count, 2);
+        assert_eq!(summary.events[0].content, "first block");
+        assert_eq!(summary.events[1].content, "second block");
+    }
+
+    #[test]
+    fn inactive_stream_summary_collapses_legacy_multi_block_runs() {
+        // Legacy data with two blocks, each ending in an empty finalizer.
+        let events = vec![
+            thinking_test_event(1, "thinking", "a", Some(false)),
+            thinking_test_event(2, "thinking", "ab", Some(false)),
+            thinking_test_event(3, "thinking", "", Some(true)),
+            thinking_test_event(4, "thinking", "x", Some(false)),
+            thinking_test_event(5, "thinking", "xy", Some(false)),
+            thinking_test_event(6, "thinking", "", Some(true)),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.summarized_count, 2);
+        assert_eq!(summary.events[0].content, "ab");
+        assert_eq!(summary.events[1].content, "xy");
+    }
+
+    #[test]
+    fn inactive_stream_summary_drops_contentless_thinking_block() {
+        // A lone empty finalizer (legacy 5506 bug with no preceding deltas)
+        // must not produce an empty thought in history.
+        let events = vec![
+            thinking_test_event(1, "user_message", "hello", None),
+            thinking_test_event(2, "thinking", "", Some(true)),
+            thinking_test_event(3, "assistant_message", "done", None),
+        ];
+
+        let summary = summarize_inactive_stream_events(events);
+
+        assert_eq!(summary.summarized_count, 2);
+        assert!(summary.events.iter().all(|e| e.event_type != "thinking"));
     }
 
     #[test]
@@ -18713,6 +18458,147 @@ Investigate <service/> failures.
         assert!(
             before_bytes >= after_bytes * 10,
             "expected >=10x payload drop, before={before_bytes}, after={after_bytes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_two_subscribers_each_get_all_events() {
+        // Reproduces the production hypothesis: producer sends N events, one
+        // subscriber drains immediately, the other lags behind. Both should
+        // receive every event as long as they never fall more than
+        // `channel_capacity` behind. Mirrors the event-logger / SSE-stream
+        // pair attached to the global events_tx in spawn_control_session.
+        const CHANNEL_CAPACITY: usize = 8192;
+        const N: u32 = 200;
+        let (tx, _rx0) = broadcast::channel::<u32>(CHANNEL_CAPACITY);
+        let mut rx_fast = tx.subscribe();
+        let mut rx_slow = tx.subscribe();
+
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            for i in 0..N {
+                let _ = producer_tx.send(i);
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let consumer_fast = tokio::spawn(async move {
+            let mut got = 0u32;
+            while let Ok(_ev) = rx_fast.recv().await {
+                got += 1;
+            }
+            got
+        });
+        let consumer_slow = tokio::spawn(async move {
+            let mut got = 0u32;
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(50), rx_slow.recv())
+                    .await
+                {
+                    Ok(Ok(_ev)) => got += 1,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                    Err(_) => continue,
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            got
+        });
+
+        producer.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(tx);
+        let fast_count = consumer_fast.await.unwrap();
+        let slow_count = consumer_slow.await.unwrap();
+        assert_eq!(
+            fast_count, N,
+            "fast subscriber should receive all {N} events (got {fast_count})"
+        );
+        assert_eq!(
+            slow_count, N,
+            "slow subscriber should still receive all {N} events when within buffer (got {slow_count})"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_slow_subscriber_beyond_buffer_loses_events_with_lagged_warning() {
+        // Documents the failure mode the production event logger may have
+        // hit during mission ab260b2e. If a subscriber is slow enough to
+        // fall more than `channel_capacity` events behind, the next
+        // recv() returns `Lagged(n)` and the subscriber loses n events. The
+        // Tokio broadcast channel does NOT retry or replay; the missed
+        // events are gone for that subscriber. Run with `--nocapture` to
+        // see the Lagged print.
+        const CHANNEL_CAPACITY: usize = 16;
+        const PRODUCER_EVENTS: u32 = 1000;
+        let (tx, _rx0) = broadcast::channel::<u32>(CHANNEL_CAPACITY);
+        let mut rx_fast = tx.subscribe();
+        let mut rx_slow = tx.subscribe();
+
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            for i in 0..PRODUCER_EVENTS {
+                let _ = producer_tx.send(i);
+                // Small sleep lets a fast consumer keep up; the slow consumer
+                // (below) deliberately adds a much larger delay so the
+                // channel buffer (16) overflows for it specifically.
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        });
+
+        let consumer_fast = tokio::spawn(async move {
+            let mut got = 0u32;
+            loop {
+                match rx_fast.recv().await {
+                    Ok(_ev) => got += 1,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            got
+        });
+        let consumer_slow = tokio::spawn(async move {
+            let mut got = 0u32;
+            let mut lagged = 0u64;
+            loop {
+                match rx_slow.recv().await {
+                    Ok(_ev) => {
+                        got += 1;
+                        // Slow consumer: 50ms per event. With a 16-deep
+                        // channel and 2ms producer cadence, this consumer
+                        // will fall roughly 25 events behind per recv(),
+                        // guaranteeing the buffer overflows.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        lagged = lagged.saturating_add(n as u64);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            eprintln!("slow subscriber got {got} events and was lagged by {lagged}");
+            (got, lagged)
+        });
+
+        producer.await.unwrap();
+        // Give consumers time to drain what they can.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(tx);
+        let fast_count = consumer_fast.await.unwrap();
+        let (slow_count, slow_lagged) = consumer_slow.await.unwrap();
+        assert_eq!(
+            fast_count, PRODUCER_EVENTS,
+            "fast subscriber should drain the producer"
+        );
+        assert!(
+            slow_lagged > 0,
+            "slow subscriber MUST report Lagged when capacity is {CHANNEL_CAPACITY} \
+             and producer sends {PRODUCER_EVENTS} events back-to-back; \
+             got fast={fast_count} slow={slow_count} lagged={slow_lagged}"
+        );
+        assert!(
+            (slow_count as u64) + slow_lagged >= PRODUCER_EVENTS as u64,
+            "slow subscriber's got+lost should still account for the producer (got={slow_count} lagged={slow_lagged})"
         );
     }
 }

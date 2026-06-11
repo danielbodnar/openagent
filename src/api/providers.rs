@@ -559,6 +559,14 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check Anthropic's current model IDs here:
                     // https://docs.anthropic.com/en/docs/about-claude/models/overview
                     ProviderModel {
+                        id: "claude-fable-5".to_string(),
+                        name: "Claude Fable 5".to_string(),
+                        description: Some(
+                            "Most capable widely released model, adaptive thinking, 1M context"
+                                .to_string(),
+                        ),
+                    },
+                    ProviderModel {
                         id: "claude-opus-4-8".to_string(),
                         name: "Claude Opus 4.8".to_string(),
                         description: Some(
@@ -1604,7 +1612,6 @@ pub async fn validate_model_override(
 
     match backend {
         "opencode" => {
-            // OpenCode expects "provider/model" format
             if let Some((provider_id, model_id)) = model_override.split_once('/') {
                 // Check if this is a known provider with a model catalog
                 if let Some(provider) = providers.iter().find(|p| p.id == provider_id) {
@@ -1631,10 +1638,10 @@ pub async fn validate_model_override(
                 // Unknown provider - allow as custom (escape hatch)
                 Ok(())
             } else {
-                Err(format!(
-                    "Invalid format for OpenCode model override. Expected 'provider/model' (e.g., 'openai/gpt-4'), got '{}'",
-                    model_override
-                ))
+                // Plain model name without '/' — could be a routing chain ID
+                // (e.g. "grok"), a builtin model alias, or a custom model name.
+                // Allow through as an escape hatch.
+                Ok(())
             }
         }
         "claudecode" => {

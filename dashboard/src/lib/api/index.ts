@@ -83,6 +83,11 @@ export {
   buildWorkspace,
   getWorkspaceDebug,
   getWorkspaceInitLog,
+  type WorkspaceMemoryStats,
+  getWorkspaceMemory,
+  type UpdateWorkspaceResourcesRequest,
+  type UpdateWorkspaceResourcesResponse,
+  updateWorkspaceResources,
 } from "./workspaces";
 
 // Providers
@@ -217,4 +222,10 @@ export {
   searchAssistantGatewayMemory,
   adoptHermesAssistant,
   getHermesAssistantStatus,
+  type HermesRemoteStatus,
+  type RotateHermesRemoteKeyResult,
+  type ApplyHermesRemoteResult,
+  getHermesRemoteStatus,
+  rotateHermesRemoteKey,
+  applyHermesRemote,
 } from "./assistant";

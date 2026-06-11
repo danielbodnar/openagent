@@ -80,6 +80,11 @@ export type ChatItem =
       isUiTool: boolean;
       startTime: number;
       endTime?: number;
+      lazy?: boolean;
+      loading?: boolean;
+      hasResult?: boolean;
+      contentBytes?: number;
+      resultBytes?: number;
     }
   | {
       kind: "system";
@@ -426,6 +431,11 @@ export function eventsToItemsImpl(
             }
           }
         } else {
+          // Legacy finalizers were persisted with empty content; with no
+          // open block they would render as empty thought bubbles. Drop them.
+          if (isDone && content.trim() === "") {
+            break;
+          }
           const newIdx = items.length;
           if (!isGoalDeliverable) {
             items.push({
@@ -477,6 +487,49 @@ export function eventsToItemsImpl(
         break;
       }
 
+      case "tool_stub": {
+        finalizePendingThinking(timestamp);
+        lastTextDelta = null;
+        const toolCallId = event.tool_call_id || `unknown-${event.id}`;
+        const name = event.tool_name || "unknown";
+        const isUiTool =
+          name.startsWith("ui_") ||
+          name === "question" ||
+          name === "AskUserQuestion";
+        const resultTimestamp =
+          typeof event.metadata?.result_timestamp === "string"
+            ? new Date(event.metadata.result_timestamp).getTime()
+            : undefined;
+        const toolItem: ChatItem = {
+          kind: "tool",
+          id: `tool-${toolCallId}`,
+          toolCallId,
+          name,
+          args: undefined,
+          isUiTool,
+          startTime: timestamp,
+          result: undefined,
+          endTime:
+            typeof resultTimestamp === "number" &&
+            Number.isFinite(resultTimestamp)
+              ? resultTimestamp
+              : undefined,
+          lazy: true,
+          hasResult: event.metadata?.has_result === true,
+          contentBytes:
+            typeof event.metadata?.call_content_bytes === "number"
+              ? event.metadata.call_content_bytes
+              : undefined,
+          resultBytes:
+            typeof event.metadata?.result_content_bytes === "number"
+              ? event.metadata.result_content_bytes
+              : undefined,
+        };
+        toolCallMap.set(toolCallId, items.length);
+        items.push(toolItem);
+        break;
+      }
+
       case "tool_result": {
         const toolCallId = event.tool_call_id || "";
         const idx = toolCallMap.get(toolCallId);
@@ -492,6 +545,9 @@ export function eventsToItemsImpl(
             ...toolItem,
             result,
             endTime: timestamp,
+            lazy: false,
+            loading: false,
+            hasResult: true,
           };
         }
         break;

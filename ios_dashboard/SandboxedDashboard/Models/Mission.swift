@@ -234,6 +234,15 @@ struct QueuedMessage: Codable, Identifiable {
     let id: String
     let content: String
     let agent: String?
+    /// Mission this message targets. `GET /api/control/queue` returns every
+    /// mission's queued messages — the UI must filter on this to avoid
+    /// showing (and deleting) another mission's queue entries.
+    let missionId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, content, agent
+        case missionId = "mission_id"
+    }
 
     /// Truncated content for display (max 100 chars)
     var displayContent: String {

@@ -56,6 +56,14 @@
   --border: 255 255 255; /* Used with /0.06 */
   --border-elevated: 255 255 255; /* Used with /0.08 */
 
+  /* Polish layer - simulated "light from above".
+     --surface-sheen: 1px inner top-edge highlight on raised surfaces, so the
+     top of each panel catches the light. --canvas-glow: faint accent-tinted
+     radial wash behind the app so the canvas isn't dead-flat. */
+  --surface-sheen: inset 0 1px 0 0 rgb(255 255 255 / 0.05);
+  --surface-sheen-strong: inset 0 1px 0 0 rgb(255 255 255 / 0.09);
+  --canvas-glow: rgb(var(--accent) / 0.05);
+
   /* Code surfaces */
   --code-background: 30 32 38;
   --code-border: 255 255 255;
@@ -106,6 +114,14 @@
   /* Borders */
   --border: 17 24 39;
   --border-elevated: 17 24 39;
+
+  /* Polish layer (light): white top bevel over translucent panels + a
+     barely-there ambient drop shadow for separation from the light canvas. */
+  --surface-sheen: inset 0 1px 0 0 rgb(255 255 255 / 0.85),
+    0 1px 2px rgb(17 24 39 / 0.04);
+  --surface-sheen-strong: inset 0 1px 0 0 rgb(255 255 255 / 0.95),
+    0 2px 6px rgb(17 24 39 / 0.05);
+  --canvas-glow: rgb(var(--accent) / 0.03);
 
   /* Code surfaces */
   --code-background: 244 246 250;
@@ -181,6 +197,16 @@ button:disabled,
 
 body {
   background-color: rgb(var(--background));
+  /* Faint accent wash from top-center so the canvas has a light source
+     instead of reading as one flat slab. Fixed so internal scrolling
+     containers don't drag the glow around. */
+  background-image: radial-gradient(
+    120rem 64rem at 50% -16rem,
+    var(--canvas-glow),
+    transparent 60%
+  );
+  background-repeat: no-repeat;
+  background-attachment: fixed;
   color: rgb(var(--foreground));
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
@@ -235,21 +261,37 @@ select:focus-visible {
    Scrollbars - minimal, subtle
    ========================================================================= */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 
+/* Translucent pill inset from the edge (transparent border + padding-box
+   clip), instead of a solid bar pinned against content. */
 ::-webkit-scrollbar-thumb {
-  background: rgb(var(--foreground-muted));
-  border-radius: 4px;
+  background-color: rgb(var(--text) / 0.16);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgb(var(--foreground-tertiary));
+  background-color: rgb(var(--text) / 0.3);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Firefox (gated so it never disables the WebKit styling above in Chromium,
+   which ignores ::-webkit-scrollbar once scrollbar-color is set). */
+@supports not selector(::-webkit-scrollbar) {
+  html {
+    scrollbar-color: rgb(var(--text) / 0.2) transparent;
+  }
 }
 
 :root[data-theme="light"] {
@@ -742,6 +784,22 @@ select:focus-visible {
   border: 1px solid rgb(var(--accent) / 0.24);
 }
 
+/* Solid accent surfaces catch the light: a faint vertical sheen layered over
+   the background-color utility (background-image never collides with bg-*
+   classes or shadow-* utilities). Token-exact [class~=...] so tinted variants
+   like bg-indigo-500/20 are untouched. */
+[class~="bg-indigo-500"],
+[class~="bg-indigo-600"],
+.user-message-bubble-solid {
+  /* Fixed-length ramp so the sheen reads the same on a 2rem button and a
+     tall message bubble (a percentage ramp washes out tall elements). */
+  background-image: linear-gradient(
+    to bottom,
+    rgb(255 255 255 / 0.1),
+    rgb(255 255 255 / 0) 2.5rem
+  );
+}
+
 .user-message-bubble-queued {
   background-color: rgb(var(--message-user-bg) / 0.2);
   border-color: rgb(var(--accent) / 0.58);
@@ -933,13 +991,13 @@ select:focus-visible {
   background: rgba(255, 255, 255, 0.03);
   backdrop-filter: blur(20px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: var(--surface-sheen);
 }
 
 :root[data-theme="light"] {
   .glass-panel {
     background: rgba(255, 255, 255, 0.76);
     border-color: rgba(17, 24, 39, 0.09);
-    box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
   }
 }
 
@@ -951,6 +1009,7 @@ select:focus-visible {
 .panel {
   background: rgb(var(--surface-raised) / 0.86);
   border: 1px solid rgb(var(--border-subtle) / 0.08);
+  box-shadow: var(--surface-sheen);
 }
 
 .muted-text {
@@ -959,6 +1018,20 @@ select:focus-visible {
 
 .border-subtle {
   border-color: rgb(var(--border-subtle) / 0.08);
+}
+
+/* 1px divider that fades out at both ends instead of running edge-to-edge.
+   Theme-aware via --border-subtle (white in dark, gray-900 in light). */
+.divider-fade {
+  height: 1px;
+  border: none;
+  background: linear-gradient(
+    to right,
+    transparent,
+    rgb(var(--border-subtle) / 0.12) 16%,
+    rgb(var(--border-subtle) / 0.12) 84%,
+    transparent
+  );
 }
 
 .icon-button {
@@ -979,7 +1052,9 @@ select:focus-visible {
   border-radius: 0.75rem;
   background: rgba(255, 255, 255, 0.02);
   border: 1px solid rgba(255, 255, 255, 0.04);
-  transition: background-color 150ms ease-out, border-color 150ms ease-out;
+  box-shadow: var(--surface-sheen);
+  transition: background-color 150ms ease-out, border-color 150ms ease-out,
+    box-shadow 150ms ease-out;
 }
 
 :root[data-theme="light"] {
@@ -997,6 +1072,7 @@ select:focus-visible {
 .card:hover {
   background: rgba(255, 255, 255, 0.04);
   border-color: rgba(255, 255, 255, 0.08);
+  box-shadow: var(--surface-sheen-strong);
 }
 
 :root[data-theme="light"] {
@@ -1019,6 +1095,7 @@ select:focus-visible {
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.08);
   backdrop-filter: blur(20px);
+  box-shadow: var(--surface-sheen);
 }
 
 :root[data-theme="light"] {
@@ -1482,7 +1559,14 @@ select:focus-visible {
 
 .prose-glass hr {
   border: none;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  height: 1px;
+  background: linear-gradient(
+    to right,
+    transparent,
+    rgb(var(--border-subtle) / 0.14) 16%,
+    rgb(var(--border-subtle) / 0.14) 84%,
+    transparent
+  );
   margin: 1rem 0;
 }
 

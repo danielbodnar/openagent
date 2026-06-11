@@ -6,6 +6,7 @@
 //! shape, so this client targets that format only.
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::api::metadata_llm::{ApiFormat, MetadataLlmConfig};
 
@@ -49,6 +50,51 @@ pub struct AskCompletion {
 pub struct AskClient {
     http: reqwest::Client,
     config: MetadataLlmConfig,
+}
+
+fn decode_xml_text(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn parse_text_tool_calls(content: &str) -> Vec<ToolCall> {
+    let tool_re =
+        regex::Regex::new(r#"(?s)<tool_call>\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(.*?)</tool_call>"#)
+            .expect("valid tool-call regex");
+    let arg_re = regex::Regex::new(
+        r#"(?s)<arg_key>\s*([^<]+?)\s*</arg_key>\s*<arg_value>(.*?)</arg_value>"#,
+    )
+    .expect("valid tool-arg regex");
+
+    tool_re
+        .captures_iter(content)
+        .filter_map(|caps| {
+            let name = caps.get(1)?.as_str().trim().to_string();
+            let body = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let mut args = serde_json::Map::new();
+            for arg in arg_re.captures_iter(body) {
+                let Some(key) = arg.get(1).map(|m| m.as_str().trim()) else {
+                    continue;
+                };
+                let value = arg
+                    .get(2)
+                    .map(|m| decode_xml_text(m.as_str()))
+                    .unwrap_or_default();
+                args.insert(key.to_string(), Value::String(value));
+            }
+            if args.is_empty() {
+                return None;
+            }
+            Some(ToolCall {
+                id: format!("text-tool-{}", Uuid::new_v4()),
+                name,
+                arguments: Value::Object(args).to_string(),
+            })
+        })
+        .collect()
 }
 
 impl AskClient {
@@ -146,11 +192,16 @@ impl AskClient {
                 }
             }
         }
+        if tool_calls.is_empty() {
+            if let Some(text) = content.as_deref() {
+                tool_calls = parse_text_tool_calls(text);
+            }
+        }
 
         let total_tokens = json["usage"]["total_tokens"].as_u64();
 
         Ok(AskCompletion {
-            content,
+            content: if tool_calls.is_empty() { content } else { None },
             tool_calls,
             total_tokens,
         })
@@ -262,7 +313,9 @@ impl AskClient {
                 if let Some(c) = delta["content"].as_str() {
                     if !c.is_empty() {
                         content.push_str(c);
-                        on_delta(c);
+                        if tools.is_empty() {
+                            on_delta(c);
+                        }
                     }
                 }
                 if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -290,7 +343,7 @@ impl AskClient {
             }
         }
 
-        let tool_calls = tool_accum
+        let mut tool_calls: Vec<ToolCall> = tool_accum
             .into_iter()
             .filter(|(_, name, _)| !name.is_empty())
             .map(|(id, name, arguments)| ToolCall {
@@ -299,9 +352,18 @@ impl AskClient {
                 arguments,
             })
             .collect();
+        if tool_calls.is_empty() {
+            tool_calls = parse_text_tool_calls(&content);
+        }
+
+        // Tools were offered but the model answered in plain text: stream the
+        // content as a delta so the UI shows it immediately.
+        if tool_calls.is_empty() && !tools.is_empty() && !content.is_empty() {
+            on_delta(&content);
+        }
 
         Ok(AskCompletion {
-            content: if content.trim().is_empty() {
+            content: if !tool_calls.is_empty() || content.trim().is_empty() {
                 None
             } else {
                 Some(content)
@@ -309,5 +371,25 @@ impl AskClient {
             tool_calls,
             total_tokens,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_opencode_style_text_tool_call() {
+        let calls = parse_text_tool_calls(
+            r#"<tool_call>bash<arg_key>command</arg_key><arg_value>cd SPHINCS- && lake build SphincsMinusVerifiers 2&gt;&amp;1 | tail -50</arg_value></tool_call>"#,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        let args: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(
+            args["command"],
+            "cd SPHINCS- && lake build SphincsMinusVerifiers 2>&1 | tail -50"
+        );
     }
 }

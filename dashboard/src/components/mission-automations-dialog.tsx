@@ -795,9 +795,9 @@ export function MissionAutomationsDialog({
     }
   };
 
-  /** Stop a native harness loop: cancel the mission's current turn (coarse —
-   *  Phase 3 will use harness-native cancel like codex `thread/goal/clear`)
-   *  and mark the automation inactive so the panel reflects the new state. */
+  /** Stop a native harness loop: the backend cancellation path asks native
+   *  harnesses to clear their goal state first (Codex: `thread/goal/clear`),
+   *  then interrupts the active turn and marks the panel row inactive. */
   const handleStopNativeLoop = async () => {
     if (!pendingStop) return;
     setStopping(true);
