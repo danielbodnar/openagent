@@ -59,7 +59,7 @@ aes-gcm = "0.10"
 pbkdf2 = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
-rand = "0.9"
+rand = "0.10"
 hex = "0.4"
 
 # Remote console / file manager
