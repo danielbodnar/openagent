@@ -46,6 +46,163 @@ fn claude_thinking_budget(effort: &str) -> u32 {
     }
 }
 
+/// Marker emitted by Claude Code's `Bash` tool when invoked with
+/// `run_in_background: true`. The CLI handles the launch locally and returns a
+/// confirmation `tool_result` of the exact form:
+///
+/// `Command running in background with ID: <id>. Output is being written to: <path>`
+///
+/// In `--print` (non-interactive) mode no further re-invocation happens when the
+/// job finishes, so nothing wakes the agent — the background-task auto-resume
+/// watcher (see `supervision::background_task_autoresume_loop`) closes that gap.
+const BACKGROUND_TASK_ID_MARKER: &str = "Command running in background with ID:";
+const BACKGROUND_TASK_OUTPUT_MARKER: &str = "Output is being written to:";
+
+/// Pure parser for the Claude Code background-start marker.
+///
+/// Given a `Bash` tool_result's textual content, returns `Some((id, output_path))`
+/// when the content is a background-launch confirmation, or `None` otherwise.
+///
+/// The marker format is:
+/// `Command running in background with ID: <id>. Output is being written to: <path>`
+///
+/// We locate both labels by substring (rather than a strict full-string match)
+/// so leading/trailing whitespace or a trailing newline in the CLI payload does
+/// not break detection.
+///
+/// Both the id and the output path are single whitespace-free tokens. The real
+/// marker continues with explanatory prose after the path
+/// (`... tasks/bokwqyjak.output. You will be notified when it completes. ...`),
+/// so for each label we take only the **first whitespace-delimited token** and
+/// strip a single trailing `.` (the sentence separator). This prevents the
+/// trailing marker sentence from being captured as part of the path.
+pub fn parse_background_task_start(content: &str) -> Option<(String, String)> {
+    let id_label = content.find(BACKGROUND_TASK_ID_MARKER)?;
+    let after_id = &content[id_label + BACKGROUND_TASK_ID_MARKER.len()..];
+
+    // The output label must come *after* the id label.
+    let out_rel = after_id.find(BACKGROUND_TASK_OUTPUT_MARKER)?;
+    let id_segment = &after_id[..out_rel];
+    let after_out = &after_id[out_rel + BACKGROUND_TASK_OUTPUT_MARKER.len()..];
+
+    // The id is the first whitespace-delimited token between the two labels,
+    // terminated by the literal "." that precedes the output label. Strip a
+    // single trailing period.
+    let id = id_segment
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_string();
+
+    // The path is the first whitespace-delimited token after the output label
+    // (paths contain no spaces). Strip a single trailing "." (sentence
+    // separator) so the trailing marker prose
+    // ("... .output. You will be notified ...") is not captured.
+    let path = after_out
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_string();
+
+    if id.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((id, path))
+}
+
+/// Classify a proxy health-probe result into pass/fast-fail.
+///
+/// The probe (`check_claudecode_proxy_health`) GETs `<base>/v1/models` through
+/// the same CLI proxy the Claude CLI will use. The verdict is deliberately
+/// conservative so it can only catch a genuinely-down/erroring proxy and never
+/// false-blocks a slow-but-working one:
+/// - any HTTP status in 2xx/3xx/4xx (incl. 401/404) proves the proxy is up and
+///   routing → pass (the `/v1/models` route does not even need to exist);
+/// - 5xx means the proxy's upstream is erroring (e.g. provider cooldown / 502),
+///   which is exactly the stall we want to fail fast on → fail;
+/// - a connection-level failure or no response (refused / DNS / unreachable /
+///   timeout / `000`) → fail.
+fn claudecode_proxy_health_verdict(combined: &str, http_code: &str) -> Result<(), String> {
+    if combined.contains("Could not resolve host") {
+        return Err("Claude CLI proxy unreachable: DNS resolution failed".to_string());
+    }
+    if combined.contains("Connection refused") {
+        return Err(
+            "Claude CLI proxy unreachable: connection refused (proxy not listening?)".to_string(),
+        );
+    }
+    if combined.contains("Network is unreachable") {
+        return Err("Claude CLI proxy unreachable: network is unreachable".to_string());
+    }
+    if combined.contains("Connection timed out") || combined.contains("Operation timed out") {
+        return Err("Claude CLI proxy unreachable: connection timed out".to_string());
+    }
+
+    let code = http_code.trim();
+    if let Ok(n) = code.parse::<u16>() {
+        if n == 0 {
+            // curl's `000` sentinel: TCP/TLS connected attempt produced no HTTP
+            // response (proxy down or hung).
+            return Err(
+                "Claude CLI proxy did not return an HTTP response (proxy down or hung)".to_string(),
+            );
+        }
+        if (500..=599).contains(&n) {
+            return Err(format!(
+                "Claude CLI proxy upstream is erroring (HTTP {n}); failing fast instead of \
+                 waiting out the startup timeout"
+            ));
+        }
+        // Any other HTTP response (2xx/3xx/4xx, including 401/404) proves the
+        // proxy is up and routing requests.
+        return Ok(());
+    }
+
+    // Unparseable/empty code: treat as no response.
+    Err("Claude CLI proxy did not return an HTTP response (proxy down or hung)".to_string())
+}
+
+/// Fast health check for the CLI proxy auth path. Mirrors `check_api_reachability`'s
+/// in-sandbox curl, but probes the proxy (which proxy environments allow) rather
+/// than api.anthropic.com (which they block). The API key is passed via env so it
+/// never lands in the command string or logs.
+async fn check_claudecode_proxy_health(
+    workspace_exec: &WorkspaceExec,
+    cwd: &std::path::Path,
+    base_url: &str,
+    api_key: &str,
+) -> Result<(), String> {
+    let timeout_secs = std::env::var("SANDBOXED_SH_CLAUDECODE_PROXY_HEALTH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(8);
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let test_cmd = format!(
+        "curl -sS -o /dev/null -w '%{{http_code}}' --max-time {timeout_secs} \
+         -H \"Authorization: Bearer ${{CLAUDE_PROXY_HEALTH_KEY}}\" {url}"
+    );
+    let mut env = std::collections::HashMap::new();
+    env.insert("CLAUDE_PROXY_HEALTH_KEY".to_string(), api_key.to_string());
+
+    let output = match workspace_exec
+        .output(cwd, "/bin/sh", &["-c".to_string(), test_cmd], env)
+        .await
+    {
+        Ok(out) => out,
+        // An exec error here is about the sandbox, not the proxy; don't block.
+        Err(e) => {
+            tracing::debug!("Claude proxy health probe could not run ({e}); skipping fast-fail");
+            return Ok(());
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    claudecode_proxy_health_verdict(&combined, stdout.trim())
+}
+
 /// Execute a turn using Claude Code CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
@@ -68,6 +225,7 @@ pub fn run_claudecode_turn<'a>(
     tool_hub: Option<Arc<FrontendToolHub>>,
     status: Option<Arc<RwLock<ControlStatus>>>,
     override_auth: Option<crate::api::ai_providers::ClaudeCodeAuth>,
+    force_argv_prompt: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
     Box::pin(async move {
         use crate::api::ai_providers::{
@@ -249,23 +407,53 @@ pub fn run_claudecode_turn<'a>(
                         .map(|(e, _)| e)
                         .unwrap_or(i64::MIN);
                     if m_expires > host_expires {
+                        // Capture the host's pre-rotation refresh token so the
+                        // store-reconcile pass can find the owning account record.
+                        let host_old_refresh = read_claude_cli_credentials(&host_path)
+                            .map(|(_, _, r, _)| r)
+                            .unwrap_or_default();
                         tracing::info!(
                             mission_id = %mission_id,
                             mission_expires_at = m_expires,
                             host_expires_at = host_expires,
                             "Mission credentials are fresher than host; syncing back to all storage tiers"
                         );
-                        if let Err(e) = crate::api::ai_providers::sync_oauth_to_all_tiers(
+                        match crate::api::ai_providers::sync_oauth_to_all_tiers(
                             crate::ai_providers::ProviderType::Anthropic,
                             &m_refresh,
                             &m_access,
                             m_expires,
                         ) {
-                            tracing::warn!(
-                                mission_id = %mission_id,
-                                error = %e,
-                                "Failed to write mission-rotated Anthropic credentials back to host"
-                            );
+                            Ok(()) => {
+                                // The runner has no safe handle on the in-memory
+                                // AIProviderStore (a second instance would
+                                // split-brain ai_providers.json), so queue the
+                                // rotation for the proactive loop — which owns the
+                                // store — to apply against the matching record.
+                                if let Err(e) = crate::api::oauth_reconcile::record_pending_rotation(
+                                    &crate::api::oauth_reconcile::sidecar_path(app_working_dir),
+                                    crate::api::oauth_reconcile::PendingRotation {
+                                        provider: "anthropic".to_string(),
+                                        old_refresh_token: host_old_refresh,
+                                        new_refresh_token: m_refresh.clone(),
+                                        new_access_token: m_access.clone(),
+                                        expires_at: m_expires,
+                                    },
+                                ) {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        error = %e,
+                                        "Failed to queue Anthropic rotation for store reconcile"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    mission_id = %mission_id,
+                                    error = %e,
+                                    "Failed to write mission-rotated Anthropic credentials back to host"
+                                );
+                            }
                         }
                     }
                 }
@@ -675,6 +863,30 @@ pub fn run_claudecode_turn<'a>(
                 return AgentResult::failure(err_msg, 0)
                     .with_terminal_reason(TerminalReason::LlmError);
             }
+        } else if let Some(ref proxy) = proxy_auth {
+            // The CLI proxy is the auth path; the direct-Anthropic probe above is
+            // skipped because proxy environments block direct egress. Probe the
+            // proxy instead so a down/hung/erroring proxy fails fast (≈8s) and
+            // routes through ResetSessionFresh recovery, instead of silently
+            // burning the full startup timeout (90s, ×2 with recovery).
+            if let Err(err_msg) = check_claudecode_proxy_health(
+                &workspace_exec,
+                work_dir,
+                &proxy.base_url,
+                &proxy.api_key,
+            )
+            .await
+            {
+                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError)
+                    .with_data(claudecode_transport_failure_data(
+                        ClaudeTransportFailureStage::Startup,
+                        false,
+                        false,
+                        &[],
+                    ));
+            }
         }
 
         tracing::info!(
@@ -882,13 +1094,25 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        // Provide the prompt as a positional argument (instead of stdin).
-        //
-        // In production we have observed cases where piping stdin from the backend results in
-        // Claude Code producing no stdout events (even though it creates the session files),
-        // leaving missions stuck "Agent is working..." indefinitely.
-        args.push("--".to_string());
-        args.push(effective_message.clone());
+        // Stream-input mode (opt-in): deliver the prompt over stdin as
+        // stream-json and keep stdin open so messages can be injected
+        // MID-TURN (picked up after the current tool call completes, like
+        // typing in the interactive CLI). The positional prompt is ignored
+        // by the CLI in this mode, so it is not added.
+        let stream_input = crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false)
+            && !force_argv_prompt;
+        if stream_input {
+            args.push("--input-format".to_string());
+            args.push("stream-json".to_string());
+        } else {
+            // Provide the prompt as a positional argument (instead of stdin).
+            //
+            // In production we have observed cases where piping stdin from the backend results in
+            // Claude Code producing no stdout events (even though it creates the session files),
+            // leaving missions stuck "Agent is working..." indefinitely.
+            args.push("--".to_string());
+            args.push(effective_message.clone());
+        }
 
         // Build environment variables
         let mut env: HashMap<String, String> = HashMap::new();
@@ -1019,6 +1243,13 @@ pub fn run_claudecode_turn<'a>(
             tracing::debug!("Using Claude CLI credentials from mission directory");
         } else {
             tracing::warn!("No authentication available for Claude Code!");
+        }
+
+        // DGX Spark build offload (opt-in per workspace): expose the local host
+        // endpoint + token + workspace paths so the in-workspace `spark-build`
+        // wrapper can ship Lean builds to the Spark. Credentials stay on the host.
+        if let Some(spark_vars) = workspace.spark_offload_env(mission_id) {
+            env.extend(spark_vars);
         }
 
         // Inject Telegram action environment variables when processing a Telegram message.
@@ -1176,9 +1407,55 @@ pub fn run_claudecode_turn<'a>(
         };
 
         // Keep stdin open - dropping the writer (closing stdin) can cause some Claude CLI
-        // agent modes to hang. We pass the prompt via argv so stdin is not needed, but the
-        // CLI may check if stdin is open during initialization.
-        let _stdin_writer = pty.take_writer();
+        // agent modes to hang. In argv mode stdin is unused but must stay open;
+        // in stream-input mode it carries the prompt and mid-turn injections.
+        let mut stdin_writer = pty.take_writer().ok();
+        if stream_input {
+            #[cfg(unix)]
+            if let Err(e) = pty.set_raw_input_mode() {
+                // Without raw mode, canonical-mode line buffering truncates
+                // stdin writes >4096 bytes and echo reflects injected JSON
+                // back into the parsed stdout stream — stream-input cannot
+                // work. Fail the turn loudly; the operator can unset
+                // SANDBOXED_SH_CLAUDE_STREAM_INPUT to fall back to argv mode.
+                tracing::error!(mission_id = %mission_id, "Failed to set PTY raw input mode: {e}");
+                pty.kill();
+                return AgentResult::failure(
+                    format!(
+                        "Stream-input mode requires PTY raw input mode, which failed: {e}.                          Unset SANDBOXED_SH_CLAUDE_STREAM_INPUT to use argv prompt delivery."
+                    ),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::LlmError);
+            }
+            let mut initial_prompt_delivered = false;
+            if let Some(w) = stdin_writer.as_mut() {
+                let init = serde_json::json!({
+                    "type": "user",
+                    "message": { "role": "user", "content": [{ "type": "text", "text": effective_message }] }
+                });
+                use std::io::Write as _;
+                match writeln!(w, "{}", init).and_then(|_| w.flush()) {
+                    Ok(()) => initial_prompt_delivered = true,
+                    Err(e) => tracing::error!(
+                        mission_id = %mission_id,
+                        "Failed to write initial stream-json prompt: {e}"
+                    ),
+                }
+            }
+            if !initial_prompt_delivered {
+                // Without the prompt the CLI would idle on an empty session —
+                // a silent no-op turn. Fail loudly instead.
+                pty.kill();
+                return AgentResult::failure(
+                    "Stream-input mode could not deliver the initial prompt over stdin".to_string(),
+                    0,
+                )
+                .with_terminal_reason(TerminalReason::LlmError);
+            }
+        }
+        // Poll cadence for mid-turn operator-note injection (stream-input mode).
+        let mut last_note_poll = Instant::now();
         tracing::debug!(mission_id = %mission_id, "PTY writer taken (kept alive)");
 
         let reader = match pty.try_clone_reader() {
@@ -1280,6 +1557,7 @@ pub fn run_claudecode_turn<'a>(
         // decode (OAuth-encrypted / signature-only) so the turn end can
         // surface a marker instead of a silently empty thoughts panel.
         let mut thinking_audit = crate::backend::shared::ThinkingDeltaAudit::default();
+        let mut encrypted_marker_emitted = false;
         let mut text_buffer: HashMap<u32, String> = HashMap::new();
         let mut active_thinking_index: Option<u32> = None; // Track which thinking block is active
         let mut finalized_thinking_indices: std::collections::HashSet<u32> =
@@ -1507,6 +1785,37 @@ pub fn run_claudecode_turn<'a>(
                 // immediately leaves the turn in AwaitingTerminalResult/
                 // AwaitingClaude (not this state), so those stalls remain subject
                 // to the watchdog as before.
+                _ = tokio::time::sleep_until(last_note_poll + crate::api::runners::midturn::MID_TURN_POLL), if stream_input && stdin_writer.is_some() => {
+                    last_note_poll = Instant::now();
+                    crate::api::runners::midturn::drain_and_inject(
+                        mission_id,
+                        &events_tx,
+                        |block| {
+                                // Claude delivery is synchronous: a successful
+                                // blocking write to the live stream-json stdin
+                                // means the frame is handed to the CLI, so the
+                                // returned `bool` is the true outcome.
+                                let msg = serde_json::json!({
+                                    "type": "user",
+                                    "message": { "role": "user", "content": [{ "type": "text", "text": block }] }
+                                });
+                                let delivered = if let Some(w) = stdin_writer.as_mut() {
+                                    use std::io::Write as _;
+                                    let ok = writeln!(w, "{}", msg).and_then(|_| w.flush()).is_ok();
+                                    if ok {
+                                        tracing::info!(
+                                            mission_id = %mission_id,
+                                            "Injected operator notes mid-turn via stream-json stdin"
+                                        );
+                                    }
+                                    ok
+                                } else {
+                                    false
+                                };
+                                std::future::ready(delivered)
+                        }
+                    ).await;
+                }
                 _ = tokio::time::sleep_until(last_heartbeat_at + heartbeat_interval),
                     if saw_non_init_event
                         && matches!(turn_wait_state, ClaudeTurnWaitState::AwaitingToolResults) => {
@@ -1924,6 +2233,7 @@ pub fn run_claudecode_turn<'a>(
                                                             tool_hub,
                                                             status,
                                                             override_auth_for_continuation,
+                                                            force_argv_prompt,
                                                         ).await;
                                                     }
                                                 }
@@ -2009,8 +2319,16 @@ pub fn run_claudecode_turn<'a>(
                                     // surface a marker so the panel isn't silently empty
                                     // (also warns once about unknown delta types).
                                     if let Some(marker) = thinking_audit.finish_turn() {
-                                        let _ = events_tx
-                                            .send(thinking_final_event(marker, mission_id));
+                                        // Coalesce: Fable/OAuth missions emit a signature-only
+                                        // thinking block on EVERY assistant round, which used to
+                                        // render dozens of identical "[encrypted thinking]"
+                                        // bubbles per turn (47 in one observed mission). One
+                                        // marker per CLI run says everything the panel needs.
+                                        if !encrypted_marker_emitted {
+                                            encrypted_marker_emitted = true;
+                                            let _ = events_tx
+                                                .send(thinking_final_event(marker, mission_id));
+                                        }
                                     }
                                     // Reset per-turn accumulation state so the next turn
                                     // starts fresh (block indices restart from 0 each turn)
@@ -2161,19 +2479,67 @@ pub fn run_claudecode_turn<'a>(
             mission_id = %mission_id,
             "Event loop completed, waiting for Claude Code process"
         );
-        let exit_status = tokio::task::spawn_blocking(move || {
+        // The final result has already been parsed at this point — the only
+        // thing left is process teardown. The CLI can fail to exit when a
+        // spawned MCP server (or any child) keeps running and holds the PTY
+        // open; an unbounded wait here loses the completed turn and stalls
+        // the mission until the 900s supervision watchdog force-aborts it
+        // (observed on orchestrator missions 832725c5/5daaa900). Bound the
+        // wait and kill the leftover process tree on expiry.
+        // In stream-input mode the CLI waits for more stdin after the result;
+        // close it so the process exits instead of hitting the kill grace.
+        // In argv mode the writer must stay open through the wait — closing
+        // stdin early can change CLI exit behavior (see spawn-site comment).
+        if stream_input {
+            drop(stdin_writer.take());
+        }
+        const CLI_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+        let child_pid = pty.process_id();
+        let mut wait_handle = tokio::task::spawn_blocking(move || {
             let mut pty = pty;
             pty.wait()
-        })
-        .await;
+        });
+        let exit_status = match tokio::time::timeout(CLI_EXIT_GRACE, &mut wait_handle).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    grace_secs = CLI_EXIT_GRACE.as_secs(),
+                    "Claude CLI did not exit after final result; killing leftover process tree"
+                );
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    // The CLI is the session leader on its PTY, so its pgid
+                    // matches its pid — killpg takes down lingering MCP
+                    // children too. Plain kill as a fallback.
+                    unsafe {
+                        libc::killpg(pid as i32, libc::SIGKILL);
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+                wait_handle.await
+            }
+        };
         tracing::debug!(
             mission_id = %mission_id,
             exit_status = ?exit_status,
             "Claude Code process exited"
         );
 
-        // Ensure the PTY reader task stops (it should naturally end after process exit).
-        let _ = reader_handle.await;
+        // Ensure the PTY reader task stops (it should naturally end after
+        // process exit). Bounded: an orphaned child holding the PTY slave
+        // open keeps the blocking read alive indefinitely.
+        let mut reader_handle = reader_handle;
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut reader_handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                mission_id = %mission_id,
+                "PTY reader did not stop after process exit; abandoning it"
+            );
+            reader_handle.abort();
+        }
 
         let usage = crate::cost::TokenUsage {
             input_tokens: total_input_tokens,
@@ -2469,6 +2835,16 @@ pub fn run_claudecode_turn<'a>(
     }) // end Box::pin(async move { ... })
 }
 
+fn claudecode_result_is_startup_transport_failure(result: &AgentResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("claudecode_transport_failure"))
+        .and_then(|value| value.get("stage"))
+        .and_then(|value| value.as_str())
+        == Some("startup")
+}
+
 /// Claude Code turn with the full recovery orchestration:
 /// transport-failure retries (resume current session, then fresh-session
 /// reset with condensed history), SIGKILL-driven proactive OAuth refresh,
@@ -2478,6 +2854,44 @@ pub fn run_claudecode_turn<'a>(
 /// Shared by both the mission arm and the control arm (Phase 3) — they
 /// previously carried near-duplicate copies of this loop, with the control
 /// copy missing the SIGKILL refresh and initial auth retry.
+#[allow(clippy::too_many_arguments)]
+/// Returns the byte size of the on-disk Claude session transcript for
+/// `session_id` when it exceeds the configured resume cap, otherwise `None`.
+///
+/// Resuming a very large transcript can make the CLI spend the entire startup
+/// window replaying it before emitting any stream-json event, tripping the
+/// startup timeout (see `run_claudecode_turn_with_recovery`). The cap is
+/// configurable via `SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES`
+/// (default 25 MB); set it to `0` to disable the check entirely.
+fn claudecode_oversized_resume_transcript(
+    work_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<u64> {
+    let cap = std::env::var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(25_000_000);
+    if cap == 0 {
+        return None;
+    }
+    // Claude stores transcripts at
+    // <work_dir>/.claude/projects/<hash>/<session_id>.jsonl. The <hash> dir
+    // depends on the absolute cwd inside the container, so scan every project
+    // dir rather than guessing the hash.
+    let projects_dir = work_dir.join(".claude").join("projects");
+    let entries = std::fs::read_dir(&projects_dir).ok()?;
+    let file_name = format!("{session_id}.jsonl");
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(&file_name);
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.is_file() && meta.len() > cap {
+                return Some(meta.len());
+            }
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_claudecode_turn_with_recovery(
     workspace: &Workspace,
@@ -2506,6 +2920,60 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
     let mut attempted_same_session_resume = false;
     let mut attempted_session_reset = false;
 
+    // Proactive guard: resuming a very large session transcript can make the
+    // Claude CLI spend the entire startup window replaying it before emitting
+    // any stream-json event, tripping the startup timeout. When the would-be
+    // resumed transcript exceeds the configured cap, rotate to a fresh session
+    // up front (same mechanism as the ResetSessionFresh recovery arm below) so
+    // the first attempt starts clean with rebuilt history instead of hanging.
+    let mut first_turn_is_continuation = is_continuation;
+    if is_continuation && !cancel.is_cancelled() && !crate::api::routes::is_shutdown_initiated() {
+        if let Some(sid) = effective_sid.clone() {
+            if let Some(size) = claudecode_oversized_resume_transcript(work_dir, &sid) {
+                let new_session_id = Uuid::new_v4().to_string();
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    old_session_id = %sid,
+                    new_session_id = %new_session_id,
+                    transcript_bytes = size,
+                    "Resume transcript exceeds cap; rotating to a fresh session before first attempt"
+                );
+                let _ = events_tx.send(AgentEvent::SessionIdUpdate {
+                    mission_id,
+                    session_id: new_session_id.clone(),
+                });
+                let session_marker = work_dir.join(".claude-session-initiated");
+                if session_marker.exists() {
+                    let _ = std::fs::remove_file(&session_marker);
+                }
+                let history_for_retry = match history.last() {
+                    Some((role, content)) if role == "user" && content == message => {
+                        &history[..history.len() - 1]
+                    }
+                    _ => history,
+                };
+                effective_msg = if history_for_retry.is_empty() {
+                    message.to_string()
+                } else {
+                    let history_ctx =
+                        build_history_context(history_for_retry, max_history_total_chars);
+                    format!(
+                        "## Prior conversation (session was reset: prior transcript too large to resume)\n\n\
+                         {history_ctx}\
+                         ## Current message\n\n\
+                         {message}"
+                    )
+                };
+                effective_sid = Some(new_session_id);
+                first_turn_is_continuation = false;
+                // A fresh session has no transcript to replay; if it still
+                // times out at startup the cause is environmental, so don't let
+                // recovery burn another reset on it.
+                attempted_session_reset = true;
+            }
+        }
+    }
+
     let mut result = run_claudecode_turn(
         workspace,
         work_dir,
@@ -2519,12 +2987,46 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
         secrets.clone(),
         app_working_dir,
         effective_sid.as_deref(),
-        is_continuation,
+        first_turn_is_continuation,
         tool_hub.clone(),
         status.clone(),
         None, // override_auth: use default credential resolution
+        false,
     )
     .await;
+
+    let mut force_argv_prompt = false;
+    if crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false)
+        && claudecode_result_is_startup_transport_failure(&result)
+        && !cancel.is_cancelled()
+        && !crate::api::routes::is_shutdown_initiated()
+    {
+        force_argv_prompt = true;
+        tracing::warn!(
+            mission_id = %mission_id,
+            "Claude stream-input turn emitted zero usable events; retrying once with argv prompt delivery"
+        );
+        result = run_claudecode_turn(
+            workspace,
+            work_dir,
+            &effective_msg,
+            model,
+            model_effort,
+            agent,
+            mission_id,
+            events_tx.clone(),
+            cancel.clone(),
+            secrets.clone(),
+            app_working_dir,
+            effective_sid.as_deref(),
+            is_continuation,
+            tool_hub.clone(),
+            status.clone(),
+            None,
+            true,
+        )
+        .await;
+    }
 
     loop {
         if cancel.is_cancelled() || crate::api::routes::is_shutdown_initiated() {
@@ -2568,6 +3070,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     tool_hub.clone(),
                     status.clone(),
                     None,
+                    force_argv_prompt,
                 )
                 .await;
             }
@@ -2633,6 +3136,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     tool_hub.clone(),
                     status.clone(),
                     None,
+                    force_argv_prompt,
                 )
                 .await;
             }
@@ -2695,6 +3199,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
             tool_hub.clone(),
             status.clone(),
             None,
+            force_argv_prompt,
         )
         .await;
     }
@@ -2751,6 +3256,7 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
                     tool_hub.clone(),
                     status.clone(),
                     Some(alt_auth),
+                    force_argv_prompt,
                 )
                 .await;
                 // Continue rotating on account-specific failures.
@@ -2805,9 +3311,157 @@ pub(crate) async fn run_claudecode_turn_with_recovery(
             tool_hub.clone(),
             status.clone(),
             None,
+            force_argv_prompt,
         )
         .await;
     }
 
     result
+}
+
+#[cfg(test)]
+mod background_task_tests {
+    use super::parse_background_task_start;
+
+    #[test]
+    fn parses_real_marker() {
+        let content = "Command running in background with ID: bash_1. \
+             Output is being written to: /tmp/claude-bg/bash_1.log";
+        let (id, path) = parse_background_task_start(content).expect("should parse marker");
+        assert_eq!(id, "bash_1");
+        assert_eq!(path, "/tmp/claude-bg/bash_1.log");
+    }
+
+    #[test]
+    fn parses_real_marker_with_trailing_prose() {
+        // Exact marker emitted by the Claude CLI: the path is followed by
+        // explanatory prose on the same line. Only the path token must be
+        // captured (no trailing sentence).
+        let content = "Command running in background with ID: bokwqyjak. \
+             Output is being written to: \
+             /tmp/claude-0/-workspaces-mission-20b6ee43/3cd99fa9-c3f8-4127-954a-d3be352221bf/tasks/bokwqyjak.output. \
+             You will be notified when it completes. To check interim output, use Read on that file path.";
+        let (id, path) = parse_background_task_start(content).expect("should parse real marker");
+        assert_eq!(id, "bokwqyjak");
+        assert_eq!(
+            path,
+            "/tmp/claude-0/-workspaces-mission-20b6ee43/3cd99fa9-c3f8-4127-954a-d3be352221bf/tasks/bokwqyjak.output"
+        );
+    }
+
+    #[test]
+    fn parses_marker_with_surrounding_whitespace_and_newline() {
+        let content = "  Command running in background with ID: abc-123. \
+             Output is being written to: /var/tmp/out.log\n";
+        let (id, path) = parse_background_task_start(content).expect("should tolerate whitespace");
+        assert_eq!(id, "abc-123");
+        assert_eq!(path, "/var/tmp/out.log");
+    }
+
+    #[test]
+    fn returns_none_for_unrelated_content() {
+        assert!(parse_background_task_start("total 0\n-rw-r--r-- 1 root root 0 file").is_none());
+        assert!(parse_background_task_start("").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_only_id_label_present() {
+        // Malformed: id label but no output label.
+        assert!(parse_background_task_start("Command running in background with ID: x").is_none());
+    }
+
+    #[test]
+    fn returns_none_when_id_or_path_empty() {
+        // Output label present but path missing.
+        let content = "Command running in background with ID: bash_2. Output is being written to:";
+        assert!(parse_background_task_start(content).is_none());
+        // Id missing.
+        let content = "Command running in background with ID: . \
+             Output is being written to: /tmp/x.log";
+        assert!(parse_background_task_start(content).is_none());
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::{claudecode_oversized_resume_transcript, claudecode_proxy_health_verdict};
+
+    // --- Proxy health verdict (fail-fast classification) ---
+
+    #[test]
+    fn proxy_verdict_passes_on_any_http_response() {
+        // 2xx/3xx/4xx all prove the proxy is up and routing — including 404
+        // (route may not exist) and 401 (auth) — so none should block.
+        for code in ["200", "204", "301", "400", "401", "403", "404", "429"] {
+            assert!(
+                claudecode_proxy_health_verdict("", code).is_ok(),
+                "HTTP {code} should pass"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_verdict_fails_on_upstream_5xx() {
+        // The observed production stall: provider cooldown / 502 surfaced by the proxy.
+        for code in ["500", "502", "503", "529"] {
+            assert!(
+                claudecode_proxy_health_verdict("", code).is_err(),
+                "HTTP {code} should fast-fail"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_verdict_fails_on_connection_errors_and_no_response() {
+        assert!(claudecode_proxy_health_verdict("curl: (7) Connection refused", "000").is_err());
+        assert!(claudecode_proxy_health_verdict("Could not resolve host: proxy", "000").is_err());
+        assert!(claudecode_proxy_health_verdict("Network is unreachable", "000").is_err());
+        assert!(claudecode_proxy_health_verdict("Operation timed out", "000").is_err());
+        // Empty / unparseable code with no recognizable error → treated as no response.
+        assert!(claudecode_proxy_health_verdict("", "000").is_err());
+        assert!(claudecode_proxy_health_verdict("", "").is_err());
+    }
+
+    // --- Oversized resume transcript detection ---
+
+    #[test]
+    fn oversized_transcript_detected_above_cap_only() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path();
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let proj = work_dir.join(".claude").join("projects").join("somehash");
+        std::fs::create_dir_all(&proj).unwrap();
+        let transcript = proj.join(format!("{session_id}.jsonl"));
+
+        // Small transcript: under the (default 25MB) cap → not flagged.
+        {
+            let mut f = std::fs::File::create(&transcript).unwrap();
+            f.write_all(b"{\"x\":1}\n").unwrap();
+        }
+        assert_eq!(
+            claudecode_oversized_resume_transcript(work_dir, session_id),
+            None
+        );
+
+        // Force a tiny cap via env so the test stays fast and deterministic.
+        std::env::set_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES", "4");
+        let got = claudecode_oversized_resume_transcript(work_dir, session_id);
+        assert!(got.is_some(), "transcript above tiny cap should be flagged");
+
+        // Cap of 0 disables the check entirely.
+        std::env::set_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES", "0");
+        assert_eq!(
+            claudecode_oversized_resume_transcript(work_dir, session_id),
+            None
+        );
+
+        // Unknown session id → nothing found.
+        std::env::set_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES", "4");
+        assert_eq!(
+            claudecode_oversized_resume_transcript(work_dir, "no-such-session"),
+            None
+        );
+        std::env::remove_var("SANDBOXED_SH_CLAUDECODE_MAX_RESUME_TRANSCRIPT_BYTES");
+    }
 }

@@ -57,6 +57,7 @@ const providerConfig: Record<string, { color: string; icon: string }> = {
   'together-ai': { color: 'bg-orange-500/10 text-orange-400', icon: '🤝' },
   perplexity: { color: 'bg-cyan-500/10 text-cyan-400', icon: '🔍' },
   cohere: { color: 'bg-rose-500/10 text-rose-400', icon: '💬' },
+  kimi: { color: 'bg-violet-500/10 text-violet-400', icon: '🌙' },
   custom: { color: 'bg-white/10 text-white/60', icon: '🔧' },
 };
 
@@ -75,6 +76,7 @@ const defaultProviderTypes: AIProviderTypeInfo[] = [
   { id: 'zai', name: 'Z.AI', uses_oauth: false, env_var: 'ZHIPU_API_KEY' },
   { id: 'minimax', name: 'Minimax', uses_oauth: false, env_var: 'MINIMAX_API_KEY' },
   { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },
+  { id: 'kimi', name: 'Kimi', uses_oauth: true, env_var: null },
 ];
 
 /** Format a number with commas */
@@ -105,12 +107,27 @@ function fmtResetEpoch(secs: number | undefined | null): string {
   return fmtReset(new Date(secs * 1000).toISOString());
 }
 
-/** Usage bar: shows used/limit with a mini progress bar */
-function UsageBar({ used, limit, label }: { used?: number | null; limit?: number | null; label: string }) {
-  if (limit == null && used == null) return null;
-  const remaining = used ?? 0;
+/**
+ * Usage bar: fills the *consumed* portion of a limit.
+ *
+ * `remaining` is how much is LEFT (e.g. `tokens_remaining`, or
+ * `(1 - utilization) * 100` for percentage windows). The bar shows
+ * `limit - remaining` consumed. (Previously this prop was named `used`, which
+ * was misleading — every call site has always passed a remaining value.)
+ */
+function UsageBar({
+  remaining,
+  limit,
+  label,
+}: {
+  remaining?: number | null;
+  limit?: number | null;
+  label: string;
+}) {
+  if (limit == null && remaining == null) return null;
+  const left = remaining ?? 0;
   const total = limit ?? 0;
-  const usedCount = total - remaining;
+  const usedCount = total - left;
   const pct = total > 0 ? Math.min(100, (usedCount / total) * 100) : 0;
   const color = pct > 90 ? 'bg-red-400' : pct > 70 ? 'bg-amber-400' : 'bg-emerald-400';
 
@@ -192,14 +209,14 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
           </div>
           {usage.unified_5h_utilization != null && (
             <UsageBar
-              used={Math.round((1 - usage.unified_5h_utilization) * 100)}
+              remaining={Math.round((1 - usage.unified_5h_utilization) * 100)}
               limit={100}
               label={`5h window (${usage.unified_5h_status || ''})`}
             />
           )}
           {usage.unified_7d_utilization != null && (
             <UsageBar
-              used={Math.round((1 - usage.unified_7d_utilization) * 100)}
+              remaining={Math.round((1 - usage.unified_7d_utilization) * 100)}
               limit={100}
               label={`7d window (${usage.unified_7d_status || ''})`}
             />
@@ -224,18 +241,18 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
       {/* Anthropic legacy rate limits */}
       {type === 'anthropic' && !usage.unified_status && usage.requests_limit != null && (
         <div className="space-y-2">
-          <UsageBar used={usage.requests_remaining} limit={usage.requests_limit} label="Requests" />
-          <UsageBar used={usage.tokens_remaining} limit={usage.tokens_limit} label="Tokens" />
-          <UsageBar used={usage.input_tokens_remaining} limit={usage.input_tokens_limit} label="Input tokens" />
-          <UsageBar used={usage.output_tokens_remaining} limit={usage.output_tokens_limit} label="Output tokens" />
+          <UsageBar remaining={usage.requests_remaining} limit={usage.requests_limit} label="Requests" />
+          <UsageBar remaining={usage.tokens_remaining} limit={usage.tokens_limit} label="Tokens" />
+          <UsageBar remaining={usage.input_tokens_remaining} limit={usage.input_tokens_limit} label="Input tokens" />
+          <UsageBar remaining={usage.output_tokens_remaining} limit={usage.output_tokens_limit} label="Output tokens" />
         </div>
       )}
 
       {/* OpenAI style rate limits */}
       {type === 'openai' && usage.requests_limit != null && (
         <div className="space-y-2">
-          <UsageBar used={usage.requests_remaining} limit={usage.requests_limit} label="Requests" />
-          <UsageBar used={usage.tokens_remaining} limit={usage.tokens_limit} label="Tokens" />
+          <UsageBar remaining={usage.requests_remaining} limit={usage.requests_limit} label="Requests" />
+          <UsageBar remaining={usage.tokens_remaining} limit={usage.tokens_limit} label="Tokens" />
           <div className="flex gap-4 text-[10px] text-white/30">
             {usage.requests_reset && (
               <span>Requests reset: {fmtReset(usage.requests_reset)}</span>
@@ -263,14 +280,14 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
           </div>
           {usage.codex_primary_used_percent != null && (
             <UsageBar
-              used={Math.round(100 - usage.codex_primary_used_percent)}
+              remaining={Math.round(100 - usage.codex_primary_used_percent)}
               limit={100}
               label="5h window"
             />
           )}
           {usage.codex_secondary_used_percent != null && (
             <UsageBar
-              used={Math.round(100 - usage.codex_secondary_used_percent)}
+              remaining={Math.round(100 - usage.codex_secondary_used_percent)}
               limit={100}
               label="Weekly window"
             />
@@ -301,8 +318,8 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
       {/* Cerebras style rate limits */}
       {type === 'cerebras' && (
         <div className="space-y-2">
-          <UsageBar used={usage.requests_remaining_day} limit={usage.requests_limit_day} label="Requests (daily)" />
-          <UsageBar used={usage.tokens_remaining_minute} limit={usage.tokens_limit_minute} label="Tokens (per minute)" />
+          <UsageBar remaining={usage.requests_remaining_day} limit={usage.requests_limit_day} label="Requests (daily)" />
+          <UsageBar remaining={usage.tokens_remaining_minute} limit={usage.tokens_limit_minute} label="Tokens (per minute)" />
           <div className="flex gap-4 text-[10px] text-white/30">
             {usage.requests_reset_day && (
               <span>Daily reset: {fmtReset(usage.requests_reset_day)}</span>
@@ -314,28 +331,20 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
         </div>
       )}
 
-      {/* Minimax model usage */}
-      {type === 'minimax' && Array.isArray(usage.model_usage) && (
+      {/* Minimax coding plan — per-category 5h + weekly windows (remaining %) */}
+      {type === 'minimax' && Array.isArray(usage.model_usage) && usage.model_usage.length > 0 && (
         <div className="space-y-3">
-          {(usage.model_usage as Array<{
-            model: string;
-            interval_total: number;
-            interval_remaining: number;
-            weekly_total: number;
-            weekly_remaining: number;
-            interval_reset: number;
-            weekly_reset: number;
-          }>).map((m) => (
+          {usage.model_usage.map((m) => (
             <div key={m.model} className="space-y-1">
               <div className="text-[11px] text-white/50 font-medium">{m.model}</div>
-              <UsageBar used={m.interval_remaining} limit={m.interval_total} label="Interval" />
-              <UsageBar used={m.weekly_remaining} limit={m.weekly_total} label="Weekly" />
+              <UsageBar remaining={m.interval_remaining_percent} limit={100} label="5h window" />
+              <UsageBar remaining={m.weekly_remaining_percent} limit={100} label="Weekly" />
               <div className="flex gap-4 text-[10px] text-white/30">
                 {m.interval_reset > 0 && (
-                  <span>Interval reset: {fmtReset(new Date(m.interval_reset).toISOString())}</span>
+                  <span>5h reset: {fmtResetEpoch(m.interval_reset)}</span>
                 )}
                 {m.weekly_reset > 0 && (
-                  <span>Weekly reset: {fmtReset(new Date(m.weekly_reset).toISOString())}</span>
+                  <span>Weekly reset: {fmtResetEpoch(m.weekly_reset)}</span>
                 )}
               </div>
             </div>
@@ -344,13 +353,37 @@ function UsageDetails({ usage, loading }: { usage: ProviderUsage | null; loading
       )}
 
       {/* Minimax connected without model data */}
-      {type === 'minimax' && usage.status === 'connected' && !Array.isArray(usage.model_usage) && (
+      {type === 'minimax' && usage.status === 'connected' &&
+        !(Array.isArray(usage.model_usage) && usage.model_usage.length > 0) && (
         <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
 
-      {/* Z.AI - minimal info */}
-      {type === 'zai' && usage.status === 'connected' && (
-        <div className="text-[11px] text-emerald-400/70">Connected - Z.AI does not expose rate limit headers</div>
+      {/* Z.AI GLM coding plan — 5h + weekly token windows (percent used) */}
+      {type === 'zai' && usage.zai_weekly_used_percent != null && (
+        <div className="space-y-2">
+          {usage.zai_plan && (
+            <div className="text-[11px] text-white/50">
+              <span className="text-white/30">Plan:</span> {usage.zai_plan}
+            </div>
+          )}
+          {usage.zai_5h_used_percent != null && (
+            <UsageBar remaining={100 - usage.zai_5h_used_percent} limit={100} label="5h window" />
+          )}
+          <UsageBar remaining={100 - usage.zai_weekly_used_percent} limit={100} label="Weekly" />
+          <div className="flex gap-4 text-[10px] text-white/30">
+            {usage.zai_5h_reset != null && usage.zai_5h_reset > 0 && (
+              <span>5h reset: {fmtResetEpoch(usage.zai_5h_reset)}</span>
+            )}
+            {usage.zai_weekly_reset != null && usage.zai_weekly_reset > 0 && (
+              <span>Weekly reset: {fmtResetEpoch(usage.zai_weekly_reset)}</span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Z.AI connected without quota data (non-coding-plan key) */}
+      {type === 'zai' && usage.status === 'connected' && usage.zai_weekly_used_percent == null && (
+        <div className="text-[11px] text-emerald-400/70">Connected</div>
       )}
 
       {/* Google - account info only */}

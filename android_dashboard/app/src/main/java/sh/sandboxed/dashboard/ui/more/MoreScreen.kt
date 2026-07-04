@@ -26,7 +26,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.theme.Palette
 
@@ -38,19 +41,19 @@ fun MoreScreen(onNavigate: (String) -> Unit) {
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         item { Text("More", style = MaterialTheme.typography.headlineSmall, color = Palette.TextPrimary, modifier = Modifier.padding(bottom = 8.dp)) }
-        item { Tile("Workspaces", "Hosts and containers", Icons.Filled.Computer) { onNavigate("workspaces") } }
-        item { Tile("Desktop", "Live stream and remote input", Icons.Filled.Computer) { onNavigate("desktop/${Uri.encode(":101")}") } }
-        item { Tile("Tasks", "Subtasks running on the agent", Icons.Filled.Schedule) { onNavigate("tasks") } }
-        item { Tile("Runs", "Cost-tracked invocations", Icons.Filled.MonetizationOn) { onNavigate("runs") } }
-        item { Tile("FIDO approvals", "Auto-approve signing requests", Icons.Filled.Fingerprint) { onNavigate("fido_rules") } }
+        item { Tile("Workspaces", "Hosts and containers", Icons.Filled.Computer, TestTags.MORE_TILE_WORKSPACES) { onNavigate("workspaces") } }
+        item { Tile("Desktop", "Live stream and remote input", Icons.Filled.Computer, TestTags.MORE_TILE_DESKTOP) { onNavigate("desktop/${Uri.encode(":101")}") } }
+        item { Tile("Tasks", "Subtasks running on the agent", Icons.Filled.Schedule, TestTags.MORE_TILE_TASKS) { onNavigate("tasks") } }
+        item { Tile("Runs", "Cost-tracked invocations", Icons.Filled.MonetizationOn, TestTags.MORE_TILE_RUNS) { onNavigate("runs") } }
+        item { Tile("FIDO approvals", "Auto-approve signing requests", Icons.Filled.Fingerprint, TestTags.MORE_TILE_FIDO) { onNavigate("fido_rules") } }
         item { Spacer(Modifier.size(8.dp)) }
-        item { Tile("Settings", "Server, defaults, sign-out", Icons.Filled.Settings) { onNavigate("settings") } }
+        item { Tile("Settings", "Server, defaults, sign-out", Icons.Filled.Settings, TestTags.MORE_TILE_SETTINGS) { onNavigate("settings") } }
     }
 }
 
 @Composable
-private fun Tile(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
-    GlassCard(modifier = Modifier.fillMaxWidth(), onClick = onClick) {
+private fun Tile(title: String, subtitle: String, icon: ImageVector, tag: String, onClick: () -> Unit) {
+    GlassCard(modifier = Modifier.fillMaxWidth().testTag(tag), onClick = onClick) {
         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(icon, null, tint = Palette.AccentLight)
             Spacer(Modifier.width(12.dp))

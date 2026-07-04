@@ -170,6 +170,20 @@ struct ControlView: View {
     @State private var slashCommandLoading = false
     @State private var copiedMessageId: String?
     @State private var shouldScrollImmediately = false
+    /// Set by revert paths (`applyViewingMission(..., scrollToBottom: false)`
+    /// after a failed mission switch) so the per-mission remount's rescue
+    /// scroll doesn't stomp a deliberately preserved scroll position.
+    @State private var preserveScrollOnNextAppear = false
+    /// Latched layout decision for the conversation stack. Decided only on
+    /// fresh-open applies (scrollToBottom == true) so the VStack/LazyVStack
+    /// structure can't silently flip mid-conversation as history grows —
+    /// such a flip rebuilds lazy geometry without a remount and can strand
+    /// the viewport (Bugbot). A change remounts via the scroll view's .id.
+    @State private var conversationUsesLazyLayout = false
+    /// Mission the lazy-layout decision was computed for, so revert paths
+    /// (which apply a different mission with scrollToBottom == false) still
+    /// get a correct decision instead of inheriting the attempted mission's.
+    @State private var lazyLayoutMissionId: String?
     @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
     @State private var pendingFocusedMessageId: String?
 
@@ -267,6 +281,12 @@ struct ControlView: View {
         bodyContent
             .navigationTitle(viewingMission?.displayTitle ?? "Control")
             .navigationBarTitleDisplayMode(.inline)
+            // Keep the bar opaque: without this the conversation scrolls
+            // through the title/buttons because SwiftUI can't always find
+            // the ScrollView (it's nested in a ZStack) to drive the
+            // scroll-edge material.
+            .toolbarBackground(Theme.backgroundPrimary, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .principal) { AnyView(principalToolbarContent) }
                 ToolbarItem(placement: .topBarLeading) { AnyView(leadingToolbarContent) }
@@ -288,6 +308,15 @@ struct ControlView: View {
         }
         .onChange(of: inputText) { _, newText in
             scheduleDraftSave(newText)
+        }
+        .onChange(of: isInputFocused) { _, focused in
+            // The keyboard resizes the conversation viewport; if the user was
+            // reading the latest message, keep them pinned there instead of
+            // letting the resize strand the viewport in lazy-layout limbo.
+            if focused && scrollAnchorState == .pinned {
+                shouldScrollImmediately = true
+                scrollToBottomTick += 1
+            }
         }
         .onChange(of: showControlDiagnostics) { _, enabled in
             if enabled {
@@ -506,6 +535,11 @@ struct ControlView: View {
         )
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+        .presentationCornerRadius(24)
+        // Explicit opaque background: the default sheet material composited
+        // over the conversation produced a visible vertical seam where the
+        // content behind changed brightness.
+        .presentationBackground(Theme.backgroundPrimary)
     }
 
     /// Leading toolbar item: thoughts panel button + workers button.
@@ -561,6 +595,9 @@ struct ControlView: View {
                 if runningMissions.count > 0 {
                     Text("\(runningMissions.count)")
                         .font(.caption2.weight(.medium))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .animation(.snappy, value: runningMissions.count)
                 }
             }
             .foregroundStyle(runningMissions.isEmpty ? Theme.textSecondary : Theme.accent)
@@ -793,18 +830,26 @@ struct ControlView: View {
 
     @ViewBuilder
     private var workerPillOrNil: some View {
-        if !childMissions.isEmpty {
-            WorkerPillView(
-                workers: childMissions,
-                runningWorkers: runningMissions,
-                onTap: {
-                    HapticService.lightTap()
-                    showWorkerSheet = true
-                }
-            )
-            .padding(.bottom, 12)
-            .transition(.move(edge: .bottom).combined(with: .opacity))
-            .animation(.spring(response: 0.3), value: childMissions.count)
+        HStack(spacing: 8) {
+            // Board belongs to the mission being VIEWED (viewingMissionId),
+            // which can differ from the session's current mission.
+            if let missionId = viewingMissionId ?? currentMission?.id {
+                TaskBoardPillLoader(missionId: missionId)
+                    .padding(.bottom, 12)
+            }
+            if !childMissions.isEmpty {
+                WorkerPillView(
+                    workers: childMissions,
+                    runningWorkers: runningMissions,
+                    onTap: {
+                        HapticService.lightTap()
+                        showWorkerSheet = true
+                    }
+                )
+                .padding(.bottom, 12)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .animation(.spring(response: 0.3), value: childMissions.count)
+            }
         }
     }
 
@@ -978,7 +1023,11 @@ struct ControlView: View {
             // `messages` is non-empty means its very first layout already has
             // the conversation in it, so the bottom anchor lands the user at
             // the most recent message naturally with no animation, no race.
-            if messages.isEmpty {
+            // `groupedItems` is the rendered source of truth — `messages` can
+            // be non-empty while every row is elided (thinking-only history),
+            // which previously mounted a ScrollView around zero rows and left
+            // an unscrollable black void.
+            if messages.isEmpty || groupedItems.isEmpty {
                 if isLoading {
                     // Skeleton bubbles instead of a bare spinner: gives the
                     // user something shaped like the result while the
@@ -1008,10 +1057,23 @@ struct ControlView: View {
         )
     }
 
+    /// Above this row count the conversation uses a LazyVStack; below it,
+    /// a plain VStack. Lazy layout + `.defaultScrollAnchor(.bottom)` has an
+    /// intermittent failure mode on initial mount: row heights are
+    /// estimated, the viewport anchors past the real content, and the user
+    /// sees a frozen blank conversation (diagnostics show rows rendered,
+    /// screen shows nothing). Fully materializing typical-size histories
+    /// sidesteps the estimation entirely; truly huge histories accept the
+    /// lazy tradeoff to keep memory bounded.
+    private static let lazyConversationThreshold = 80
+
     private var conversationScrollView: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 20) {
+                ConditionallyLazyVStack(
+                    isLazy: conversationUsesLazyLayout,
+                    spacing: 20
+                ) {
                     // "Load earlier messages" button when history is truncated
                     if hasMoreHistory {
                         Button {
@@ -1066,6 +1128,20 @@ struct ControlView: View {
                 )
             }
             .defaultScrollAnchor(.bottom)
+            .onAppear {
+                // Rescue pass for the lazy path: if the initial anchor landed
+                // outside real content (estimated row heights), snap to the
+                // true bottom once layout settles. No-op when already there.
+                // Skipped when a revert path explicitly preserved position.
+                if preserveScrollOnNextAppear {
+                    preserveScrollOnNextAppear = false
+                    return
+                }
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(80))
+                    scrollToBottom(proxy: proxy, immediate: true)
+                }
+            }
             .coordinateSpace(name: "scroll")
             .onPreferenceChange(ScrollOffsetPreferenceKey.self) { maxY in
                 let pinned = maxY < UIScreen.main.bounds.height + 200
@@ -1132,6 +1208,13 @@ struct ControlView: View {
             .environment(\.missionFileContext, inlineImageContext)
             .environment(\.controlPerformanceDiagnosticsEnabled, showControlDiagnostics)
         }
+        // Remount the scroll view per mission. Reusing one ScrollView across
+        // wholesale content swaps left stale lazy-layout geometry behind —
+        // the view could end up positioned past the new (shorter) content,
+        // rendering an unrecoverable blank conversation. A fresh mount also
+        // re-arms `.defaultScrollAnchor(.bottom)` so each mission opens at
+        // its latest message with no scroll chase.
+        .id("\(viewingMissionId ?? "global-conversation")-lazy-\(conversationUsesLazyLayout)")
     }
 
     private var hasActiveStreamingItem: Bool {
@@ -1242,6 +1325,7 @@ struct ControlView: View {
         .padding(16)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .surfaceSheen(cornerRadius: 16)
         .transition(.opacity.combined(with: .scale(scale: 0.95)))
     }
     
@@ -1489,7 +1573,7 @@ struct ControlView: View {
                         .foregroundStyle(Theme.accent.opacity(0.6))
                     Text(goal.objective)
                         .font(.caption2)
-                        .foregroundStyle(Theme.accent.opacity(0.7))
+                        .foregroundStyle(Theme.accent.opacity(0.85))
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -1577,8 +1661,10 @@ struct ControlView: View {
                             .frame(width: 32, height: 32)
                             .background(Theme.error)
                             .clipShape(Circle())
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
-                    .padding(.leading, 8)
+                    .padding(.leading, 2)
                     .transition(.scale.combined(with: .opacity))
                 }
 
@@ -1630,18 +1716,18 @@ struct ControlView: View {
                         Circle()
                             .stroke(!canSend && pendingSendCount == 0 ? Theme.border : Color.clear, lineWidth: 1)
                     )
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
                 }
                 .disabled(!canSend)
-                .padding(.trailing, 8)
+                .padding(.trailing, 2)
             }
             .animation(.easeInOut(duration: 0.15), value: runState)
             .animation(.easeInOut(duration: 0.15), value: pendingSendCount > 0)
             .animation(.easeInOut(duration: 0.15), value: hasInput)
+            .background(Theme.card.opacity(0.6))
             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(Theme.border, lineWidth: 1)
-            )
+            .surfaceSheen(cornerRadius: 24)
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 16)
@@ -2087,6 +2173,14 @@ struct ControlView: View {
         restorePendingSends(for: mission.id)
         recomputeGroupedItems()
 
+        // Recompute the layout decision on fresh opens and whenever the
+        // applied mission differs from the one the flag was computed for
+        // (e.g. a failed-switch revert). In-place growth of the same
+        // mission (load earlier) deliberately never flips the structure.
+        if scrollToBottom || lazyLayoutMissionId != mission.id {
+            conversationUsesLazyLayout = groupedItems.count > Self.lazyConversationThreshold
+            lazyLayoutMissionId = mission.id
+        }
         if scrollToBottom {
             shouldScrollImmediately = true
             scrollToBottomTick += 1
@@ -2233,6 +2327,14 @@ struct ControlView: View {
             recomputeGroupedItems()
         }
 
+        // Recompute the layout decision on fresh opens and whenever the
+        // applied mission differs from the one the flag was computed for
+        // (e.g. a failed-switch revert). In-place growth of the same
+        // mission (load earlier) deliberately never flips the structure.
+        if scrollToBottom || lazyLayoutMissionId != mission.id {
+            conversationUsesLazyLayout = groupedItems.count > Self.lazyConversationThreshold
+            lazyLayoutMissionId = mission.id
+        }
         if scrollToBottom {
             shouldScrollImmediately = true
             scrollToBottomTick += 1
@@ -2482,6 +2584,7 @@ struct ControlView: View {
 
             // Revert viewing state to avoid filtering out events
             if let fallback = previousViewingMission ?? currentMission {
+                preserveScrollOnNextAppear = true
                 applyViewingMission(fallback, scrollToBottom: false)
             } else {
                 viewingMissionId = previousViewingId
@@ -3682,6 +3785,7 @@ struct ControlView: View {
             queueLength = previousQueueLength
             progress = previousProgress
             if let fallback = previousViewingMission ?? currentMission {
+                preserveScrollOnNextAppear = true
                 applyViewingMission(fallback, scrollToBottom: false)
             } else {
                 viewingMissionId = previousViewingId
@@ -4154,10 +4258,25 @@ struct ControlView: View {
         case "error":
             if let errorMessage = data["message"] as? String {
                 finalizeActiveThinkingMessages()
+                // Transport-layer errors are connection plumbing, not agent
+                // output — the reconnect/fallback machinery already handles
+                // them and the connection banner reports them. Rendering
+                // them as chat bubbles ("WebSocket failed to open…") reads
+                // like the mission broke when it didn't.
+                let transportReasons: Set<String> = [
+                    "web_socket_open_failed", "web_socket_failed",
+                    "inactivity", "invalid_configuration"
+                ]
+                if let reason = data["reason"] as? String,
+                   transportReasons.contains(reason) {
+                    break
+                }
                 // Filter out SSE-specific reconnection errors - these are handled by the reconnection logic
                 // Use specific patterns to avoid filtering legitimate agent errors
                 let lower = errorMessage.lowercased()
-                let isSseReconnectError = lower.contains("stream connection failed") ||
+                let isSseReconnectError = lower.contains("websocket failed to open") ||
+                                          lower.contains("websocket stream failed") ||
+                                          lower.contains("stream connection failed") ||
                                           lower.contains("sse connection") ||
                                           lower.contains("event stream") ||
                                           lower.contains("stream idle") ||
@@ -4441,2427 +4560,6 @@ struct ControlView: View {
     }
 }
 
-// MARK: - Scroll Offset Preference Key
-
-private struct ScrollOffsetPreferenceKey: PreferenceKey {
-    nonisolated(unsafe) static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-// MARK: - Conversation Rows
-
-private struct ConversationRowsView: View {
-    let groupedItems: [GroupedChatItem]
-    let copiedMessageId: String?
-    @Binding var expandedToolGroups: Set<String>
-    let onCopy: (ChatMessage) -> Void
-    let onRetry: (ChatMessage) -> Void
-
-    var body: some View {
-        ForEach(groupedItems) { item in
-            switch item {
-            case .single(let message):
-                MessageBubble(
-                    message: message,
-                    isCopied: copiedMessageId == message.id,
-                    onCopy: { onCopy(message) },
-                    onRetry: message.sendState.isFailed ? { onRetry(message) } : nil
-                )
-                .modifier(ControlBodyRenderProbe(name: "MessageBubble"))
-                .id(message.id)
-            case .toolGroup(let groupId, let tools):
-                ToolGroupView(
-                    groupId: groupId,
-                    tools: tools,
-                    expandedGroups: $expandedToolGroups
-                )
-                .modifier(ControlBodyRenderProbe(name: "ToolGroupView"))
-                .id(item.id)
-            }
-        }
-    }
-}
-
-// MARK: - Message Bubble
-
-private struct MessageBubble: View {
-    let message: ChatMessage
-    var isCopied: Bool = false
-    var onCopy: (() -> Void)?
-    var onRetry: (() -> Void)?
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            if message.isUser {
-                Spacer(minLength: 60)
-                userBubble
-            } else if message.isThinking {
-                ThinkingBubble(message: message)
-                Spacer(minLength: 60)
-            } else if message.isPhase {
-                PhaseBubble(message: message)
-                Spacer(minLength: 60)
-            } else if message.isToolCall {
-                ToolCallBubble(message: message)
-                Spacer(minLength: 60)
-            } else if message.isToolUI {
-                toolUIBubble
-                Spacer(minLength: 40)
-            } else {
-                // Assistant messages now use full width
-                assistantBubble
-            }
-        }
-    }
-    
-    @ViewBuilder
-    private var toolUIBubble: some View {
-        if let toolUI = message.toolUI {
-            ToolUIView(content: toolUI)
-        }
-    }
-    
-    private var userBubble: some View {
-        HStack(alignment: .top, spacing: 8) {
-            // Copy button
-            if !message.content.isEmpty {
-                CopyButton(isCopied: isCopied, onCopy: onCopy)
-            }
-
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(message.content)
-                    .font(.body)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .background(bubbleBackground)
-                    .clipShape(
-                        .rect(
-                            topLeadingRadius: 20,
-                            bottomLeadingRadius: 20,
-                            bottomTrailingRadius: 6,
-                            topTrailingRadius: 20
-                        )
-                    )
-                    .overlay(
-                        UnevenRoundedRectangle(
-                            topLeadingRadius: 20,
-                            bottomLeadingRadius: 20,
-                            bottomTrailingRadius: 6,
-                            topTrailingRadius: 20
-                        )
-                        .stroke(message.sendState.isFailed ? Theme.error : Color.clear, lineWidth: 1)
-                    )
-                    // While the message is awaiting server ack, dim the bubble
-                    // and overlay a small spinner so the user has unambiguous
-                    // feedback that the send is in flight. (UX audit item #11.)
-                    .opacity(message.sendState.isPending ? 0.55 : 1)
-                    .overlay(alignment: .bottomTrailing) {
-                        if message.sendState.isPending {
-                            ProgressView()
-                                .controlSize(.mini)
-                                .tint(.white)
-                                .padding(6)
-                        } else if message.sendState.isFailed {
-                            Image(systemName: "exclamationmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(Theme.error)
-                                .padding(6)
-                        }
-                    }
-                    .animation(.easeOut(duration: 0.15), value: message.sendState.isPending)
-                    .animation(.easeOut(duration: 0.15), value: message.sendState.isFailed)
-                    .contextMenu {
-                        Button {
-                            onCopy?()
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                        }
-                        if message.sendState.isFailed, onRetry != nil {
-                            Button {
-                                onRetry?()
-                            } label: {
-                                Label("Retry send", systemImage: "arrow.clockwise")
-                            }
-                        }
-                    }
-
-                // Inline "Send failed — Tap to retry" affordance directly under
-                // the failed bubble. Mirrors iMessage's "Not Delivered" pattern
-                // so users get an unmistakable signal and a one-tap recovery.
-                if message.sendState.isFailed, let reason = message.sendState.failureReason {
-                    Button(action: { onRetry?() }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.clockwise.circle.fill")
-                                .font(.caption2)
-                            Text("Not sent · Tap to retry")
-                                .font(.caption2.weight(.medium))
-                        }
-                        .foregroundStyle(Theme.error)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Retry send. Failed: \(reason)")
-                } else {
-                    // Timestamp
-                    Text(message.timestamp, style: .time)
-                        .font(.caption2)
-                        .foregroundStyle(Theme.textMuted)
-                }
-            }
-        }
-    }
-
-    /// Background color/material for the user bubble. Failed sends render with
-    /// a dimmed error tint so the row is unmistakably distinct from a normal
-    /// (sent) bubble, in case the user is glancing rather than reading.
-    private var bubbleBackground: Color {
-        message.sendState.isFailed ? Theme.error.opacity(0.55) : Theme.accent
-    }
-
-    private var assistantBubble: some View {
-        HStack(alignment: .top, spacing: 8) {
-            VStack(alignment: .leading, spacing: 8) {
-                // Status header for assistant messages
-                if case .assistant(let success, _, _, _, _) = message.type {
-                    HStack(spacing: 6) {
-                        Image(systemName: success ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .font(.caption2)
-                            .foregroundStyle(success ? Theme.success : Theme.error)
-
-                        if let model = message.displayModel {
-                            Text(model)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(Theme.textTertiary)
-                        }
-
-                        if let cost = message.costFormatted {
-                            Text("•")
-                                .foregroundStyle(Theme.textMuted)
-                            // Cost + source as one calm chip: "$4.22 actual" — the
-                            // ALL-CAPS pill version of "ACTUAL" was visually shouting
-                            // louder than the cost itself.
-                            HStack(spacing: 4) {
-                                Text(cost)
-                                    .font(.caption2.monospaced())
-                                    .foregroundStyle(message.costIsEstimated ? Theme.textSecondary : Theme.success)
-                                if let badge = message.costSourceLabel {
-                                    Text(badge.lowercased())
-                                        .font(.caption2)
-                                        .foregroundStyle(Theme.textMuted)
-                                }
-                            }
-                        }
-
-                        Text("•")
-                            .foregroundStyle(Theme.textMuted)
-                        Text(message.timestamp, style: .time)
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                }
-
-                MarkdownView(message.content)
-                    .modifier(ControlBodyRenderProbe(name: "MarkdownView"))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .background(.ultraThinMaterial)
-                    .clipShape(
-                        .rect(
-                            topLeadingRadius: 20,
-                            bottomLeadingRadius: 6,
-                            bottomTrailingRadius: 20,
-                            topTrailingRadius: 20
-                        )
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(Theme.border, lineWidth: 0.5)
-                    )
-                    .contextMenu {
-                        Button {
-                            onCopy?()
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                        }
-                    }
-
-                // Render shared files
-                if let files = message.sharedFiles, !files.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach(files) { file in
-                            SharedFileCardView(file: file)
-                        }
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            // Copy button
-            if !message.content.isEmpty {
-                CopyButton(isCopied: isCopied, onCopy: onCopy)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-// MARK: - Shared File Card View
-
-private struct SharedFileCardView: View {
-    let file: SharedFile
-    @Environment(\.openURL) private var openURL
-    @State private var imageData: Data?
-    @State private var isLoadingImage = false
-    @State private var imageLoadFailed = false
-
-    private var fullURL: URL? {
-        // If URL is relative, prepend the base URL
-        if file.url.hasPrefix("/") {
-            let baseURL = APIService.shared.baseURL
-            return URL(string: baseURL + file.url)
-        }
-        return URL(string: file.url)
-    }
-
-    var body: some View {
-        if file.isImage {
-            imageCard
-        } else {
-            downloadCard
-        }
-    }
-
-    private var imageCard: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Image preview with authentication support. The shimmer
-            // skeleton matches the inline rich-image placeholder so the
-            // chat feels consistent while either type loads.
-            Group {
-                if let url = fullURL,
-                   let data = imageData,
-                   let uiImage = ImageMemoryCache.shared.cachedImage(for: url) ?? UIImage(data: data) {
-                    Image(uiImage: uiImage)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity, maxHeight: 300)
-                } else if imageLoadFailed {
-                    Image(systemName: "photo")
-                        .font(.title)
-                        .foregroundStyle(Theme.textMuted)
-                        .frame(maxWidth: .infinity, minHeight: 80)
-                        .background(Theme.backgroundSecondary)
-                } else {
-                    ShimmerSkeleton(cornerRadius: 12, height: 200)
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .task {
-                await loadImage()
-            }
-
-            // File info bar
-            HStack(spacing: 6) {
-                Image(systemName: file.kind.iconName)
-                    .font(.caption2)
-                    .foregroundStyle(Theme.textMuted)
-
-                Text(file.name)
-                    .font(.caption2)
-                    .foregroundStyle(Theme.textSecondary)
-                    .lineLimit(1)
-
-                Spacer()
-
-                if let size = file.formattedSize {
-                    Text(size)
-                        .font(.caption2)
-                        .foregroundStyle(Theme.textMuted)
-                }
-
-                Button {
-                    if let url = fullURL {
-                        openURL(url)
-                    }
-                } label: {
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.caption2)
-                        .foregroundStyle(Theme.accent)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(Theme.backgroundSecondary)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Theme.border, lineWidth: 0.5)
-        )
-    }
-
-    private var downloadCard: some View {
-        Button {
-            if let url = fullURL {
-                openURL(url)
-            }
-        } label: {
-            HStack(spacing: 12) {
-                // File type icon
-                Image(systemName: file.kind.iconName)
-                    .font(.title3)
-                    .foregroundStyle(Theme.accent)
-                    .frame(width: 40, height: 40)
-                    .background(Theme.accent.opacity(0.1))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-
-                // File info
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(file.name)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(Theme.textPrimary)
-                        .lineLimit(1)
-
-                    HStack(spacing: 4) {
-                        Text(file.contentType)
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textMuted)
-                            .lineLimit(1)
-
-                        if let size = file.formattedSize {
-                            Text("•")
-                                .foregroundStyle(Theme.textMuted)
-                            Text(size)
-                                .font(.caption2)
-                                .foregroundStyle(Theme.textMuted)
-                        }
-                    }
-                }
-
-                Spacer()
-
-                // Download indicator
-                Image(systemName: "arrow.down.circle")
-                    .font(.title3)
-                    .foregroundStyle(Theme.textMuted)
-            }
-            .padding(12)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Theme.border, lineWidth: 0.5)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func loadImage() async {
-        guard let url = fullURL, !isLoadingImage else {
-            // If URL is nil (malformed), mark as failed to prevent infinite loading
-            if fullURL == nil {
-                await MainActor.run {
-                    self.imageLoadFailed = true
-                    self.isLoadingImage = false
-                }
-            }
-            return
-        }
-
-        isLoadingImage = true
-        imageLoadFailed = false
-
-        if ImageMemoryCache.shared.cachedImage(for: url) != nil {
-            imageData = Data()
-            isLoadingImage = false
-            return
-        }
-
-        do {
-            var request = URLRequest(url: url)
-            // Bound the per-image fetch to the same window as JSON requests so
-            // a stalled image host can't leave the cell spinning behind the
-            // 60s URLSession default.
-            request.timeoutInterval = APIService.requestTimeout
-
-            // Add authentication token if available
-            if let token = APIService.shared.authToken {
-                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            }
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-
-            // Check response status
-            if let httpResponse = response as? HTTPURLResponse {
-                if httpResponse.statusCode == 200 {
-                    // Validate/downsample before storing row state.
-                    if await ImageMemoryCache.shared.image(from: data, url: url) != nil {
-                        await MainActor.run {
-                            self.imageData = data
-                        }
-                    } else {
-                        // Data is not a valid image
-                        await MainActor.run {
-                            self.imageLoadFailed = true
-                        }
-                    }
-                } else {
-                    await MainActor.run {
-                        self.imageLoadFailed = true
-                    }
-                }
-            } else {
-                // Non-HTTP response (or failed cast) shouldn't leave the spinner running
-                await MainActor.run {
-                    self.imageLoadFailed = true
-                }
-            }
-        } catch {
-            print("Failed to load image: \(error)")
-            await MainActor.run {
-                self.imageLoadFailed = true
-            }
-        }
-
-        await MainActor.run {
-            isLoadingImage = false
-        }
-    }
-}
-
-// MARK: - Copy Button
-
-private struct CopyButton: View {
-    let isCopied: Bool
-    let onCopy: (() -> Void)?
-
-    var body: some View {
-        Button {
-            onCopy?()
-        } label: {
-            Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(isCopied ? Theme.success : Theme.textSecondary)
-                .frame(width: 28, height: 28)
-                .background(Theme.backgroundSecondary)
-                .clipShape(Circle())
-                .overlay(
-                    Circle().stroke(Theme.border, lineWidth: 0.5)
-                )
-        }
-        .accessibilityLabel(isCopied ? "Copied" : "Copy message")
-    }
-}
-
-// MARK: - Phase Bubble
-
-private struct PhaseBubble: View {
-    let message: ChatMessage
-    
-    var body: some View {
-        if case .phase(let phase, let detail, let agent) = message.type {
-            let agentPhase = AgentPhase(rawValue: phase)
-            
-            HStack(spacing: 12) {
-                // Icon with pulse animation
-                Image(systemName: agentPhase?.icon ?? "gear")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(Theme.accent)
-                    .symbolEffect(.pulse, options: .repeating)
-                    .frame(width: 32, height: 32)
-                    .background(Theme.accent.opacity(0.1))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(agentPhase?.label ?? phase.replacingOccurrences(of: "_", with: " ").capitalized)
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(Theme.accent)
-
-                        if let agent = agent {
-                            Text(agent)
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(Theme.textMuted)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Theme.backgroundTertiary)
-                                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                        }
-
-                        Text("•")
-                            .foregroundStyle(Theme.textMuted)
-                            .font(.caption2)
-                        Text(message.timestamp, style: .time)
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textMuted)
-                    }
-
-                    if let detail = detail {
-                        Text(detail)
-                            .font(.caption)
-                            .foregroundStyle(Theme.textTertiary)
-                    }
-                }
-                
-                Spacer()
-                
-                // Spinner
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .scaleEffect(0.7)
-                    .tint(Theme.accent.opacity(0.5))
-            }
-            .padding(12)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Theme.accent.opacity(0.15), lineWidth: 1)
-            )
-            .transition(.opacity.combined(with: .scale(scale: 0.95)))
-        }
-    }
-}
-
-// MARK: - Tool Call Bubble (Enhanced)
-
-struct ToolCallBubble: View {
-    let message: ChatMessage
-    @State private var isExpanded = false
-    @State private var elapsedSeconds: Int = 0
-    @State private var timerTask: Task<Void, Never>?
-
-    private var toolData: ToolCallData? {
-        message.toolData
-    }
-
-    private var isRunning: Bool {
-        toolData?.state == .running
-    }
-
-    private var stateColor: Color {
-        guard let state = toolData?.state else {
-            return message.isActiveToolCall ? Theme.warning : Theme.textMuted
-        }
-        switch state {
-        case .running: return Theme.warning
-        case .success: return Theme.success
-        case .error: return Theme.error
-        case .cancelled: return Theme.warning
-        }
-    }
-
-    private var stateIcon: String {
-        guard let state = toolData?.state else {
-            return message.isActiveToolCall ? "circle.fill" : "checkmark.circle.fill"
-        }
-        switch state {
-        case .running: return "circle.fill"
-        case .success: return "checkmark.circle.fill"
-        case .error: return "xmark.circle.fill"
-        case .cancelled: return "xmark.circle.fill"
-        }
-    }
-
-    var body: some View {
-        if let name = message.toolCallName {
-            VStack(alignment: .leading, spacing: 0) {
-                // Compact header button
-                Button {
-                    withAnimation(.spring(duration: 0.25)) {
-                        isExpanded.toggle()
-                    }
-                    HapticService.selectionChanged()
-                } label: {
-                    HStack(spacing: 6) {
-                        // Tool icon
-                        Image(systemName: toolIcon(for: name))
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(stateColor)
-                            .frame(width: 18, height: 18)
-                            .background(stateColor.opacity(0.15))
-                            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-
-                        // Tool name
-                        Text(name)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(Theme.accent)
-                            .lineLimit(1)
-
-                        // Args preview
-                        if let preview = toolData?.argsPreview, !preview.isEmpty {
-                            Text("(\(preview))")
-                                .font(.caption2)
-                                .foregroundStyle(Theme.textMuted)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                        }
-
-                        Spacer()
-
-                        // Duration
-                        if let data = toolData {
-                            Text(isRunning ? "\(formattedElapsed)..." : data.durationFormatted)
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(Theme.textMuted)
-                        }
-
-                        // State indicator
-                        if isRunning {
-                            ProgressView()
-                                .progressViewStyle(.circular)
-                                .scaleEffect(0.5)
-                                .tint(stateColor)
-                        } else {
-                            Image(systemName: stateIcon)
-                                .font(.system(size: 12))
-                                .foregroundStyle(stateColor)
-                        }
-
-                        // Chevron
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(Theme.textMuted)
-                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(stateColor.opacity(0.05))
-                    .clipShape(Capsule())
-                    .overlay(
-                        Capsule()
-                            .stroke(stateColor.opacity(0.2), lineWidth: 1)
-                    )
-                }
-                .buttonStyle(.plain)
-
-                // Expandable content
-                if isExpanded {
-                    VStack(alignment: .leading, spacing: 10) {
-                        // Arguments section
-                        if let data = toolData, !data.args.isEmpty {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Arguments")
-                                    .font(.caption2)
-                                    .fontWeight(.medium)
-                                    .foregroundStyle(Theme.textMuted)
-                                    .textCase(.uppercase)
-
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    Text(data.argsString)
-                                        .font(.caption.monospaced())
-                                        .foregroundStyle(Theme.textSecondary)
-                                        .padding(8)
-                                        .background(Theme.backgroundTertiary.opacity(0.5))
-                                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                }
-                                .frame(maxHeight: 120)
-                            }
-                        }
-
-                        // Result section
-                        if let data = toolData, let resultStr = data.resultString {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(data.isErrorResult ? "Error" : "Result")
-                                    .font(.caption2)
-                                    .fontWeight(.medium)
-                                    .foregroundStyle(data.isErrorResult ? Theme.error : Theme.success)
-                                    .textCase(.uppercase)
-
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    Text(resultStr)
-                                        .font(.caption.monospaced())
-                                        .foregroundStyle(data.isErrorResult ? Theme.error : Theme.textSecondary)
-                                        .padding(8)
-                                        .background((data.isErrorResult ? Theme.error : Theme.backgroundTertiary).opacity(0.1))
-                                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                }
-                                .frame(maxHeight: 120)
-                            }
-                        }
-
-                        // Still running indicator
-                        if isRunning {
-                            HStack(spacing: 6) {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                                    .scaleEffect(0.5)
-                                    .tint(Theme.warning)
-                                Text("Running for \(formattedElapsed)...")
-                                    .font(.caption2)
-                                    .foregroundStyle(Theme.warning)
-                            }
-                        }
-                    }
-                    .padding(.top, 8)
-                    .padding(.horizontal, 4)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-            }
-            .animation(.spring(duration: 0.25), value: isExpanded)
-            .onAppear {
-                if isRunning {
-                    startTimer()
-                }
-            }
-            .onDisappear {
-                timerTask?.cancel()
-            }
-            .onChange(of: isRunning) { _, running in
-                if running {
-                    startTimer()
-                } else {
-                    timerTask?.cancel()
-                }
-            }
-        }
-    }
-
-    private var formattedElapsed: String {
-        formatDurationString(elapsedSeconds)
-    }
-
-    private func startTimer() {
-        timerTask?.cancel()
-        elapsedSeconds = Int(toolData?.duration ?? 0)
-        timerTask = Task { @MainActor in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                if !Task.isCancelled {
-                    elapsedSeconds = Int(toolData?.duration ?? 0)
-                }
-            }
-        }
-    }
-
-    private func toolIcon(for name: String) -> String {
-        let lower = name.lowercased()
-        if lower.contains("bash") || lower.contains("shell") || lower.contains("terminal") || lower.contains("exec") {
-            return "terminal"
-        } else if lower.contains("read") || lower.contains("file") || lower.contains("write") {
-            return "doc.text"
-        } else if lower.contains("search") || lower.contains("grep") || lower.contains("find") || lower.contains("glob") {
-            return "magnifyingglass"
-        } else if lower.contains("browser") || lower.contains("web") || lower.contains("http") || lower.contains("fetch") {
-            return "globe"
-        } else if lower.contains("edit") || lower.contains("patch") || lower.contains("notebook") {
-            return "chevron.left.forwardslash.chevron.right"
-        } else if lower.contains("task") || lower.contains("agent") || lower.contains("subagent") {
-            return "person.2"
-        } else if lower.contains("desktop") || lower.contains("screenshot") {
-            return "display"
-        } else if lower.contains("todo") {
-            return "checklist"
-        } else {
-            return "wrench"
-        }
-    }
-}
-
-// MARK: - Thinking Bubble
-
-private struct InlineThinkingSurface: View {
-    let message: ChatMessage
-    let onOpenTimeline: () -> Void
-
-    var body: some View {
-        Button(action: onOpenTimeline) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Image(systemName: "brain")
-                        .font(.caption)
-                        .foregroundStyle(message.thinkingDone ? Theme.textMuted : Theme.accent)
-                        .symbolEffect(.pulse, options: message.thinkingDone ? .nonRepeating : .repeating)
-
-                    Text(message.thinkingDone ? "Latest thought" : "Thinking")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(message.thinkingDone ? Theme.textSecondary : Theme.accent)
-
-                    Spacer()
-
-                    Image(systemName: "chevron.up.forward")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(Theme.textMuted)
-                }
-
-                (Text(message.content) + (message.thinkingDone ? Text("") : Text(" ▍").foregroundColor(Theme.accent)))
-                    .font(.caption)
-                    .foregroundStyle(Theme.textSecondary)
-                    .lineLimit(message.thinkingDone ? 2 : 4)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(10)
-            .background(Theme.backgroundSecondary.opacity(0.96))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(message.thinkingDone ? Theme.border : Theme.accent.opacity(0.35), lineWidth: 0.5)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct ThinkingBubble: View {
-    let message: ChatMessage
-    @State private var isExpanded: Bool = true
-    @State private var elapsedSeconds: Int = 0
-    @State private var timerTask: Task<Void, Never>?
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Compact header button
-            Button {
-                withAnimation(.spring(duration: 0.25)) {
-                    isExpanded.toggle()
-                }
-                HapticService.selectionChanged()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "brain")
-                        .font(.caption)
-                        .foregroundStyle(Theme.accent)
-                        .symbolEffect(.pulse, options: message.thinkingDone ? .nonRepeating : .repeating)
-
-                    Text(message.thinkingDone ? "Thought for \(formattedDuration)" : "Thinking for \(formattedDuration)")
-                        .font(.caption)
-                        .foregroundStyle(Theme.textSecondary)
-
-                    Text("•")
-                        .foregroundStyle(Theme.textMuted)
-                        .font(.caption2)
-                    Text(message.timestamp, style: .time)
-                        .font(.caption2)
-                        .foregroundStyle(Theme.textMuted)
-
-                    Spacer()
-
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Theme.textMuted)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Theme.accent.opacity(0.1))
-                .clipShape(Capsule())
-            }
-            
-            // Expandable content
-            if isExpanded && !message.content.isEmpty {
-                ScrollView {
-                    // Inline a blinking caret while streaming so the user can
-                    // distinguish in-flight tokens from a settled thought.
-                    // Without this, a paused stream looks identical to a
-                    // completed one.
-                    (Text(message.content) + (message.thinkingDone ? Text("") : Text(" ▍").foregroundColor(Theme.accent)))
-                        .font(.caption)
-                        .foregroundStyle(Theme.textTertiary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 300) // Allow scrolling for long thinking content
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color.white.opacity(0.02))
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Theme.border, lineWidth: 0.5)
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .top)))
-            } else if isExpanded && message.content.isEmpty {
-                Text("Processing...")
-                    .font(.caption)
-                    .italic()
-                    .foregroundStyle(Theme.textMuted)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-            }
-        }
-        .onAppear {
-            startTimer()
-        }
-        .onDisappear {
-            timerTask?.cancel()
-            timerTask = nil
-        }
-        .onChange(of: message.thinkingDone) { _, done in
-            if done {
-                timerTask?.cancel()
-                timerTask = nil
-
-                if let startTime = message.thinkingStartTime {
-                    elapsedSeconds = Int(Date().timeIntervalSince(startTime))
-                }
-            }
-
-        }
-    }
-    
-    private var formattedDuration: String {
-        formatDurationString(elapsedSeconds)
-    }
-    
-    private func startTimer() {
-        timerTask?.cancel()
-        timerTask = nil
-
-        guard !message.thinkingDone else {
-            // Calculate elapsed from start time
-            if let startTime = message.thinkingStartTime {
-                elapsedSeconds = Int(Date().timeIntervalSince(startTime))
-            }
-            return
-        }
-
-        // Update every second while thinking
-        timerTask = Task { @MainActor in
-            while !Task.isCancelled {
-                if let startTime = message.thinkingStartTime {
-                    elapsedSeconds = Int(Date().timeIntervalSince(startTime))
-                } else {
-                    elapsedSeconds += 1
-                }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-        }
-    }
-}
-
-
-// MARK: - Thoughts Sheet
-
-private struct ThoughtsSheet: View {
-    let messages: [ChatMessage]
-    @Environment(\.dismiss) private var dismiss
-
-    /// All thinking messages
-    private var thinkingMessages: [ChatMessage] {
-        messages.filter { $0.isThinking }
-    }
-
-    /// Stable, chronological thought rows. Completed rows are deduplicated,
-    /// but they do not move between separate active/completed sections when
-    /// streaming finishes.
-    private var visibleThoughts: [ChatMessage] {
-        var seen = Set<String>()
-        return thinkingMessages.filter { msg in
-            let trimmed = msg.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard msg.thinkingDone else { return true }
-            guard !trimmed.isEmpty else { return false }
-            guard !seen.contains(trimmed) else { return false }
-            seen.insert(trimmed)
-            return true
-        }
-    }
-
-    private var hasActiveThinking: Bool {
-        visibleThoughts.contains { !$0.thinkingDone }
-    }
-
-    /// Count aligned with what is actually rendered in the sheet.
-    private var visibleThoughtCount: Int {
-        visibleThoughts.count
-    }
-
-    private var hasVisibleThoughts: Bool {
-        visibleThoughtCount > 0
-    }
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if !hasVisibleThoughts {
-                    ContentUnavailableView(
-                        "No Thoughts Yet",
-                        systemImage: "brain",
-                        description: Text("Agent thoughts will appear here during execution.")
-                    )
-                } else {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(spacing: 14) {
-                                ForEach(Array(visibleThoughts.enumerated()), id: \.element.id) { index, msg in
-                                    ThoughtTimelineRow(
-                                        message: msg,
-                                        emphasize: !msg.thinkingDone,
-                                        isLatest: index == visibleThoughts.count - 1
-                                    )
-                                    .id(msg.id)
-                                    .accessibilityIdentifier(index == visibleThoughts.count - 1 ? "thought-latest" : "thought-row")
-                                }
-                                Color.clear
-                                    .frame(height: 1)
-                                    .id("thoughts-bottom")
-                                    .accessibilityIdentifier("thoughts-bottom")
-                            }
-                            .padding()
-                        }
-                        .accessibilityIdentifier("thoughts-timeline")
-                        .onAppear {
-                            scrollToLatestThought(proxy)
-                        }
-                        .onChange(of: visibleThoughtCount) { _, _ in
-                            scrollToLatestThought(proxy)
-                        }
-                        .onChange(of: hasActiveThinking) { _, _ in
-                            scrollToLatestThought(proxy)
-                        }
-                    }
-                }
-            }
-            .navigationTitle(hasActiveThinking ? "Thinking" : "Thoughts")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    HStack(spacing: 4) {
-                        if hasActiveThinking {
-                            Image(systemName: "brain")
-                                .font(.caption)
-                                .foregroundStyle(Theme.accent)
-                                .symbolEffect(.pulse, options: .repeating)
-                        }
-                        Text("\(visibleThoughtCount)")
-                            .font(.subheadline.monospacedDigit())
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
-    }
-
-    private func scrollToLatestThought(_ proxy: ScrollViewProxy) {
-        guard hasVisibleThoughts else { return }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 80_000_000)
-            withAnimation(.snappy(duration: 0.2)) {
-                proxy.scrollTo("thoughts-bottom", anchor: .bottom)
-            }
-        }
-    }
-}
-
-private struct ThoughtTimelineRow: View {
-    let message: ChatMessage
-    let emphasize: Bool
-    let isLatest: Bool
-    @State private var isExpanded: Bool
-    @State private var elapsedSeconds: Int = 0
-    @State private var timerTask: Task<Void, Never>?
-
-    init(message: ChatMessage, emphasize: Bool, isLatest: Bool) {
-        self.message = message
-        self.emphasize = emphasize
-        self.isLatest = isLatest
-        _isExpanded = State(initialValue: emphasize || isLatest)
-    }
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            VStack(spacing: 0) {
-                Circle()
-                    .fill(emphasize ? Theme.accent : Theme.textMuted)
-                    .frame(width: 8, height: 8)
-                Rectangle()
-                    .fill(Theme.border)
-                    .frame(width: 1)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    withAnimation(.spring(duration: 0.2)) {
-                        isExpanded.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "brain")
-                            .font(.caption)
-                            .foregroundStyle(message.thinkingDone ? Theme.textMuted : Theme.accent)
-                            .symbolEffect(.pulse, options: message.thinkingDone ? .nonRepeating : .repeating)
-
-                        Text(message.thinkingDone ? "Thought for \(formatDurationString(elapsedSeconds))" : "Thinking for \(formatDurationString(elapsedSeconds))")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(Theme.textSecondary)
-
-                        Spacer()
-
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(Theme.textMuted)
-                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    }
-                }
-
-                if isExpanded && !message.content.isEmpty {
-                    Text(message.content)
-                        .font(.caption)
-                        .foregroundStyle(Theme.textSecondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .padding(10)
-            .background(Theme.backgroundSecondary.opacity(emphasize ? 1 : 0.8))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-        .onAppear {
-            startTimer()
-        }
-        .onDisappear {
-            timerTask?.cancel()
-            timerTask = nil
-        }
-        .onChange(of: message.thinkingDone) { _, done in
-            if done {
-                timerTask?.cancel()
-                timerTask = nil
-                if let startTime = message.thinkingStartTime {
-                    elapsedSeconds = Int(Date().timeIntervalSince(startTime))
-                }
-            }
-        }
-        .onChange(of: isLatest) { _, latest in
-            if latest {
-                withAnimation(.spring(duration: 0.2)) {
-                    isExpanded = true
-                }
-            }
-        }
-    }
-
-    private func startTimer() {
-        timerTask?.cancel()
-        timerTask = nil
-
-        guard !message.thinkingDone else {
-            if let startTime = message.thinkingStartTime {
-                elapsedSeconds = Int(Date().timeIntervalSince(startTime))
-            }
-            return
-        }
-
-        timerTask = Task { @MainActor in
-            while !Task.isCancelled {
-                if let startTime = message.thinkingStartTime {
-                    elapsedSeconds = Int(Date().timeIntervalSince(startTime))
-                }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-        }
-    }
-
-}
-
-// MARK: - Flow Layout
-
-private struct FlowLayout: Layout {
-    var spacing: CGFloat = 8
-    
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let result = FlowResult(in: proposal.width ?? 0, spacing: spacing, subviews: subviews)
-        return result.size
-    }
-    
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let result = FlowResult(in: bounds.width, spacing: spacing, subviews: subviews)
-        for (index, subview) in subviews.enumerated() {
-            subview.place(at: CGPoint(x: bounds.minX + result.positions[index].x,
-                                       y: bounds.minY + result.positions[index].y),
-                          proposal: .unspecified)
-        }
-    }
-    
-    struct FlowResult {
-        var size: CGSize = .zero
-        var positions: [CGPoint] = []
-        
-        init(in maxWidth: CGFloat, spacing: CGFloat, subviews: Subviews) {
-            var x: CGFloat = 0
-            var y: CGFloat = 0
-            var rowHeight: CGFloat = 0
-            
-            for subview in subviews {
-                let size = subview.sizeThatFits(.unspecified)
-                
-                if x + size.width > maxWidth && x > 0 {
-                    x = 0
-                    y += rowHeight + spacing
-                    rowHeight = 0
-                }
-                
-                positions.append(CGPoint(x: x, y: y))
-                rowHeight = max(rowHeight, size.height)
-                x += size.width + spacing
-                self.size.width = max(self.size.width, x)
-            }
-            
-            self.size.height = y + rowHeight
-        }
-    }
-}
-
-// MARK: - Grouped Chat Item
-
-/// Represents either a single message or a group of consecutive tool calls
-enum GroupedChatItem: Identifiable {
-    case single(ChatMessage)
-    case toolGroup(groupId: String, tools: [ChatMessage])
-
-    var id: String {
-        switch self {
-        case .single(let message):
-            return message.id
-        case .toolGroup(let groupId, _):
-            return "group-\(groupId)"
-        }
-    }
-}
-
-// MARK: - Tool Group View
-
-/// Displays a group of tool calls with expand/collapse functionality
-private struct ToolGroupView: View {
-    let groupId: String
-    let tools: [ChatMessage]
-    @Binding var expandedGroups: Set<String>
-
-    private var isExpanded: Bool {
-        expandedGroups.contains(groupId)
-    }
-
-    private var hiddenCount: Int {
-        tools.count - 1
-    }
-
-    private var lastTool: ChatMessage? {
-        tools.last
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Expand/collapse button
-            if hiddenCount > 0 {
-                Button {
-                    withAnimation(.spring(duration: 0.25)) {
-                        if isExpanded {
-                            expandedGroups.remove(groupId)
-                        } else {
-                            expandedGroups.insert(groupId)
-                        }
-                    }
-                    HapticService.selectionChanged()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(Theme.textMuted)
-
-                        Text(isExpanded ? "Hide \(hiddenCount) previous tool\(hiddenCount > 1 ? "s" : "")" : "Show \(hiddenCount) previous tool\(hiddenCount > 1 ? "s" : "")")
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Theme.backgroundSecondary.opacity(0.5))
-                    .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-            }
-
-            // Show all tools if expanded, otherwise just the last one
-            if isExpanded {
-                ForEach(tools) { tool in
-                    ToolCallBubble(message: tool)
-                }
-            } else if let last = lastTool {
-                ToolCallBubble(message: last)
-            }
-        }
-    }
-}
-
-// MARK: - Mission Switcher Sheet
-
-private enum MissionQuickAction: Hashable {
-    case resume
-    case `continue`
-    case retry
-    case openFailure
-    case followUp
-
-    var label: String {
-        switch self {
-        case .resume: return "Resume"
-        case .continue: return "Continue"
-        case .retry: return "Retry"
-        case .openFailure: return "Open Failure"
-        case .followUp: return "Follow-up"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .resume, .continue: return "play.circle.fill"
-        case .retry: return "arrow.clockwise.circle.fill"
-        case .openFailure: return "wrench.and.screwdriver.fill"
-        case .followUp: return "plus.bubble.fill"
-        }
-    }
-}
-
-/// Sheet for switching between missions (like dashboard's Cmd+K)
-private struct MissionSwitcherSheet: View {
-    let runningMissions: [RunningMissionInfo]
-    let recentMissions: [Mission]
-    let currentMissionId: String?
-    let viewingMissionId: String?
-    let onSelectMission: (String) -> Void
-    let onResumeMission: (String) -> Void
-    let onFollowUpMission: (Mission) -> Void
-    let onOpenFailureMission: (String) -> Void
-    let onCancelMission: (String) -> Void
-    let onCreateNewMission: () -> Void
-    let onDismiss: () -> Void
-
-    @State private var searchText = ""
-    @State private var backendSearchTask: Task<Void, Never>?
-    @State private var backendSearchQuery = ""
-    @State private var backendSearchResults: [MissionSearchResult] = []
-    @State private var isBackendSearchLoading = false
-    @State private var derivedMissionById: [String: Mission] = [:]
-    @State private var derivedFilteredRunning: [RunningMissionInfo] = []
-    @State private var derivedFilteredRecent: [Mission] = []
-    @State private var derivedOrderedRunning: [RunningRow] = []
-    @State private var derivedJustCompletedMissions: [Mission] = []
-    @State private var derivedRecentMissionsForList: [Mission] = []
-
-    private let backendSearchDebounceNanos: UInt64 = 250_000_000
-
-    private var normalizedSearchQuery: String {
-        normalizeMetadataText(searchText)
-    }
-
-    private func preferredMissionForDuplicateId(_ lhs: Mission, _ rhs: Mission) -> Mission {
-        let lhsUpdated = lhs.updatedDate ?? .distantPast
-        let rhsUpdated = rhs.updatedDate ?? .distantPast
-        return rhsUpdated >= lhsUpdated ? rhs : lhs
-    }
-
-    /// A running row carries layout hints so we can render boss + nested
-    /// workers without losing the underlying `RunningMissionInfo`.
-    private struct RunningRow: Identifiable {
-        let info: RunningMissionInfo
-        let isBoss: Bool
-        /// Non-nil when this row should render indented under a boss. The id
-        /// references the boss mission for visual continuity only.
-        let nestedUnder: String?
-
-        var id: String { info.missionId }
-    }
-
-    private var missionListSignature: String {
-        let runningPart = runningMissions
-            .map { "\($0.missionId):\($0.state):\($0.title ?? ""):\($0.currentActivity ?? "")" }
-            .joined(separator: "|")
-        let recentPart = recentMissions
-            .map {
-                "\($0.id):\($0.status.displayLabel):\($0.updatedDate?.timeIntervalSince1970 ?? 0):\($0.parentMissionId ?? ""):\($0.title ?? ""):\($0.shortDescription ?? ""):\($0.backend ?? "")"
-            }
-            .joined(separator: "|")
-        let backendPart = backendSearchResults
-            .map { "\($0.mission.id):\($0.relevanceScore)" }
-            .joined(separator: "|")
-        return [
-            runningPart,
-            recentPart,
-            searchText,
-            backendSearchQuery,
-            backendPart
-        ].joined(separator: "||")
-    }
-
-    private func bossWorkerIds(from missions: [Mission]) -> [String: [String]] {
-        var map: [String: [String]] = [:]
-        for mission in missions {
-            if let parent = mission.parentMissionId, !parent.isEmpty {
-                map[parent, default: []].append(mission.id)
-            }
-        }
-        return map
-    }
-
-    private func orderedRunningRows(
-        filtered: [RunningMissionInfo],
-        missionById: [String: Mission],
-        workerIdsByBoss: [String: [String]]
-    ) -> [RunningRow] {
-        let filteredById: [String: RunningMissionInfo] = Dictionary(
-            uniqueKeysWithValues: filtered.map { ($0.missionId, $0) }
-        )
-
-        var rows: [RunningRow] = []
-        var seen = Set<String>()
-
-        // Phase 1: bosses (with their running workers nested directly under).
-        for info in filtered where workerIdsByBoss[info.missionId] != nil {
-            guard seen.insert(info.missionId).inserted else { continue }
-            rows.append(RunningRow(info: info, isBoss: true, nestedUnder: nil))
-            for workerId in workerIdsByBoss[info.missionId] ?? [] {
-                guard !seen.contains(workerId),
-                      let workerInfo = filteredById[workerId]
-                else { continue }
-                seen.insert(workerId)
-                rows.append(RunningRow(info: workerInfo, isBoss: false, nestedUnder: info.missionId))
-            }
-        }
-
-        // Phase 2: standalone running (no workers, not a worker itself).
-        for info in filtered {
-            guard !seen.contains(info.missionId) else { continue }
-            let mission = missionById[info.missionId]
-            if mission?.parentMissionId == nil {
-                seen.insert(info.missionId)
-                rows.append(RunningRow(info: info, isBoss: false, nestedUnder: nil))
-            }
-        }
-
-        // Phase 3: orphan workers — running, but their boss isn't. Render them
-        // indented so the worker identity is still obvious.
-        for info in filtered {
-            guard !seen.contains(info.missionId) else { continue }
-            seen.insert(info.missionId)
-            let parentId = missionById[info.missionId]?.parentMissionId
-            rows.append(RunningRow(info: info, isBoss: false, nestedUnder: parentId))
-        }
-
-        return rows
-    }
-
-    private func recomputeMissionSections() {
-        let query = normalizedSearchQuery
-        let runningIds = Set(runningMissions.map { $0.missionId })
-        let missionById = Dictionary(
-            recentMissions.map { ($0.id, $0) },
-            uniquingKeysWith: preferredMissionForDuplicateId
-        )
-
-        let liveCandidates = runningMissions.filter { info in
-            guard let mission = missionById[info.missionId] else { return true }
-            return !mission.hasFinishedSuccessfully
-        }
-        let filteredRunning: [RunningMissionInfo]
-        if query.isEmpty {
-            filteredRunning = liveCandidates
-        } else {
-            filteredRunning = liveCandidates
-                .compactMap { info -> (RunningMissionInfo, Double)? in
-                    let score = runningMissionSearchScore(
-                        info,
-                        query: query,
-                        linkedMission: missionById[info.missionId]
-                    )
-                    return score > 0 ? (info, score) : nil
-                }
-                .sorted { lhs, rhs in
-                    if lhs.1 == rhs.1 {
-                        let lhsUpdated = missionById[lhs.0.missionId]?.updatedDate ?? .distantPast
-                        let rhsUpdated = missionById[rhs.0.missionId]?.updatedDate ?? .distantPast
-                        if lhsUpdated != rhsUpdated {
-                            return lhsUpdated > rhsUpdated
-                        }
-                        return lhs.0.missionId < rhs.0.missionId
-                    }
-                    return lhs.1 > rhs.1
-                }
-                .map(\.0)
-        }
-
-        let nonRunning = recentMissions.filter { !runningIds.contains($0.id) }
-        let filteredRecent: [Mission]
-        if query.isEmpty {
-            filteredRecent = nonRunning
-        } else {
-            let localMatches: [Mission] = nonRunning
-                .compactMap { mission -> (Mission, Double)? in
-                    let score = missionSearchRelevanceScore(mission, query: query)
-                    return score > 0 ? (mission, score) : nil
-                }
-                .sorted { lhs, rhs in
-                    if lhs.1 == rhs.1 {
-                        return (lhs.0.updatedDate ?? .distantPast) > (rhs.0.updatedDate ?? .distantPast)
-                    }
-                    return lhs.1 > rhs.1
-                }
-                .map(\.0)
-
-            if backendSearchQuery == query {
-                let byId = Dictionary(
-                    nonRunning.map { ($0.id, $0) },
-                    uniquingKeysWith: preferredMissionForDuplicateId
-                )
-                var merged: [Mission] = []
-                var seen = Set<String>()
-
-                for result in backendSearchResults {
-                    let mission = byId[result.mission.id] ?? result.mission
-                    guard !runningIds.contains(mission.id) else { continue }
-                    if seen.insert(mission.id).inserted {
-                        merged.append(mission)
-                    }
-                }
-
-                for mission in localMatches {
-                    if seen.insert(mission.id).inserted {
-                        merged.append(mission)
-                    }
-                }
-
-                filteredRecent = merged
-            } else {
-                filteredRecent = localMatches
-            }
-        }
-
-        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
-        let justCompletedMissions = query.isEmpty
-            ? recentMissions
-                .filter { mission in
-                    guard !runningIds.contains(mission.id) else { return false }
-                    switch mission.status {
-                    case .completed, .acknowledged, .awaitingUser:
-                        return true
-                    default:
-                        return false
-                    }
-                }
-                .filter { ($0.updatedDate ?? .distantPast) >= cutoff }
-                .prefix(5)
-                .map { $0 }
-            : []
-        let justCompletedIds = Set(justCompletedMissions.map(\.id))
-
-        derivedMissionById = missionById
-        derivedFilteredRunning = filteredRunning
-        derivedFilteredRecent = filteredRecent
-        derivedOrderedRunning = orderedRunningRows(
-            filtered: filteredRunning,
-            missionById: missionById,
-            workerIdsByBoss: bossWorkerIds(from: recentMissions)
-        )
-        derivedJustCompletedMissions = justCompletedMissions
-        derivedRecentMissionsForList = filteredRecent.filter { !justCompletedIds.contains($0.id) }
-    }
-
-    @ViewBuilder
-    private func missionSection(_ title: String, missions: [Mission]) -> some View {
-        if !missions.isEmpty {
-            Section(title) {
-                ForEach(missions) { mission in
-                    MissionRow(
-                        missionId: mission.id,
-                        displayName: missionDisplayName(for: mission),
-                        title: mission.displayTitle,
-                        shortDescription: missionCardDescription(for: mission),
-                        backend: mission.backend,
-                        status: mission.status,
-                        isRunning: false,
-                        runningState: nil,
-                        isViewing: viewingMissionId == mission.id,
-                        isWorker: mission.parentMissionId != nil,
-                        quickActions: missionQuickActions(for: mission),
-                        onSelect: { onSelectMission(mission.id) },
-                        onQuickAction: { action in
-                            handleQuickAction(action, for: mission)
-                        },
-                        onCancel: nil
-                    )
-                }
-            }
-        }
-    }
-
-    var body: some View {
-        NavigationStack {
-            List {
-                // Create new mission button
-                Section {
-                    Button {
-                        onCreateNewMission()
-                    } label: {
-                        Label("Create New Mission", systemImage: "plus.circle.fill")
-                            .foregroundStyle(Theme.accent)
-                    }
-                }
-
-                // Running missions — boss + nested workers, then standalone.
-                if !derivedOrderedRunning.isEmpty {
-                    Section("Running") {
-                        ForEach(derivedOrderedRunning) { row in
-                            let info = row.info
-                            let mission = derivedMissionById[info.missionId]
-                            MissionRow(
-                                missionId: info.missionId,
-                                displayName: mission.map { missionDisplayName(for: $0) },
-                                title: mission?.displayTitle ?? info.title,
-                                shortDescription: mission.flatMap { missionCardDescription(for: $0) },
-                                backend: mission?.backend,
-                                status: .active,
-                                isRunning: true,
-                                runningState: info.state,
-                                isViewing: viewingMissionId == info.missionId,
-                                isWorker: row.nestedUnder != nil,
-                                quickActions: [.followUp],
-                                onSelect: { onSelectMission(info.missionId) },
-                                onQuickAction: { action in
-                                    handleRunningQuickAction(
-                                        action,
-                                        missionId: info.missionId,
-                                        mission: mission
-                                    )
-                                },
-                                onCancel: { onCancelMission(info.missionId) }
-                            )
-                        }
-                    }
-                }
-
-                missionSection("Just Completed", missions: derivedJustCompletedMissions)
-                missionSection("Recent", missions: derivedRecentMissionsForList)
-
-                if isBackendSearchLoading && !normalizedSearchQuery.isEmpty {
-                    Section {
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .scaleEffect(0.8)
-                            Text("Searching missions...")
-                                .font(.caption)
-                                .foregroundStyle(Theme.textMuted)
-                        }
-                    }
-                }
-
-                if derivedFilteredRunning.isEmpty && derivedFilteredRecent.isEmpty && !normalizedSearchQuery.isEmpty {
-                    ContentUnavailableView(
-                        "No Missions Found",
-                        systemImage: "magnifyingglass",
-                        description: Text("No missions match '\(searchText)'")
-                    )
-                }
-            }
-            .searchable(text: $searchText, prompt: "Search missions...")
-            .onChange(of: searchText) { _, newValue in
-                scheduleBackendSearch(for: newValue)
-                recomputeMissionSections()
-            }
-            .onAppear {
-                recomputeMissionSections()
-                scheduleBackendSearch(for: searchText)
-            }
-            .onChange(of: missionListSignature) { _, _ in
-                recomputeMissionSections()
-            }
-            .onDisappear {
-                backendSearchTask?.cancel()
-                backendSearchTask = nil
-            }
-            .navigationTitle("Switch Mission")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { onDismiss() }
-                }
-            }
-        }
-    }
-
-    private func scheduleBackendSearch(for rawQuery: String) {
-        backendSearchTask?.cancel()
-        backendSearchTask = nil
-
-        let normalizedQuery = normalizeMetadataText(rawQuery)
-        guard !normalizedQuery.isEmpty else {
-            backendSearchQuery = ""
-            backendSearchResults = []
-            isBackendSearchLoading = false
-            return
-        }
-
-        isBackendSearchLoading = true
-        backendSearchTask = Task {
-            try? await Task.sleep(nanoseconds: backendSearchDebounceNanos)
-            guard !Task.isCancelled else { return }
-
-            do {
-                let results = try await APIService.shared.searchMissions(query: normalizedQuery, limit: 50)
-                guard !Task.isCancelled else { return }
-
-                await MainActor.run {
-                    if normalizeMetadataText(searchText) == normalizedQuery {
-                        backendSearchQuery = normalizedQuery
-                        backendSearchResults = results
-                        isBackendSearchLoading = false
-                    }
-                }
-            } catch {
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    if normalizeMetadataText(searchText) == normalizedQuery {
-                        backendSearchQuery = ""
-                        backendSearchResults = []
-                        isBackendSearchLoading = false
-                    }
-                }
-            }
-        }
-    }
-
-    private func normalizeMetadataText(_ text: String) -> String {
-        let lowered = text.lowercased()
-        let scalars = lowered.unicodeScalars.map { scalar -> Character in
-            if scalar.properties.isAlphabetic
-                || scalar.properties.numericType != nil
-                || CharacterSet.whitespacesAndNewlines.contains(scalar)
-            {
-                return Character(scalar)
-            }
-            return " "
-        }
-        return String(scalars)
-            .split(whereSeparator: \.isWhitespace)
-            .joined(separator: " ")
-    }
-
-    private let searchStopwords: Set<String> = [
-        "a", "an", "and", "at", "did", "do", "does", "for", "from", "how",
-        "i", "in", "is", "it", "me", "my", "of", "on", "or", "our", "please",
-        "show", "that", "the", "this", "to", "us", "was", "we", "what", "when",
-        "where", "which", "who", "why", "with", "you", "your",
-    ]
-
-    private struct SearchQueryTerms {
-        let normalizedQuery: String
-        let normalizedCoreQuery: String
-        let queryGroups: [[String]]
-        let phraseQueries: [String]
-    }
-
-    private func buildSearchQueryTerms(_ query: String) -> SearchQueryTerms? {
-        let normalizedQuery = normalizeMetadataText(query)
-        if normalizedQuery.isEmpty { return nil }
-
-        let queryTokens = normalizedQuery.split(separator: " ").map(String.init)
-        if queryTokens.isEmpty { return nil }
-
-        let filteredTokens = queryTokens.filter { !searchStopwords.contains($0) }
-        let effectiveTokens = filteredTokens.isEmpty ? queryTokens : filteredTokens
-        let normalizedCoreQuery = effectiveTokens.joined(separator: " ")
-
-        let queryGroups = effectiveTokens
-            .map(expandQueryGroup)
-            .filter { !$0.isEmpty }
-        if queryGroups.isEmpty { return nil }
-
-        var phraseQueries = Set<String>()
-        phraseQueries.insert(normalizedCoreQuery)
-        for token in effectiveTokens {
-            for phrase in phraseExpansions(for: token) {
-                let normalizedPhrase = normalizeMetadataText(phrase)
-                if !normalizedPhrase.isEmpty {
-                    phraseQueries.insert(normalizedPhrase)
-                }
-            }
-        }
-
-        return SearchQueryTerms(
-            normalizedQuery: normalizedQuery,
-            normalizedCoreQuery: normalizedCoreQuery,
-            queryGroups: queryGroups,
-            phraseQueries: Array(phraseQueries)
-        )
-    }
-
-    private func missionWorkspaceLabel(for mission: Mission) -> String? {
-        guard let workspaceName = mission.workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !workspaceName.isEmpty else {
-            return nil
-        }
-        return workspaceName
-    }
-
-    private func missionDisplayName(for mission: Mission) -> String {
-        let shortId = String(mission.id.prefix(8)).uppercased()
-        if let workspaceLabel = missionWorkspaceLabel(for: mission) {
-            return "\(workspaceLabel) · \(shortId)"
-        }
-        return shortId
-    }
-
-    private func hasMeaningfulExtraTokens(baseText: String, candidateText: String) -> Bool {
-        let base = normalizeMetadataText(baseText)
-        let candidate = normalizeMetadataText(candidateText)
-        if candidate.isEmpty { return false }
-        if base.isEmpty { return true }
-
-        let baseTokens = Set(base.split(separator: " ").map(String.init))
-        let candidateTokens = candidate.split(separator: " ").map(String.init)
-        return candidateTokens.contains(where: { !baseTokens.contains($0) })
-    }
-
-    private func missionCardDescription(for mission: Mission) -> String? {
-        guard let shortDescription = mission.shortDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !shortDescription.isEmpty else {
-            return nil
-        }
-        let title = mission.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !title.isEmpty && !hasMeaningfulExtraTokens(baseText: title, candidateText: shortDescription) {
-            return nil
-        }
-        return shortDescription.count > 100 ? String(shortDescription.prefix(100)) + "..." : shortDescription
-    }
-
-    private func expandQueryGroup(token: String) -> [String] {
-        let synonyms: [String: [String]] = [
-            "api": ["endpoint", "http", "rest", "rpc"],
-            "auth": ["login", "signin", "oauth", "credential", "credentials"],
-            "blocked": ["stalled", "waiting"],
-            "bug": ["issue", "error", "fix", "problem"],
-            "cd": ["deploy", "release", "rollout", "ship"],
-            "ci": ["pipeline", "build", "integration", "tests"],
-            "crash": ["panic", "exception", "failure"],
-            "db": ["database", "sql", "sqlite", "postgres"],
-            "deploy": ["release", "rollout", "ship"],
-            "error": ["bug", "issue", "failure"],
-            "failed": ["error", "failure"],
-            "fix": ["bug", "issue", "error", "repair"],
-            "issue": ["bug", "error", "problem", "fix"],
-            "login": ["auth", "signin", "oauth", "credentials"],
-            "performance": ["perf", "slow", "latency", "optimize"],
-            "perf": ["performance", "slow", "latency", "optimize"],
-            "release": ["deploy", "rollout", "ship"],
-            "sid": ["session", "id", "sessionid", "cookie", "token"],
-            "signin": ["login", "auth", "oauth", "credentials"],
-            "slow": ["performance", "latency", "timeout", "stall"],
-            "sso": ["signin", "login", "auth", "oauth"],
-            "stalled": ["blocked", "waiting", "timeout"],
-            "timeout": ["slow", "latency", "stalled", "hang"],
-            "ui": ["ux", "interface", "frontend"],
-            "ux": ["ui", "interface", "frontend"],
-        ]
-
-        let normalized = normalizeMetadataText(token)
-        if normalized.isEmpty { return [] }
-
-        var group = Set<String>([normalized])
-        for synonym in synonyms[normalized] ?? [] {
-            let normalizedSynonym = normalizeMetadataText(synonym)
-            if !normalizedSynonym.isEmpty {
-                group.insert(normalizedSynonym)
-            }
-        }
-        return Array(group)
-    }
-
-    private func phraseExpansions(for token: String) -> [String] {
-        let normalized = normalizeMetadataText(token)
-        let expansions: [String: [String]] = [
-            "cd": ["continuous deployment"],
-            "ci": ["continuous integration"],
-            "sid": ["session id"],
-            "sso": ["single sign on"],
-        ]
-        return expansions[normalized] ?? []
-    }
-
-    private func tokenMatchStrength(token: String, candidate: String) -> Double {
-        if token == candidate { return 1.0 }
-
-        let asciiCandidate = candidate.range(of: "^[a-z0-9]+$", options: .regularExpression) != nil
-        if token.hasPrefix(candidate) && (!asciiCandidate || candidate.count >= 3) {
-            return 0.7
-        }
-        if asciiCandidate && token.count >= 5 && candidate.hasPrefix(token) && candidate.count - token.count <= 2 {
-            return 0.65
-        }
-        if candidate.count >= 4 && token.contains(candidate) {
-            return 0.45
-        }
-        return 0
-    }
-
-    private func tokenSet(from text: String) -> Set<String> {
-        let normalized = normalizeMetadataText(text)
-        if normalized.isEmpty { return [] }
-        return Set(normalized.split(separator: " ").map(String.init))
-    }
-
-    private func groupMatchStrength(_ group: [String], in tokenSet: Set<String>) -> Double {
-        var best = 0.0
-        for candidate in group where !candidate.isEmpty {
-            for token in tokenSet {
-                let strength = tokenMatchStrength(token: token, candidate: candidate)
-                best = max(best, strength)
-                if best >= 1 { return best }
-            }
-        }
-        return best
-    }
-
-    private func missionSearchRelevanceScore(_ mission: Mission, query: String) -> Double {
-        guard let queryTerms = buildSearchQueryTerms(query) else { return 0 }
-        let phraseQueries = queryTerms.phraseQueries.isEmpty
-            ? [queryTerms.normalizedCoreQuery.isEmpty ? queryTerms.normalizedQuery : queryTerms.normalizedCoreQuery]
-            : queryTerms.phraseQueries
-
-        let displayName = missionDisplayName(for: mission)
-        let title = mission.displayTitle
-        let shortDescription = mission.shortDescription ?? ""
-        let backend = mission.backend ?? ""
-        let status = mission.status.displayLabel
-        let combined = "\(displayName) \(mission.id) \(title) \(shortDescription) \(backend) \(status)"
-        let normalizedCombined = normalizeMetadataText(combined)
-        if normalizedCombined.isEmpty { return 0 }
-
-        let fields: [(weight: Double, tokens: Set<String>)] = [
-            (5, tokenSet(from: displayName)),
-            (8, tokenSet(from: title)),
-            (7, tokenSet(from: shortDescription)),
-            (3, tokenSet(from: backend)),
-            (2, tokenSet(from: status)),
-            (1, tokenSet(from: combined)),
-        ]
-
-        var score = 0.0
-        for group in queryTerms.queryGroups {
-            var bestGroupScore = 0.0
-            for field in fields {
-                let strength = groupMatchStrength(group, in: field.tokens)
-                if strength > 0 {
-                    bestGroupScore = max(bestGroupScore, strength * field.weight)
-                }
-            }
-            if bestGroupScore <= 0 { return 0 }
-            score += bestGroupScore
-        }
-
-        let phraseTargets: [(text: String, boost: Double)] = [
-            (normalizeMetadataText(title), 14),
-            (normalizeMetadataText(shortDescription), 12),
-            (normalizeMetadataText(displayName), 8),
-            (normalizeMetadataText(combined), 5),
-        ]
-        for target in phraseTargets where !target.text.isEmpty {
-            if phraseQueries.contains(where: { phraseQuery in
-                !phraseQuery.isEmpty && target.text.contains(phraseQuery)
-            }) {
-                score += target.boost
-            }
-        }
-
-        return score
-    }
-
-    private func runningMissionSearchScore(
-        _ mission: RunningMissionInfo,
-        query: String,
-        linkedMission: Mission?
-    ) -> Double {
-        guard let queryTerms = buildSearchQueryTerms(query) else { return 0 }
-        let phraseQueries = queryTerms.phraseQueries.isEmpty
-            ? [queryTerms.normalizedCoreQuery.isEmpty ? queryTerms.normalizedQuery : queryTerms.normalizedCoreQuery]
-            : queryTerms.phraseQueries
-
-        let title = mission.title ?? ""
-        let combined = "\(mission.missionId) \(title) \(mission.state)"
-        let candidateTokens = tokenSet(from: combined)
-        if candidateTokens.isEmpty { return 0 }
-
-        var score = 0.0
-        for group in queryTerms.queryGroups {
-            let strength = groupMatchStrength(group, in: candidateTokens)
-            if strength <= 0 { return 0 }
-            score += strength * 4.0
-        }
-        if phraseQueries.contains(where: { phraseQuery in
-            !phraseQuery.isEmpty && normalizeMetadataText(combined).contains(phraseQuery)
-        }) {
-            score += 6
-        }
-
-        let metadataScore = linkedMission.map { missionSearchRelevanceScore($0, query: query) } ?? 0
-        return max(score, metadataScore)
-    }
-
-    private func missionQuickActions(for mission: Mission, isRunning: Bool = false) -> [MissionQuickAction] {
-        if isRunning {
-            return [.followUp]
-        }
-
-        var actions: [MissionQuickAction] = []
-        if mission.status == .failed {
-            actions.append(.openFailure)
-        }
-        if mission.resumable {
-            switch mission.status {
-            case .interrupted:
-                actions.append(.resume)
-            case .blocked:
-                actions.append(.continue)
-            case .failed, .notFeasible:
-                actions.append(.retry)
-            default:
-                break
-            }
-        }
-        if mission.status != .active {
-            actions.append(.followUp)
-        }
-        return actions
-    }
-
-    private func handleQuickAction(_ action: MissionQuickAction, for mission: Mission) {
-        switch action {
-        case .resume, .continue, .retry:
-            onResumeMission(mission.id)
-        case .openFailure:
-            onOpenFailureMission(mission.id)
-        case .followUp:
-            onFollowUpMission(mission)
-        }
-    }
-
-    private func handleRunningQuickAction(
-        _ action: MissionQuickAction,
-        missionId: String,
-        mission: Mission?
-    ) {
-        if let mission {
-            handleQuickAction(action, for: mission)
-            return
-        }
-        guard action == .followUp else { return }
-
-        Task {
-            do {
-                let hydratedMission = try await APIService.shared.getMission(id: missionId)
-                await MainActor.run {
-                    onFollowUpMission(hydratedMission)
-                }
-            } catch {
-                // If mission hydration fails, keep the sheet responsive and skip the action.
-                print("Failed to load mission for follow-up action: \(error)")
-            }
-        }
-    }
-}
-
-// MARK: - Mission Row
-
-private struct MissionRow: View {
-    let missionId: String
-    let displayName: String?
-    let title: String?
-    let shortDescription: String?
-    let backend: String?
-    let status: MissionStatus
-    let isRunning: Bool
-    let runningState: String?
-    let isViewing: Bool
-    /// When true the row renders indented with a small "W" badge so workers
-    /// read as visually subordinate to their boss row.
-    var isWorker: Bool = false
-    let quickActions: [MissionQuickAction]
-    let onSelect: () -> Void
-    let onQuickAction: ((MissionQuickAction) -> Void)?
-    let onCancel: (() -> Void)?
-
-    private var shortId: String {
-        String(missionId.prefix(8))
-    }
-
-    private var statusColor: Color {
-        if isRunning {
-            return Theme.accent
-        }
-        switch status {
-        case .pending: return Theme.warning
-        case .active: return Theme.accent
-        case .awaitingUser: return Theme.warning
-        case .acknowledged: return Theme.success
-        case .completed: return Theme.success
-        case .failed: return Theme.error
-        case .interrupted, .blocked: return Theme.error
-        case .notFeasible: return Theme.error
-        case .unknown: return Theme.textMuted
-        }
-    }
-
-    private var statusIcon: String {
-        if isRunning {
-            return "arrow.trianglehead.2.clockwise"
-        }
-        switch status {
-        case .pending: return "clock.fill"
-        case .active: return "arrow.trianglehead.2.clockwise"
-        case .awaitingUser: return "hand.wave.fill"
-        case .acknowledged: return "checkmark.circle.fill"
-        case .completed: return "checkmark.circle.fill"
-        case .failed: return "xmark.circle.fill"
-        case .interrupted: return "pause.circle.fill"
-        case .blocked: return "exclamationmark.triangle.fill"
-        case .notFeasible: return "xmark.circle.fill"
-        case .unknown: return "questionmark.circle.fill"
-        }
-    }
-
-    /// Whether the supplied `displayName` is just the uppercased short id.
-    /// `missionDisplayName(for:)` always returns at least the uppercased
-    /// 8-char short id (with an optional `"<workspace> · "` prefix), so we
-    /// can't detect the bare-id case by checking for nil/empty — we have to
-    /// compare against the actual short id. When it matches we suppress the
-    /// secondary line: the title above already carries the meaning.
-    private var displayLabelIsShortId: Bool {
-        guard let trimmed = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty
-        else { return true }
-        return trimmed.caseInsensitiveCompare(shortId) == .orderedSame
-    }
-
-    /// "<description> · <backend>" collapsed onto one line so we don't stack
-    /// four lineLimit-1 captions in a narrow row.
-    private var secondaryMetadataLine: String? {
-        var parts: [String] = []
-        if let shortDescription = shortDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !shortDescription.isEmpty {
-            parts.append(shortDescription)
-        }
-        if let backend = backend?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !backend.isEmpty {
-            parts.append(backend)
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    private var trailingStatusPill: some View {
-        Group {
-            if isRunning, let state = runningState {
-                Text(state)
-                    .font(.caption2)
-                    .foregroundStyle(Theme.info)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Theme.info.opacity(0.12))
-                    .clipShape(Capsule())
-            } else {
-                Text(status.displayLabel)
-                    .font(.caption2)
-                    .foregroundStyle(statusColor)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(statusColor.opacity(0.1))
-                    .clipShape(Capsule())
-            }
-        }
-    }
-
-    var body: some View {
-        Button {
-            onSelect()
-            HapticService.selectionChanged()
-        } label: {
-            HStack(spacing: 12) {
-                if isWorker {
-                    // Indent rail + "W" chip mirrors the cmd+K palette so
-                    // workers read as nested under their boss row above.
-                    HStack(spacing: 6) {
-                        Rectangle()
-                            .fill(Theme.info.opacity(0.5))
-                            .frame(width: 2, height: 24)
-                        Text("W")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(Theme.info)
-                            .frame(width: 14, height: 14)
-                            .background(Theme.info.opacity(0.15))
-                            .clipShape(RoundedRectangle(cornerRadius: 3))
-                    }
-                }
-
-                Group {
-                    if isRunning {
-                        ProgressView()
-                            .progressViewStyle(.circular)
-                            .controlSize(.small)
-                            .tint(Theme.accent)
-                    } else {
-                        Image(systemName: statusIcon)
-                            .font(.system(size: 18))
-                            .foregroundStyle(statusColor)
-                    }
-                }
-                .frame(width: 24, height: 24)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    // Title (or short id when there is no title) is the primary
-                    // line. The viewing checkmark sits right next to it.
-                    HStack(spacing: 6) {
-                        Text(title?.isEmpty == false ? title! : shortId)
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(Theme.textPrimary)
-                            .lineLimit(1)
-
-                        if isViewing {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(Theme.accent)
-                        }
-                    }
-
-                    // Secondary line: optional human display name when distinct
-                    // from the short id, plus collapsed description+backend.
-                    if !displayLabelIsShortId,
-                       let displayName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !displayName.isEmpty,
-                       displayName != title {
-                        Text(displayName)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(Theme.textSecondary)
-                            .lineLimit(1)
-                    }
-
-                    if let secondaryMetadataLine {
-                        Text(secondaryMetadataLine)
-                            .font(.caption2)
-                            .foregroundStyle(Theme.textMuted)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
-                }
-
-                Spacer(minLength: 8)
-
-                trailingStatusPill
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            // Cancel ships first so it occupies the leftmost (closest)
-            // trailing slot when the user swipes — matches Mail's destructive
-            // affordance placement.
-            if let onCancel {
-                Button(role: .destructive) {
-                    onCancel()
-                    HapticService.lightTap()
-                } label: {
-                    Label("Cancel", systemImage: "xmark.circle.fill")
-                }
-            }
-            if let onQuickAction {
-                ForEach(quickActions, id: \.self) { action in
-                    Button {
-                        onQuickAction(action)
-                        HapticService.lightTap()
-                    } label: {
-                        Label(action.label, systemImage: action.icon)
-                    }
-                    .tint(Theme.accent)
-                }
-            }
-        }
-        .contextMenu {
-            // Long-press fallback: keeps every action discoverable for
-            // accessibility and for users who don't know about swipes.
-            if let onQuickAction {
-                ForEach(quickActions, id: \.self) { action in
-                    Button {
-                        onQuickAction(action)
-                    } label: {
-                        Label(action.label, systemImage: action.icon)
-                    }
-                }
-            }
-            if let onCancel {
-                Button(role: .destructive) {
-                    onCancel()
-                } label: {
-                    Label("Cancel Mission", systemImage: "xmark.circle.fill")
-                }
-            }
-        }
-    }
-}
-
-/// Concrete struct holding the main content stack, parameterised on the
-/// dynamic bits ControlView needs to inject. Pulling this out of
-/// `ControlView` lets SwiftUI's type-checker resolve it independently of
-/// the toolbar + sheet + onChange chain on the parent body.
-private struct MainContentStack<Banner: View, Pill: View, Messages: View, Worker: View, Input: View>: View {
-    let showBanner: Bool
-    let bannerView: Banner
-    let showStaleCachePill: Bool
-    let staleCachePill: Pill
-    let messagesView: Messages
-    let workerPill: Worker
-    let inputView: Input
-
-    var body: some View {
-        VStack(spacing: 0) {
-            if showBanner {
-                bannerView
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
-            if showStaleCachePill {
-                staleCachePill
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
-            ZStack(alignment: .bottom) {
-                messagesView
-                workerPill
-            }
-            inputView
-        }
-        .animation(.easeInOut(duration: 0.2), value: showBanner)
-        .animation(.easeInOut(duration: 0.2), value: showStaleCachePill)
-    }
-}
-
-/// Renders the connection-state banner. Extracted to a separate struct so
-/// `ControlView.body` doesn't grow past the Swift type-checker's complexity
-/// budget.
-private struct ConnectionBannerView: View {
-    let state: ConnectionState
-
-    var body: some View {
-        // Degraded is a softer signal than disconnect/reconnect; use the
-        // standard textSecondary tone rather than warning so users on a
-        // marginal cell don't get a red flag for every minor slowdown.
-        let tint: Color = state.isDegraded ? Theme.textSecondary : Theme.warning
-        return HStack(spacing: 8) {
-            Image(systemName: state.icon)
-                .font(.system(size: 11, weight: .semibold))
-                .symbolEffect(.pulse, options: state.isDegraded ? .nonRepeating : .repeating)
-            Text(state.label)
-                .font(.caption.weight(.medium))
-            Spacer()
-        }
-        .foregroundStyle(tint)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
-        .background(tint.opacity(0.12))
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(tint.opacity(0.25))
-                .frame(height: 0.5)
-        }
-    }
-}
 
 #Preview {
     NavigationStack {

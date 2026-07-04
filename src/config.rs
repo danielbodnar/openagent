@@ -19,6 +19,8 @@
 //!   If not set, defaults to: https://github.com/Th0rgal/sandboxed-library-template.git
 //! - `DEFAULT_BACKEND` - Optional. Default backend to use.
 //!   If not set, defaults to the first available backend with priority: claudecode → opencode → grok → gemini → codex.
+//! - `PALOMA_WEBHOOK_FORWARD_URL` - Optional. External webhook to receive mission status changes.
+//! - `PALOMA_WEBHOOK_SECRET` - Optional. HMAC-SHA256 secret; adds `X-Hub-Signature-256` to forwarded webhooks.
 //!
 //! Note: The agent has **full system access**. It can read/write any file, execute any command,
 //! and search anywhere on the machine. The `WORKING_DIR` is just the default for relative paths.
@@ -236,6 +238,25 @@ pub struct Config {
 
     /// Whether mission automations are enabled
     pub automations_enabled: bool,
+
+    /// Optional external webhook that receives Paloma mission status-change events.
+    pub paloma_webhook_forward_url: Option<String>,
+
+    /// Optional shared secret for the Paloma webhook. When set, each forwarded
+    /// request carries a GitHub-style `X-Hub-Signature-256: sha256=<hex>`
+    /// header (HMAC-SHA256 of the raw body) so consumers that require signed
+    /// webhooks (e.g. the Hermes gateway webhook platform) accept it.
+    pub paloma_webhook_secret: Option<String>,
+
+    /// DGX Spark build-offload config (all optional; offload is disabled unless
+    /// all three are set). The host holds these credentials so workspaces never
+    /// need Spark access. See `src/api/spark.rs`.
+    /// Arbiter base URL, e.g. `http://100.77.4.93:8088`.
+    pub spark_arbiter_url: Option<String>,
+    /// Arbiter bearer token (matches `/etc/spark-arbiter.env` on the Spark).
+    pub spark_arbiter_token: Option<String>,
+    /// SSH target for rsync of the workspace, e.g. `th0rgal@100.77.4.93`.
+    pub spark_ssh_target: Option<String>,
 }
 
 /// API auth configuration.
@@ -343,6 +364,21 @@ impl AuthConfig {
                 .is_some_and(|s| !s.is_empty())
             && !self.github_oauth_allowlist.is_empty()
             && self.jwt_secret.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
+    /// Whether the GitHub OAuth *App* credentials are present. Unlike
+    /// [`Self::github_enabled`] this does not require the login allowlist or a
+    /// JWT secret — it gates the "Connect GitHub" integration flow, which only
+    /// needs the OAuth App to mint a git-push token. Reuses the same
+    /// `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET`.
+    pub fn github_oauth_app_configured(&self) -> bool {
+        self.github_oauth_client_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            && self
+                .github_oauth_client_secret
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
     }
 
     /// True iff `gh_login` is permitted to sign in via GitHub OAuth.
@@ -590,6 +626,26 @@ impl Config {
             .transpose()?
             .unwrap_or(true);
 
+        let paloma_webhook_forward_url = std::env::var("PALOMA_WEBHOOK_FORWARD_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let paloma_webhook_secret = std::env::var("PALOMA_WEBHOOK_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let env_opt = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let spark_arbiter_url = env_opt("SPARK_ARBITER_URL");
+        let spark_arbiter_token = env_opt("SPARK_ARBITER_TOKEN");
+        let spark_ssh_target = env_opt("SPARK_SSH_TARGET");
+
         Ok(Self {
             default_model,
             working_dir,
@@ -608,6 +664,11 @@ impl Config {
             library_path,
             default_backend,
             automations_enabled,
+            paloma_webhook_forward_url,
+            paloma_webhook_secret,
+            spark_arbiter_url,
+            spark_arbiter_token,
+            spark_ssh_target,
         })
     }
 
@@ -632,6 +693,11 @@ impl Config {
             library_path,
             default_backend: None,
             automations_enabled: true,
+            paloma_webhook_forward_url: None,
+            paloma_webhook_secret: None,
+            spark_arbiter_url: None,
+            spark_arbiter_token: None,
+            spark_ssh_target: None,
         }
     }
 }

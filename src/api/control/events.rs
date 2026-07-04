@@ -27,6 +27,11 @@ pub enum AgentEvent {
         /// Mission this message belongs to (for parallel execution)
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
+        /// Origin of this message for audit/attribution (e.g. `api:<user_id>`,
+        /// `task-board`, `telegram`, `relay`). None for internally-generated
+        /// control messages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
     },
     AssistantMessage {
         id: Uuid,
@@ -362,6 +367,17 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Target mission ID - if provided and differs from running mission, start in parallel
         target_mission_id: Option<Uuid>,
+        /// Control-plane delivery: when true this is a system-generated message
+        /// (board wake / worker dispatch) that MUST go only to `target_mission_id`.
+        /// The actor skips user-message heuristics for it — no `/goal` rewriting,
+        /// no untargeted inference, and no fall-through to the main session: if it
+        /// can't reach its exact target it is dropped, never delivered elsewhere.
+        /// This keeps the control plane from leaking into unrelated missions.
+        strict: bool,
+        /// Origin of this message for audit/attribution (e.g. `api:<user_id>`,
+        /// `task-board`, `telegram`, `relay`). None for internally-generated
+        /// control messages.
+        source: Option<String>,
         /// Respond with the delivery outcome (queued / delivered / dropped).
         respond: oneshot::Sender<UserMessageAck>,
     },
@@ -397,6 +413,8 @@ pub enum ControlCommand {
         parent_mission_id: Option<Uuid>,
         /// Working directory override (for git worktrees etc.)
         working_directory: Option<String>,
+        /// FLEET-001 scheduling metadata (priority, not_before, deadline).
+        scheduling: crate::api::mission_store::MissionScheduling,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status
@@ -437,6 +455,17 @@ pub enum ControlCommand {
         /// the caller's "stalled" observation and the actor processing
         /// this command. User-initiated cancels pass `None`.
         min_idle: Option<std::time::Duration>,
+        respond: oneshot::Sender<Result<(), String>>,
+    },
+    /// Pause a mission (FLEET-004). Stops any in-flight runner (main or
+    /// parallel) for the mission, then sets its status to `Paused`. Unlike
+    /// `CancelMission` (which lands on `Interrupted`), this lands on `Paused`
+    /// so the dispatcher skips it until an explicit resume. Routing through the
+    /// control loop guarantees the active turn is actually signalled to stop —
+    /// a bare store update would leave the runner executing and let its
+    /// completion overwrite the paused status.
+    PauseMission {
+        mission_id: Uuid,
         respond: oneshot::Sender<Result<(), String>>,
     },
     /// List currently running missions
@@ -489,6 +518,13 @@ pub enum MissionStatus {
     /// User opened the mission while it was AwaitingUser and the ack grace
     /// period elapsed without a new message — mission is auto-archived.
     Acknowledged,
+    /// The agent's turn finished but it left one or more background shell jobs
+    /// (`Bash run_in_background`) running in the workspace. The mission is NOT
+    /// done: it is parked waiting for that background work to complete, and the
+    /// auto-resume watcher will wake it with the output. Non-terminal, and NOT
+    /// eligible for ack-promotion while jobs are live — otherwise a mission
+    /// could silently look "done" while work is still running.
+    WaitingBackground,
     Completed,
     Failed,
     /// Mission was interrupted (server shutdown, cancellation, etc.)
@@ -497,6 +533,10 @@ pub enum MissionStatus {
     Blocked,
     /// Mission not feasible as specified (wrong assumptions in request)
     NotFeasible,
+    /// Mission explicitly paused by an operator. Unlike `Blocked` this is
+    /// NOT terminal: the dispatcher skips it while paused but can resume it
+    /// back to `Pending` on demand (see FLEET-004).
+    Paused,
 }
 
 impl std::fmt::Display for MissionStatus {
@@ -506,11 +546,68 @@ impl std::fmt::Display for MissionStatus {
             Self::Active => write!(f, "active"),
             Self::AwaitingUser => write!(f, "awaiting_user"),
             Self::Acknowledged => write!(f, "acknowledged"),
+            Self::WaitingBackground => write!(f, "waiting_background"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Blocked => write!(f, "blocked"),
             Self::NotFeasible => write!(f, "not_feasible"),
             Self::Interrupted => write!(f, "interrupted"),
+            Self::Paused => write!(f, "paused"),
         }
+    }
+}
+
+impl MissionStatus {
+    /// Whether this status is terminal — the mission has reached a final
+    /// resting state and the dispatcher will never auto-run it again.
+    ///
+    /// NOTE: `Paused` is deliberately NOT terminal. A paused mission is parked
+    /// by an operator and can be resumed back to `Pending` (FLEET-004); the
+    /// dispatcher simply skips it while paused. `Blocked` is treated as
+    /// terminal here because, unlike `Paused`, it requires external resolution.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Interrupted | Self::Blocked | Self::NotFeasible
+        )
+    }
+}
+
+/// Free-function alias for [`MissionStatus::is_terminal`], kept for call sites
+/// that read more clearly as `mission_status_is_terminal(status)`.
+pub fn mission_status_is_terminal(status: MissionStatus) -> bool {
+    status.is_terminal()
+}
+
+#[cfg(test)]
+mod mission_status_tests {
+    use super::MissionStatus;
+
+    #[test]
+    fn waiting_background_serde_roundtrip_is_snake_case() {
+        // The wire form must be `waiting_background` (snake_case) so dashboard
+        // and Paloma clients that key off the string agree with the backend.
+        let json = serde_json::to_string(&MissionStatus::WaitingBackground).unwrap();
+        assert_eq!(json, "\"waiting_background\"");
+        let back: MissionStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, MissionStatus::WaitingBackground);
+    }
+
+    #[test]
+    fn waiting_background_display_matches_serde() {
+        // Display and serde must not drift — several call sites persist via
+        // Display and read back via serde.
+        assert_eq!(
+            MissionStatus::WaitingBackground.to_string(),
+            "waiting_background"
+        );
+    }
+
+    #[test]
+    fn waiting_background_is_not_terminal() {
+        // Background work is still running, so the mission is NOT done. Marking
+        // it terminal would let it be archived/acked while work is in flight —
+        // exactly the bug this status exists to prevent.
+        assert!(!MissionStatus::WaitingBackground.is_terminal());
     }
 }

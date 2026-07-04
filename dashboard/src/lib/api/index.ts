@@ -133,6 +133,15 @@ export {
   getAllProviderUsage,
 } from "./providers";
 
+// GitHub integration ("Connect GitHub")
+export {
+  type GithubIntegrationStatus,
+  type GithubAuthorizeResponse,
+  getGithubStatus,
+  authorizeGithub,
+  disconnectGithub,
+} from "./github";
+
 // Model Routing
 export {
   type ChainEntry,

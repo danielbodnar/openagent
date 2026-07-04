@@ -44,6 +44,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -56,6 +57,8 @@ import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.Mission
 import sh.sandboxed.dashboard.data.MissionMomentSearchResult
 import sh.sandboxed.dashboard.data.MissionStatus
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.components.StatusBadge
@@ -64,6 +67,14 @@ import sh.sandboxed.dashboard.util.Haptics
 import sh.sandboxed.dashboard.util.boundedForText
 
 private enum class HistoryFilter { ALL, ACTIVE, INTERRUPTED, COMPLETED, FAILED }
+
+private fun historyFilterTag(f: HistoryFilter): String = when (f) {
+    HistoryFilter.ALL -> TestTags.HISTORY_FILTER_ALL
+    HistoryFilter.ACTIVE -> TestTags.HISTORY_FILTER_ACTIVE
+    HistoryFilter.INTERRUPTED -> TestTags.HISTORY_FILTER_INTERRUPTED
+    HistoryFilter.COMPLETED -> TestTags.HISTORY_FILTER_COMPLETED
+    HistoryFilter.FAILED -> TestTags.HISTORY_FILTER_FAILED
+}
 
 private data class HistoryState(
     val missions: List<Mission> = emptyList(),
@@ -131,9 +142,9 @@ private class HistoryViewModel(private val container: AppContainer) : ViewModel(
 
 private fun HistoryFilter.matches(m: Mission): Boolean = when (this) {
     HistoryFilter.ALL -> true
-    HistoryFilter.ACTIVE -> m.status == MissionStatus.ACTIVE || m.status == MissionStatus.PENDING
+    HistoryFilter.ACTIVE -> m.status.isOpen
     HistoryFilter.INTERRUPTED -> m.status == MissionStatus.INTERRUPTED || m.status == MissionStatus.BLOCKED
-    HistoryFilter.COMPLETED -> m.status == MissionStatus.COMPLETED
+    HistoryFilter.COMPLETED -> m.status.isDone
     HistoryFilter.FAILED -> m.status == MissionStatus.FAILED || m.status == MissionStatus.NOT_FEASIBLE
 }
 
@@ -148,12 +159,12 @@ fun HistoryScreen(container: AppContainer, onOpen: (String) -> Unit) {
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Missions", style = MaterialTheme.typography.headlineSmall, color = Palette.TextPrimary, modifier = Modifier.weight(1f))
-            IconButton(onClick = { haptics.light(); vm.cleanup() }) { Icon(Icons.Filled.CleaningServices, "Cleanup completed", tint = Palette.Warning) }
-            IconButton(onClick = { haptics.light(); vm.refresh() }) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
+            IconButton(onClick = { haptics.light(); vm.cleanup() }, modifier = Modifier.tag(TestTags.HISTORY_CLEANUP)) { Icon(Icons.Filled.CleaningServices, "Cleanup completed", tint = Palette.Warning) }
+            IconButton(onClick = { haptics.light(); vm.refresh() }, modifier = Modifier.tag(TestTags.HISTORY_REFRESH)) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
         }
         OutlinedTextField(
             value = state.query, onValueChange = { vm.setQuery(it) },
-            singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            singleLine = true, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).tag(TestTags.HISTORY_SEARCH),
             placeholder = { Text("Search missions and moments…", color = Palette.TextMuted) },
             leadingIcon = { Icon(Icons.Filled.Search, null, tint = Palette.TextTertiary) },
             colors = TextFieldDefaults.colors(focusedContainerColor = Palette.Card, unfocusedContainerColor = Palette.Card, cursorColor = Palette.Accent, focusedTextColor = Palette.TextPrimary, unfocusedTextColor = Palette.TextPrimary),
@@ -165,17 +176,19 @@ fun HistoryScreen(container: AppContainer, onOpen: (String) -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 items(HistoryFilter.entries.toList()) { f ->
-                    FilterChip(
-                        selected = state.filter == f,
-                        onClick = { vm.setFilter(f) },
-                        label = { Text(f.name.lowercase().replaceFirstChar { it.uppercase() }) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            containerColor = Palette.Card,
-                            selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
-                            labelColor = Palette.TextSecondary,
-                            selectedLabelColor = Palette.Accent,
-                        ),
-                    )
+                    Box(Modifier.tag(historyFilterTag(f))) {
+                        FilterChip(
+                            selected = state.filter == f,
+                            onClick = { vm.setFilter(f) },
+                            label = { Text(f.name.lowercase().replaceFirstChar { it.uppercase() }) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                containerColor = Palette.Card,
+                                selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
+                                labelColor = Palette.TextSecondary,
+                                selectedLabelColor = Palette.Accent,
+                            ),
+                        )
+                    }
                 }
             }
         }
@@ -245,7 +258,7 @@ private fun MissionRow(mission: Mission, onOpen: () -> Unit, onResume: () -> Uni
                 if (mission.status.canResume || mission.resumable) {
                     IconButton(onClick = onResume) { Icon(Icons.Filled.PlayArrow, "Resume", tint = Palette.Success) }
                 }
-                if (mission.status == MissionStatus.ACTIVE || mission.status == MissionStatus.PENDING) {
+                if (mission.status.isOpen) {
                     IconButton(onClick = onCancel) { Icon(Icons.Filled.Cancel, "Cancel", tint = Palette.Warning) }
                 }
                 IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, "Delete", tint = Palette.Error) }

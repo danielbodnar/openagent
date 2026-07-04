@@ -215,20 +215,42 @@ export function prepareVisibleAutomations<
   A extends {
     active: boolean;
     created_at?: string;
+    last_triggered_at?: string | null;
+    stop_policy?: { type: string } | null;
     command_source?: { type: string } | null;
   }
->(automations: A[]): A[] {
-  return automations
-    .filter(
-      (a) => !(a.command_source?.type === 'native_loop' && !a.active)
-    )
-    .slice()
-    .sort((a, b) => {
-      if (a.active !== b.active) return a.active ? -1 : 1;
-      const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
-      const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
-      return bTime - aTime;
-    });
+>(automations: A[]): { live: A[]; spent: A[] } {
+  const sortByCreated = (a: A, b: A) => {
+    if (a.active !== b.active) return a.active ? -1 : 1;
+    const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+    const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+    return bTime - aTime;
+  };
+  const kept = automations.filter(
+    (a) => !(a.command_source?.type === 'native_loop' && !a.active),
+  );
+  // "Spent" = an inactive automation that already fired at least once — almost
+  // always a one-shot ScheduleWakeup the harness completed. These are history,
+  // not actionable, and used to bury the single live driver under dozens of
+  // dead rows. Anything still active, or inactive-but-never-fired (a paused or
+  // failed-on-create automation worth seeing), stays in `live`.
+  const live: A[] = [];
+  const spent: A[] = [];
+  for (const a of kept) {
+    // Spent = a fired ONE-SHOT (stop_policy after_first_fire) that is now
+    // inactive — i.e. a completed ScheduleWakeup. A user-paused recurring
+    // automation (interval/webhook, different stop policy) is NOT spent even
+    // though it has fired before; it stays in `live` so it remains editable.
+    const isFiredOneShot =
+      !a.active &&
+      !!a.last_triggered_at &&
+      a.stop_policy?.type === "after_first_fire";
+    if (isFiredOneShot) spent.push(a);
+    else live.push(a);
+  }
+  live.sort(sortByCreated);
+  spent.sort(sortByCreated);
+  return { live, spent };
 }
 
 export function MissionAutomationsDialog({
@@ -250,6 +272,7 @@ export function MissionAutomationsDialog({
   const [hasLoaded, setHasLoaded] = useState(false);
   const [loadedMissionId, setLoadedMissionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showSpent, setShowSpent] = useState(false);
 
   useEffect(() => {
     automationsRef.current = automations;
@@ -916,7 +939,9 @@ export function MissionAutomationsDialog({
 
   const isMissionDataReady = !!missionId && loadedMissionId === missionId;
   const showLoadingPlaceholder = !!missionId && (!isMissionDataReady || (loading && !hasLoaded));
-  const visibleAutomations = isMissionDataReady ? prepareVisibleAutomations(automations) : [];
+  const { live: visibleAutomations, spent: spentAutomations } = isMissionDataReady
+    ? prepareVisibleAutomations(automations)
+    : { live: [], spent: [] };
   const visibleError = isMissionDataReady ? error : null;
   const selectClass =
     'rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer';
@@ -1422,6 +1447,7 @@ export function MissionAutomationsDialog({
                 {isMissionDataReady &&
                   !loading &&
                   visibleAutomations.length === 0 &&
+                  spentAutomations.length === 0 &&
                   !visibleError && (
                     <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6 text-center text-sm text-white/40">
                       No automations yet. Create one above.
@@ -1703,6 +1729,39 @@ export function MissionAutomationsDialog({
                     );
                   })}
                 </div>
+
+                {spentAutomations.length > 0 && (
+                  <div className="mt-3 border-t border-white/[0.06] pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowSpent((v) => !v)}
+                      className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-[11px] text-white/40 hover:bg-white/[0.04] hover:text-white/60"
+                    >
+                      <span>
+                        {showSpent ? 'Hide' : 'Show'} {spentAutomations.length} completed
+                        {' '}wakeup{spentAutomations.length === 1 ? '' : 's'} (history)
+                      </span>
+                      <span>{showSpent ? '▾' : '▸'}</span>
+                    </button>
+                    {showSpent && (
+                      <div className="mt-1 space-y-1">
+                        {spentAutomations.map((automation) => (
+                          <div
+                            key={automation.id}
+                            className="flex items-center justify-between gap-2 rounded-md px-2 py-1 text-[11px] text-white/35"
+                          >
+                            <span className="truncate">{getAutomationLabel(automation)}</span>
+                            <span className="shrink-0 text-white/25">
+                              {automation.last_triggered_at
+                                ? new Date(automation.last_triggered_at).toLocaleString()
+                                : ''}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </>
           )}

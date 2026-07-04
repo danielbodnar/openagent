@@ -12,7 +12,7 @@ assistant stack:
 - `src/api/telegram.rs` owns Telegram webhook routing, trigger filtering,
   per-chat mission creation, file download, streaming edits, Paloma commands,
   proactive mission cards, scheduled messages, workflow relays, and memory.
-- `src/api/control.rs` exposes the Telegram CRUD endpoints and routes webhook
+- `src/api/control/mod.rs` exposes the Telegram CRUD endpoints and routes webhook
   updates into `ControlCommand::UserMessage`.
 - `dashboard/src/app/assistant/page.tsx` is the new top-level UI surface,
   while `dashboard/src/app/settings/telegram/page.tsx` redirects for

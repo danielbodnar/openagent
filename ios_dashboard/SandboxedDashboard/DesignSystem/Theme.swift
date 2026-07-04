@@ -76,7 +76,10 @@ enum Theme {
     static let textPrimary = Color(uiColor: .label)
     static let textSecondary = Color(uiColor: .secondaryLabel)
     static let textTertiary = Color(uiColor: .tertiaryLabel)
-    static let textMuted = Color.white.opacity(0.4)
+    /// Semantic quaternary tone instead of raw white-at-40%: participates in
+    /// vibrancy on materials and tracks Increase Contrast, which a fixed
+    /// opacity never does (HIG: prefer semantic label colors).
+    static let textMuted = Color(uiColor: .quaternaryLabel)
     
     // MARK: - Typography Helpers
     
@@ -88,6 +91,57 @@ enum Theme {
     static func metric(_ value: Int) -> Text {
         Text("\(value)")
             .monospacedDigit()
+    }
+}
+
+// MARK: - Polish Layer
+// Mirrors the web dashboard's --surface-sheen / --canvas-glow treatment:
+// a faint top-edge light catch on raised surfaces and a soft vignette on
+// the canvas. Subtle by design — visible as "quality", not as an effect.
+
+extension Theme {
+    /// Top-edge light catch for raised surfaces (cards, composer, pills).
+    static let surfaceSheen = LinearGradient(
+        stops: [
+            .init(color: Color.white.opacity(0.07), location: 0),
+            .init(color: Color.white.opacity(0.02), location: 0.18),
+            .init(color: .clear, location: 0.45)
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+
+    /// Hairline used on raised surfaces; brighter on the top edge.
+    static let edgeHighlight = LinearGradient(
+        colors: [Color.white.opacity(0.12), Color.white.opacity(0.04)],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+}
+
+private struct SurfaceSheen: ViewModifier {
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(Theme.surfaceSheen)
+                    .allowsHitTesting(false)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(Theme.edgeHighlight, lineWidth: 0.5)
+                    .allowsHitTesting(false)
+            )
+    }
+}
+
+extension View {
+    /// Apply the polish-layer sheen + edge highlight to a rounded surface.
+    /// Call after the surface's own background/clip so the sheen sits on top.
+    func surfaceSheen(cornerRadius: CGFloat = 14) -> some View {
+        modifier(SurfaceSheen(cornerRadius: cornerRadius))
     }
 }
 

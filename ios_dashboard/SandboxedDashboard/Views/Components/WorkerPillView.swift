@@ -13,20 +13,14 @@ struct WorkerPillView: View {
     let runningWorkers: [RunningMissionInfo]
     let onTap: () -> Void
 
-    private var activeCount: Int {
-        workers.filter { m in
-            m.status == .active || m.status == .pending || m.status == .blocked ||
-            runningWorkers.contains { $0.missionId == m.id }
-        }.count
+    private var buckets: WorkerBuckets {
+        WorkerBuckets(workers: workers, runningWorkers: runningWorkers)
     }
 
-    private var completedCount: Int {
-        workers.filter { $0.status == .completed }.count
-    }
-
-    private var failedCount: Int {
-        workers.filter { $0.status == .failed || $0.status == .notFeasible || $0.status == .interrupted }.count
-    }
+    private var activeCount: Int { buckets.active.count }
+    private var waitingCount: Int { buckets.waiting.count }
+    private var completedCount: Int { buckets.done.count }
+    private var failedCount: Int { buckets.failed.count }
 
     var body: some View {
         Button(action: onTap) {
@@ -35,29 +29,27 @@ struct WorkerPillView: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Theme.accent)
 
-                Text("\(workers.count)")
+                // Headline = workers running right now, NOT the cumulative
+                // total. The total counts every sub-mission that ever ran,
+                // most of which have finished and are never reused, so leading
+                // with it implied a far larger live fleet than exists.
+                Text("\(activeCount)")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(Theme.textPrimary)
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
+                    .foregroundStyle(activeCount > 0 ? Theme.textPrimary : Theme.textMuted)
+                Text("active")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Theme.textTertiary)
 
-                if activeCount > 0 {
+                if waitingCount > 0 {
                     HStack(spacing: 3) {
                         Circle()
-                            .fill(Theme.accent)
+                            .fill(Theme.info)
                             .frame(width: 5, height: 5)
-                        Text("\(activeCount)")
+                        Text("\(waitingCount)")
                             .font(.system(size: 10, weight: .medium).monospaced())
-                            .foregroundStyle(Theme.accent)
-                    }
-                }
-
-                if completedCount > 0 {
-                    HStack(spacing: 3) {
-                        Circle()
-                            .fill(Theme.success)
-                            .frame(width: 5, height: 5)
-                        Text("\(completedCount)")
-                            .font(.system(size: 10, weight: .medium).monospaced())
-                            .foregroundStyle(Theme.success)
+                            .foregroundStyle(Theme.info)
                     }
                 }
 
@@ -72,6 +64,14 @@ struct WorkerPillView: View {
                     }
                 }
 
+                // Cumulative count of every sub-mission ever spawned — kept
+                // for reference but visually muted so it doesn't read as a
+                // live fleet size.
+                Text("· \(workers.count) total")
+                    .font(.system(size: 10))
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.textMuted)
+
                 Image(systemName: "chevron.up")
                     .font(.system(size: 9, weight: .bold))
                     .foregroundStyle(Theme.textMuted)
@@ -82,10 +82,20 @@ struct WorkerPillView: View {
             .clipShape(Capsule())
             .overlay(
                 Capsule()
-                    .stroke(Theme.border, lineWidth: 1)
+                    .fill(Theme.surfaceSheen)
+                    .allowsHitTesting(false)
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(Theme.edgeHighlight, lineWidth: 0.5)
             )
             .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
         }
         .buttonStyle(.plain)
+        // Roll digits instead of snapping when worker states change.
+        .animation(.snappy, value: workers.count)
+        .animation(.snappy, value: activeCount)
+        .animation(.snappy, value: waitingCount)
+        .animation(.snappy, value: failedCount)
     }
 }

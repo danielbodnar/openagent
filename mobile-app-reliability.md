@@ -313,7 +313,7 @@ Use simulator tests for:
 ## Source Notes
 
 - `backend/STREAMING.md` is the repo's canonical stream contract.
-- `src/api/control.rs` confirms SSE keepalives and WS heartbeat/resume support.
+- `src/api/control/mod.rs` confirms SSE keepalives and WS heartbeat/resume support.
 - `dashboard/src/lib/api.ts` already has stream diagnostics and opt-in WS logic
   worth mirroring in iOS.
 - Apple documents

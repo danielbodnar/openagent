@@ -3,7 +3,7 @@
  * based on runtime state and stored status.
  */
 
-import type { MissionStatus } from './api/missions';
+import type { AwaitingKind, MissionStatus } from './api/missions';
 
 export type MissionCategory = 'running' | 'needs-you' | 'finished' | 'other';
 export type FinishedTone = 'green' | 'red';
@@ -50,16 +50,32 @@ export function finishedTone(status: MissionStatus): FinishedTone {
  * Categorize a mission based on runtime state and stored status.
  *
  * Priority order:
- * 1. Running - mission is actually running (runtime state takes precedence)
- * 2. Needs You - awaiting_user AND not running
- * 3. Finished - completed/acknowledged/failed/interrupted/blocked/not_feasible AND not running
- * 4. Other - anything else (active-but-not-running, pending)
+ * 1. Needs You (waiting for tool) - the agent is parked on a frontend tool
+ *    (e.g. AskUserQuestion). The backend still reports this mission as
+ *    "running" (run state `waiting_for_tool`) because its harness is alive,
+ *    but it is blocked on the user, so it belongs in Needs You — not Running.
+ * 2. Running - mission is actually executing a turn
+ * 3. Needs You - awaiting_user AND not running
+ * 4. Finished - completed/acknowledged/failed/interrupted/blocked/not_feasible AND not running
+ * 5. Other - anything else (active-but-not-running, pending)
  */
 export function categorizeMission(
   status: MissionStatus,
-  isActuallyRunning: boolean
+  isActuallyRunning: boolean,
+  isWaitingForTool = false
 ): MissionCategory {
+  if (isWaitingForTool) {
+    return 'needs-you';
+  }
+
   if (isActuallyRunning) {
+    return 'running';
+  }
+
+  // The agent's turn ended but background shell jobs it spawned are still
+  // live. Work is genuinely in progress, so surface it in Running rather than
+  // letting it fall through to Other (where it would look idle/dropped).
+  if (status === 'waiting_background') {
     return 'running';
   }
 
@@ -77,10 +93,15 @@ export function categorizeMission(
 /**
  * Categorize multiple missions into columns for display.
  * Returns missions grouped by category with each mission only in one category.
+ *
+ * `waitingForToolMissionIds` is the subset of running missions parked on a
+ * frontend tool (run state `waiting_for_tool`); they are surfaced as Needs You
+ * rather than Running even though the backend still reports them as running.
  */
 export function categorizeMissions<T extends { id: string; status: MissionStatus }>(
   missions: T[],
-  runningMissionIds: Set<string>
+  runningMissionIds: Set<string>,
+  waitingForToolMissionIds: Set<string> = new Set()
 ): Record<MissionCategory, T[]> {
   const result: Record<MissionCategory, T[]> = {
     running: [],
@@ -90,8 +111,9 @@ export function categorizeMissions<T extends { id: string; status: MissionStatus
   };
 
   for (const mission of missions) {
+    const isWaitingForTool = waitingForToolMissionIds.has(mission.id);
     const isActuallyRunning = runningMissionIds.has(mission.id);
-    const category = categorizeMission(mission.status, isActuallyRunning);
+    const category = categorizeMission(mission.status, isActuallyRunning, isWaitingForTool);
     result[category].push(mission);
   }
 
@@ -111,6 +133,7 @@ export const STATUS_DOT_COLORS: Record<MissionStatus, string> = {
   interrupted: 'bg-red-400',
   blocked: 'bg-red-400',
   not_feasible: 'bg-red-400',
+  waiting_background: 'bg-indigo-400',
 };
 
 export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
@@ -123,6 +146,7 @@ export const STATUS_TEXT_COLORS: Record<MissionStatus, string> = {
   interrupted: 'text-red-400',
   blocked: 'text-red-400',
   not_feasible: 'text-red-400',
+  waiting_background: 'text-indigo-400',
 };
 
 export const STATUS_LABELS: Record<MissionStatus, string> = {
@@ -135,7 +159,33 @@ export const STATUS_LABELS: Record<MissionStatus, string> = {
   interrupted: 'Interrupted',
   blocked: 'Blocked',
   not_feasible: 'Not Feasible',
+  waiting_background: 'Working (Background)',
 };
+
+/**
+ * Labels for the two flavors of `awaiting_user`. `decision` means the agent
+ * asked a real question; `ack` means it finished and is waiting to be
+ * acknowledged/merged. The old single "Needs You" / "Waiting for your input"
+ * conflated these, which was misleading.
+ */
+export const AWAITING_KIND_LABELS: Record<AwaitingKind, string> = {
+  decision: 'Needs Decision',
+  ack: 'Awaiting Review',
+};
+
+/**
+ * Display label for a mission status, refined by `awaiting_kind` when the
+ * mission is parked in `awaiting_user`. Falls back to the generic status label.
+ */
+export function statusLabel(
+  status: MissionStatus,
+  awaitingKind?: AwaitingKind | null,
+): string {
+  if (status === 'awaiting_user' && awaitingKind) {
+    return AWAITING_KIND_LABELS[awaitingKind];
+  }
+  return STATUS_LABELS[status] ?? status;
+}
 
 /**
  * Get the display dot color for a mission, considering runtime state.

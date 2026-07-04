@@ -511,3 +511,71 @@ curl -sS "https://agent-backend-dev.thomas.md/api/control/progress" \
 curl -sS "https://agent-backend-dev.thomas.md/api/control/diagnostics/opencode" \
   -H "Authorization: Bearer <token>" | jq
 ```
+
+## Resource Isolation & Host Overload (cgroups: memory + CPU)
+
+Symptom: the whole server feels overloaded, dashboards lag, and harnesses can
+barely stream — usually while a mission runs a heavy fan-out (Lean/proof or
+contract builds). Diagnose **what kind** of pressure it is before touching
+anything:
+
+```bash
+uptime; nproc                       # load average vs core count
+free -h                             # is memory/swap the problem?
+cat /proc/pressure/cpu              # `some avg10` high + load > nproc => CPU-bound
+cat /proc/pressure/memory /proc/pressure/io
+ps -eo pid,pcpu,ni,comm --sort=-pcpu | head -20
+```
+
+If it's **CPU**, confirm the cgroup tiering is actually in effect:
+
+```bash
+# All three should NOT be equal — missions.slice must be < system.slice.
+for s in missions.slice system.slice user.slice; do
+  echo -n "$s cpu.weight="; cat /sys/fs/cgroup/$s/cpu.weight 2>/dev/null
+done
+systemctl show sandboxed-sh-prod -p CPUWeight -p Slice   # API tier weight
+systemctl show missions.slice -p CPUWeight -p CPUQuotaPerSecUSec
+# Is the cpu controller delegated into the slice? (must contain `cpu`)
+cat /sys/fs/cgroup/missions.slice/cgroup.subtree_control
+# Which cgroup is a harness actually in? (claude/codex/opencode)
+cat /proc/$(pgrep -n claude)/cgroup
+```
+
+Gotcha seen on prod 2026-06-15: every slice sat at the default `cpu.weight=100`
+with `CPUQuota=infinity`, the `cpu` controller was **not** delegated into
+`missions.slice` (`subtree_control = memory pids`), and the harness CLIs live
+*inside* `missions.slice` next to the build hogs. Boosting only the API service
+(`CPUWeight=10000`) didn't help because the bottleneck was the harness, not the
+API. A single mission running ~21 parallel `harness.cli run-task` jobs
+oversubscribed all 8 cores.
+
+### Fix — aggregate slice guard (persistent drop-in)
+
+```bash
+mkdir -p /etc/systemd/system/missions.slice.d
+cat > /etc/systemd/system/missions.slice.d/cpu.conf <<'EOF'
+[Slice]
+# Missions yield CPU to the API tier (system.slice = 100) under contention,
+# and can never take more than ~6.5 of 8 cores in aggregate.
+CPUWeight=30
+CPUQuota=650%
+EOF
+systemctl daemon-reload
+# Apply to the already-running slice immediately (runtime, also covered by the
+# drop-in on next boot):
+systemctl set-property missions.slice CPUWeight=30 CPUQuota=650%
+```
+
+Tune `CPUQuota` to `(cores - ~1.5) * 100%`. A runtime-only `set-property`
+without the drop-in is lost on restart — always write the drop-in too.
+
+### Fix — per-mission guard (code, env-driven)
+
+Set `MISSION_CPU_WEIGHT` (low, e.g. 40) and `MISSION_CPU_QUOTA` (e.g. `400%`) in
+the prod env file so each new mission scope is capped; existing missions can be
+retuned live from the dashboard **Resources** panel (or
+`POST /api/workspaces/:id/resources` with `cpu_weight`/`cpu_quota`). Setting any
+CPU property is also what makes systemd delegate the `cpu` controller into
+`missions.slice` — without it, a per-scope `CPUQuota` is silently unenforced.
+See the "Resource isolation" section in `CLAUDE.md` for the architecture.

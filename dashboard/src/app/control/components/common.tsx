@@ -8,7 +8,7 @@ import { memo } from "react";
 import { cn } from "@/lib/utils";
 import { useNow } from "@/lib/now-tick";
 import { getMissionDotColor } from "@/lib/mission-status";
-import type { MissionStatus } from "@/lib/api";
+import type { AwaitingKind, MissionStatus } from "@/lib/api";
 import type { ChatItem } from "../events-reducer";
 
 /** Thinking/stream chat items routed to the side panel. */
@@ -54,6 +54,7 @@ export function Shimmer({ className }: { className?: string }) {
 export function missionStatusLabel(
   status: MissionStatus,
   isRunning = false,
+  awaitingKind?: AwaitingKind | null,
 ): {
   label: string;
   className: string;
@@ -67,7 +68,27 @@ export function missionStatusLabel(
       return { label: "Pending", className: "bg-zinc-500/20 text-zinc-400" };
     case "active":
       return { label: "Active", className: "bg-indigo-500/20 text-indigo-400" };
+    case "waiting_background":
+      return {
+        label: "Working (Background)",
+        className: "bg-indigo-500/20 text-indigo-400",
+      };
     case "awaiting_user":
+      // Distinguish "agent asked a question" (decision) from "agent finished,
+      // waiting to be acked/merged" (ack). The old single "Needs You" label
+      // was ambiguous.
+      if (awaitingKind === "decision") {
+        return {
+          label: "Needs Decision",
+          className: "bg-amber-500/20 text-amber-400",
+        };
+      }
+      if (awaitingKind === "ack") {
+        return {
+          label: "Awaiting Review",
+          className: "bg-sky-500/20 text-sky-400",
+        };
+      }
       return {
         label: "Needs You",
         className: "bg-amber-500/20 text-amber-400",

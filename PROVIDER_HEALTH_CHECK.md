@@ -59,7 +59,7 @@ curl -X POST https://YOUR-BACKEND/api/ai/providers/cerebras/health
 
 The health check performs actual API validation for:
 - **Cerebras** - Tests with `llama-3.1-8b` model
-- **Z.AI** - Tests with `glm-4-flash` model
+- **Z.AI** - Tests with `glm-4.7-flash` model
 - **DeepInfra** - Tests with `Meta-Llama-3.1-8B-Instruct` model
 
 For OAuth-based providers (Anthropic, OpenAI, Google), it verifies credentials exist without making test API calls.

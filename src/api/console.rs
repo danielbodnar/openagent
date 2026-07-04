@@ -28,7 +28,6 @@ use uuid::Uuid;
 
 use super::auth;
 use super::routes::AppState;
-use crate::nspawn;
 use crate::workspace::{use_nspawn_for_workspace, WorkspaceType};
 
 /// How long to keep a session alive after disconnect before cleanup.
@@ -625,51 +624,6 @@ async fn child_has_exited(
     }
 }
 
-/// Terminate any existing systemd-nspawn container for the given machine name.
-/// This ensures we don't get "Directory tree is currently busy" errors when
-/// spawning a new container session.
-async fn terminate_stale_container(machine_name: &str) {
-    let status = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::process::Command::new("machinectl")
-            .args(["show", machine_name, "--property=State"])
-            .output(),
-    )
-    .await;
-
-    let output = match status {
-        Ok(Ok(output)) => output,
-        Ok(Err(_)) => return,
-        Err(_) => {
-            tracing::warn!(
-                "Timed out while checking machinectl state for '{}'",
-                machine_name
-            );
-            return;
-        }
-    };
-
-    if !output.status.success() {
-        return;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.contains("State=") {
-        tracing::info!(
-            "Terminating stale container '{}' before spawning new session",
-            machine_name
-        );
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::process::Command::new("machinectl")
-                .args(["terminate", machine_name])
-                .output(),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
 async fn handle_workspace_shell(
     socket: WebSocket,
     state: Arc<AppState>,
@@ -755,65 +709,75 @@ async fn handle_new_workspace_shell(
     // Build command based on workspace type
     let mut cmd = match workspace.workspace_type {
         WorkspaceType::Container if use_nspawn_for_workspace(&workspace) => {
-            // For container workspaces, use systemd-nspawn to enter the isolated environment
-            // First, terminate any stale container that might be holding the directory lock
-            terminate_stale_container(&workspace.name).await;
-
-            let mut cmd = CommandBuilder::new("systemd-nspawn");
-            cmd.arg("-D");
-            cmd.arg(workspace.path.to_string_lossy().to_string());
-            // Register with a consistent machine name so we can detect/terminate it later
-            cmd.arg(format!("--machine={}", workspace.name));
-            cmd.arg("--quiet");
-            cmd.arg("--timezone=off");
-            for arg in nspawn::tailscale_nspawn_extra_args(&workspace.env_vars) {
-                cmd.arg(arg);
-            }
-
-            if let Some(display) = read_runtime_display() {
-                if std::path::Path::new("/tmp/.X11-unix").exists() {
-                    cmd.arg("--bind=/tmp/.X11-unix");
-                    cmd.arg(format!("--setenv=DISPLAY={}", display));
-                }
-            }
-
-            cmd.arg("--setenv=TERM=xterm-256color");
-            cmd.arg(format!("--setenv=WORKSPACE_ID={}", workspace_id));
-            cmd.arg(format!("--setenv=WORKSPACE_NAME={}", workspace.name));
-            for (key, value) in &workspace.env_vars {
-                if key.trim().is_empty() {
-                    continue;
-                }
-                cmd.arg(format!("--setenv={}={}", key, value));
-            }
-
-            // Try to use bash if available, fallback to sh
+            // Enter the container by joining its shared persistent leader via
+            // `nsenter`, exactly like mission harnesses do. Booting a second
+            // `systemd-nspawn -D <dir>` on a directory a running mission already
+            // holds fails with "Directory tree … is currently busy" — which is
+            // why an interactive shell was unusable while a mission ran in the
+            // same container. Reusing WorkspaceExec keeps shell and mission
+            // execution on one path (leader management, env export, Tailscale
+            // bootstrap, and cgroup caps all come along for free).
             let bash_path = workspace.path.join("bin/bash");
             let shell = if bash_path.exists() {
                 "/bin/bash"
             } else {
                 "/bin/sh"
             };
-
-            // When tailscale networking is enabled, run the bootstrap script first
-            // to set up DNS and tailscale connection before the interactive shell
-            if nspawn::tailscale_enabled(&workspace.env_vars) {
-                cmd.arg(shell);
-                cmd.arg("-c");
-                // Run tailscale bootstrap, then exec to interactive shell
-                cmd.arg(format!(
-                    "/usr/local/bin/sandboxed-tailscale-up 2>/dev/null; exec {} --login -i",
-                    shell
-                ));
-            } else if shell == "/bin/bash" {
-                cmd.arg(shell);
-                cmd.arg("--login");
-                cmd.arg("-i");
+            let shell_args: Vec<String> = if shell == "/bin/bash" {
+                vec!["--login".to_string(), "-i".to_string()]
             } else {
-                cmd.arg(shell);
-                cmd.arg("-i");
+                vec!["-i".to_string()]
+            };
+
+            // These are exported *inside* the container by WorkspaceExec (nsenter
+            // does not propagate the caller's environment into the namespace).
+            let mut extra_env: HashMap<String, String> = HashMap::new();
+            extra_env.insert("WORKSPACE_ID".to_string(), workspace_id.to_string());
+            extra_env.insert("WORKSPACE_NAME".to_string(), workspace.name.clone());
+            if let Some(display) = read_runtime_display() {
+                if std::path::Path::new("/tmp/.X11-unix").exists() {
+                    extra_env.insert("DISPLAY".to_string(), display);
+                }
             }
-            cmd
+            for (key, value) in &workspace.env_vars {
+                if key.trim().is_empty() {
+                    continue;
+                }
+                extra_env.insert(key.clone(), value.clone());
+            }
+
+            let exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
+            match exec
+                .build_interactive_shell_invocation(&workspace.path, shell, &shell_args, extra_env)
+                .await
+            {
+                Ok(Some((program, args))) => {
+                    let mut cmd = CommandBuilder::new(&program);
+                    for arg in &args {
+                        cmd.arg(arg);
+                    }
+                    cmd
+                }
+                Ok(None) => {
+                    // Not actually an nspawn container; fall back to a plain
+                    // shell in the workspace directory.
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+                    let mut cmd = CommandBuilder::new(&shell);
+                    cmd.arg("--login");
+                    cmd.cwd(&workspace.path);
+                    cmd
+                }
+                Err(e) => {
+                    let _ = socket
+                        .send(Message::Text(format!(
+                            "Failed to open container shell: {}",
+                            e
+                        )))
+                        .await;
+                    let _ = socket.close().await;
+                    return;
+                }
+            }
         }
         _ => {
             // For host workspaces, just spawn a shell in the workspace directory

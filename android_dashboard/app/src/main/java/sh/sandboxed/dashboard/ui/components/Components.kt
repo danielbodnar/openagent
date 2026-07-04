@@ -51,6 +51,8 @@ private data class StatusVisual(val color: Color, val icon: ImageVector, val lab
 private fun MissionStatus.visual(): StatusVisual = when (this) {
     MissionStatus.PENDING -> StatusVisual(Palette.TextTertiary, Icons.Filled.HourglassEmpty, "Pending")
     MissionStatus.ACTIVE -> StatusVisual(Palette.Info, Icons.Filled.PlayArrow, "Active")
+    MissionStatus.AWAITING_USER -> StatusVisual(Palette.Warning, Icons.Filled.PauseCircle, "Needs you")
+    MissionStatus.ACKNOWLEDGED -> StatusVisual(Palette.Success, Icons.Filled.CheckCircle, "Acknowledged")
     MissionStatus.COMPLETED -> StatusVisual(Palette.Success, Icons.Filled.CheckCircle, "Completed")
     MissionStatus.FAILED -> StatusVisual(Palette.Error, Icons.Filled.Error, "Failed")
     MissionStatus.INTERRUPTED -> StatusVisual(Palette.Warning, Icons.Filled.PauseCircle, "Interrupted")

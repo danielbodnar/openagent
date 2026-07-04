@@ -30,18 +30,20 @@ class DesktopStreamSocket(
     fun connect(display: String, fps: Int, quality: Int): Flow<DesktopStreamEvent> = callbackFlow {
         val s = provider()
         val baseUrl = s.baseUrl.trimEnd('/').ifBlank { error("Server URL not configured") }
-        val wsBase = baseUrl.replaceFirst("https://", "wss://").replaceFirst("http://", "ws://")
-        val url = "$wsBase/api/desktop/stream".toHttpUrl().newBuilder()
+        val httpUrl = "$baseUrl/api/desktop/stream".toHttpUrl().newBuilder()
             .addQueryParameter("display", display)
             .addQueryParameter("fps", fps.coerceIn(1, 30).toString())
             .addQueryParameter("quality", quality.coerceIn(10, 100).toString())
             .build()
+        val wsUrl = httpUrl.toString()
+            .replaceFirst("https://", "wss://")
+            .replaceFirst("http://", "ws://")
         val protocols = listOfNotNull(
             "sandboxed",
             s.jwtToken?.let { "jwt.$it" },
         ).joinToString(", ")
         val req = Request.Builder()
-            .url(url)
+            .url(wsUrl)
             .apply { if (protocols.isNotEmpty()) header("Sec-WebSocket-Protocol", protocols) }
             .build()
 

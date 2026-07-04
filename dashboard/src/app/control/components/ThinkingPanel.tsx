@@ -5,7 +5,14 @@
 // Extracted mechanically from control-client.tsx.
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDown, Brain, ChevronDown, ChevronUp, X } from "lucide-react";
+import {
+  ArrowDown,
+  Brain,
+  ChevronDown,
+  ChevronUp,
+  PenLine,
+  X,
+} from "lucide-react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { StreamingMarkdown } from "@/components/streaming-markdown";
 import { cn } from "@/lib/utils";
@@ -17,11 +24,19 @@ export function ThinkingGroupItem({
   basePath,
   workspaceId,
   missionId,
+  defaultExpanded = false,
 }: {
   items: SidePanelItem[];
   basePath?: string;
   workspaceId?: string;
   missionId?: string;
+  /**
+   * When true (this is the last row in the transcript), the pill opens by
+   * default so the live thought/draft is readable without a click. Once a
+   * newer row arrives this flips back to false and — absent a manual
+   * override — the group auto-collapses, keeping only the current tail open.
+   */
+  defaultExpanded?: boolean;
 }) {
   // Filter out empty items for display
   const nonEmptyItems = useMemo(
@@ -30,11 +45,11 @@ export function ThinkingGroupItem({
   );
 
   const hasActiveItem = items.some((item) => !item.done);
-  // Collapsed by default, including while active: the transcript shows one
-  // compact pill ("Thinking for 12s") that matches the tool-call rows'
-  // height, instead of auto-expanding into a tall content card. Live
-  // reasoning is one click away here or in the Thinking side panel.
-  const [expanded, setExpanded] = useState(false);
+  // Expansion tracks `defaultExpanded` (the last transcript row opens; older
+  // rows stay compact) until the user clicks, after which their explicit
+  // choice sticks. `null` = follow the default.
+  const [manualExpanded, setManualExpanded] = useState<boolean | null>(null);
+  const expanded = manualExpanded ?? defaultExpanded;
 
   // Get the earliest start time and latest end time
   const startTime = Math.min(...items.map((item) => item.startTime));
@@ -77,11 +92,18 @@ export function ThinkingGroupItem({
     return "Thinking";
   })();
 
+  // Streaming the final response (kind "stream") is not reasoning — give it a
+  // writing glyph so the brain icon stays reserved for actual thoughts.
+  const isStreamView = hasActiveItem
+    ? activeLabel === "Streaming"
+    : label === "Draft" || label === "Drafts";
+  const HeaderIcon = isStreamView ? PenLine : Brain;
+
   return (
     <div className="my-2">
       {/* Compact header */}
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => setManualExpanded(!expanded)}
         className={cn(
           "flex items-center gap-1.5 px-2.5 py-1 rounded-full",
           "bg-white/[0.04] border border-white/[0.06]",
@@ -89,7 +111,7 @@ export function ThinkingGroupItem({
           "transition-all duration-200",
         )}
       >
-        <Brain
+        <HeaderIcon
           className={cn(
             "h-3 w-3",
             hasActiveItem && "animate-pulse text-indigo-400",
@@ -181,6 +203,7 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
 
   const activeLabel = item.kind === "stream" ? "Streaming" : "Thinking";
   const pastLabel = item.kind === "stream" ? "Draft" : "Thought";
+  const ItemIcon = item.kind === "stream" ? PenLine : Brain;
 
   // For completed items, check if content is long enough to collapse
   const isLongContent =
@@ -203,7 +226,7 @@ const ThinkingPanelItem = memo(function ThinkingPanelItem({
       )}
     >
       <div className="flex items-center gap-2 mb-2">
-        <Brain
+        <ItemIcon
           className={cn(
             "h-3.5 w-3.5 shrink-0",
             isActive ? "animate-pulse text-indigo-400" : "text-white/40",
@@ -312,6 +335,9 @@ export const ThinkingPanel = memo(function ThinkingPanel({
   const activeItems = useMemo(() => items.filter((t) => !t.done), [items]);
   const hasActiveThinking = activeItems.some((i) => i.kind === "thinking");
   const hasActiveStream = activeItems.some((i) => i.kind === "stream");
+  // Brain for thinking; pen when the only thing in flight is a streamed reply.
+  const PanelHeaderIcon =
+    hasActiveStream && !hasActiveThinking ? PenLine : Brain;
 
   // Performance: limit visible thoughts, load more on demand
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -359,6 +385,7 @@ export const ThinkingPanel = memo(function ThinkingPanel({
   const {
     isAtBottom: isThoughtsAtBottom,
     scrollToBottom: scrollThoughtsToBottom,
+    registerContent: registerThoughtsContent,
   } = useVirtualTimelineAnchor({
     scrollElementRef: scrollRef,
     virtualizer: thoughtsVirtualizer,
@@ -403,7 +430,7 @@ export const ThinkingPanel = memo(function ThinkingPanel({
       {/* Header */}
       <div className="flex items-center justify-between border-b border-white/[0.06] px-4 py-3">
         <div className="flex items-center gap-2">
-          <Brain
+          <PanelHeaderIcon
             className={cn(
               "h-4 w-4",
               activeItems.length > 0
@@ -447,6 +474,7 @@ export const ThinkingPanel = memo(function ThinkingPanel({
         ) : (
           <>
             <div
+              ref={registerThoughtsContent}
               className="relative w-full"
               style={{
                 height: `${thoughtsVirtualizer.getTotalSize()}px`,

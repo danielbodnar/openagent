@@ -4,7 +4,7 @@ export default function SettingsLayout({
   children: React.ReactNode;
 }) {
   return (
-    <div className="h-screen flex flex-col overflow-hidden">
+    <div className="h-[calc(100vh-3rem)] lg:h-screen flex flex-col overflow-hidden">
       {children}
     </div>
   );

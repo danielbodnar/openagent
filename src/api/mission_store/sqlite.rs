@@ -1,11 +1,13 @@
 //! SQLite-based mission store with full event logging.
 
 use super::{
-    now_string, sanitize_filename, Automation, AutomationExecution, CommandSource, DailyUsageStats,
-    ExecutionStatus, FreshSession, HourlyUsageStats, Mission, MissionHistoryEntry, MissionMode,
-    MissionStatus, MissionStatusCounts, MissionStore, ModelUsageStats, PalomaCooldownState,
-    PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
-    StopPolicy, StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
+    now_string, sanitize_filename, Automation, AutomationExecution, AwaitingKind, BoardTask,
+    BoardTaskOutcome, BoardTaskStatus, CommandSource, DailyUsageStats, ExecutionStatus,
+    FreshSession, HourlyUsageStats, Mission, MissionActivity, MissionHistoryEntry, MissionMode,
+    MissionProject, MissionProjectPatch, MissionScheduling, MissionStatus, MissionStatusCounts,
+    MissionStore, ModelUsageStats, NewBoardTask, PalomaCooldownState, PalomaDecision,
+    PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig, StopPolicy,
+    StoredEvent, TelegramActionExecution, TelegramActionExecutionKind,
     TelegramActionExecutionStatus, TelegramAlert, TelegramAlertPreference, TelegramChannel,
     TelegramChatMission, TelegramConversation, TelegramConversationMessage,
     TelegramConversationMessageDirection, TelegramMissionInterestLevel,
@@ -490,7 +492,21 @@ CREATE TABLE IF NOT EXISTS missions (
     resumable INTEGER NOT NULL DEFAULT 0,
     desktop_sessions TEXT,
     terminal_reason TEXT,
-    first_viewed_at TEXT
+    first_viewed_at TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    not_before TEXT,
+    deadline TEXT,
+    deferred_goal TEXT,
+    paused_at TEXT,
+    project TEXT,
+    track TEXT,
+    intent TEXT,
+    github_pr TEXT,
+    tags TEXT,
+    desired_state TEXT,
+    next_check_at TEXT,
+    awaiting_kind TEXT,
+    last_status_change_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -627,6 +643,44 @@ CREATE TABLE IF NOT EXISTS proxy_usage (
 
 CREATE INDEX IF NOT EXISTS idx_proxy_usage_timestamp ON proxy_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_proxy_usage_model ON proxy_usage(model);
+
+-- Task board: server-scheduled worker tasks owned by a boss mission.
+-- The control loop spawns workers for ready tasks and settles them when the
+-- worker turn ends; the boss only plans and judges. See api::control::board.
+CREATE TABLE IF NOT EXISTS board_tasks (
+    id TEXT PRIMARY KEY,
+    boss_mission_id TEXT NOT NULL,
+    task_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    model_override TEXT,
+    model_effort TEXT,
+    working_directory TEXT,
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    outcome TEXT,
+    worker_mission_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    result_digest TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(boss_mission_id, task_key),
+    FOREIGN KEY (boss_mission_id) REFERENCES missions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_board_tasks_boss ON board_tasks(boss_mission_id);
+CREATE INDEX IF NOT EXISTS idx_board_tasks_worker ON board_tasks(worker_mission_id);
+CREATE INDEX IF NOT EXISTS idx_board_tasks_status ON board_tasks(status);
+
+-- Persisted control-session message queue (JSON snapshot) so pending queued
+-- messages survive a restart. Single row (the DB is already per-user).
+CREATE TABLE IF NOT EXISTS control_queue (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 "#;
 
 /// Content size threshold for inline storage (64KB).
@@ -864,6 +918,14 @@ impl SqliteMissionStore {
         let conn = tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path)
                 .map_err(|e| format!("Failed to open SQLite database: {}", e))?;
+
+            // A global store and the per-user store can open the same DB file
+            // and run schema/migrations concurrently at startup. Without a busy
+            // timeout, the second writer's DDL fails with SQLITE_BUSY and aborts
+            // store init (→ silent in-memory fallback). Make concurrent writers
+            // wait for the lock instead.
+            conn.busy_timeout(std::time::Duration::from_secs(10))
+                .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
 
             // Run schema
             conn.execute_batch(SCHEMA)
@@ -1978,6 +2040,146 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to add first_viewed_at column: {}", e))?;
         }
 
+        // FLEET-001 scheduling columns: priority (dispatch ordering), not_before
+        // (earliest dispatch time), deadline (soft deadline for observability).
+        let has_priority_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'priority'")
+            .map_err(|e| format!("Failed to check for priority column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_priority_column {
+            tracing::info!("Running migration: adding 'priority' column to missions table");
+            conn.execute(
+                "ALTER TABLE missions ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("Failed to add priority column: {}", e))?;
+        }
+
+        let has_not_before_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'not_before'")
+            .map_err(|e| format!("Failed to check for not_before column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_not_before_column {
+            tracing::info!("Running migration: adding 'not_before' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN not_before TEXT", [])
+                .map_err(|e| format!("Failed to add not_before column: {}", e))?;
+        }
+
+        let has_deadline_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'deadline'")
+            .map_err(|e| format!("Failed to check for deadline column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_deadline_column {
+            tracing::info!("Running migration: adding 'deadline' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN deadline TEXT", [])
+                .map_err(|e| format!("Failed to add deadline column: {}", e))?;
+        }
+
+        // FLEET-001 scheduling dispatch: the goal a not_before-deferred mission
+        // will run once the scheduler dispatches it. Held here (rather than in
+        // mission history) so a Pending mission carries dispatchable work
+        // without prematurely appearing as a committed turn.
+        let has_deferred_goal_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'deferred_goal'")
+            .map_err(|e| format!("Failed to check for deferred_goal column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_deferred_goal_column {
+            tracing::info!("Running migration: adding 'deferred_goal' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN deferred_goal TEXT", [])
+                .map_err(|e| format!("Failed to add deferred_goal column: {}", e))?;
+        }
+
+        // FLEET-004: when a mission was last paused (status Paused). Drives pause
+        // age in the UI and future zombie-pause cleanup.
+        let has_paused_at_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'paused_at'")
+            .map_err(|e| format!("Failed to check for paused_at column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+        if !has_paused_at_column {
+            tracing::info!("Running migration: adding 'paused_at' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN paused_at TEXT", [])
+                .map_err(|e| format!("Failed to add paused_at column: {}", e))?;
+        }
+
+        // Project tagging + awaiting_kind classification + activity timestamps +
+        // track state. Lets external consumers (Paloma) group/filter/route
+        // missions, tell "needs a decision" apart from "finished, please ack",
+        // tell "no worker = problem" apart from "intentionally waiting on CI",
+        // and reason about staleness without parsing titles. All nullable.
+        for (column, sql_type) in [
+            ("project", "TEXT"),
+            ("track", "TEXT"),
+            ("intent", "TEXT"),
+            ("github_pr", "TEXT"),
+            ("tags", "TEXT"),
+            ("desired_state", "TEXT"),
+            ("next_check_at", "TEXT"),
+            ("awaiting_kind", "TEXT"),
+            ("last_status_change_at", "TEXT"),
+        ] {
+            // `github_pr` shipped briefly as INTEGER; it now holds a free-form
+            // PR reference string (e.g. "owner/repo#123"). The column is freshly
+            // added and always NULL in practice, so converting affinity via a
+            // lossless DROP + re-add as TEXT is safe.
+            //
+            // CRITICAL: this runs concurrently — a global store and the per-user
+            // store both initialize on the same DB file at startup. The DDL here
+            // MUST be non-fatal: a previous (#572) version returned Err when the
+            // racing init had already dropped the column ("no such column"),
+            // which failed the whole sqlite store init and silently fell the
+            // service back to an in-memory store (losing visibility of all
+            // persisted missions). So tolerate "already done" / concurrent races
+            // on every ALTER below instead of propagating them.
+            if column == "github_pr" {
+                let is_integer: bool = conn
+                    .prepare(
+                        "SELECT 1 FROM pragma_table_info('missions') WHERE name = 'github_pr' AND UPPER(type) = 'INTEGER'",
+                    )
+                    .map_err(|e| format!("Failed to check github_pr type: {}", e))?
+                    .exists([])
+                    .map_err(|e| format!("Failed to query table info: {}", e))?;
+                if is_integer {
+                    tracing::info!(
+                        "Running migration: converting 'github_pr' column from INTEGER to TEXT"
+                    );
+                    if let Err(e) = conn.execute("ALTER TABLE missions DROP COLUMN github_pr", []) {
+                        tracing::warn!(
+                            "github_pr INTEGER→TEXT drop skipped (already converted or concurrent migration): {}",
+                            e
+                        );
+                    }
+                }
+            }
+            let exists: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = ?1")
+                .map_err(|e| format!("Failed to check for {} column: {}", column, e))?
+                .exists(params![column])
+                .map_err(|e| format!("Failed to query table info: {}", e))?;
+            if !exists {
+                tracing::info!(
+                    "Running migration: adding '{}' column to missions table",
+                    column
+                );
+                // Non-fatal: a concurrent init may have added the column between
+                // our `exists` check and here ("duplicate column name").
+                if let Err(e) = conn.execute(
+                    &format!("ALTER TABLE missions ADD COLUMN {} {}", column, sql_type),
+                    [],
+                ) {
+                    tracing::warn!(
+                        "Adding '{}' column skipped (already present or concurrent migration): {}",
+                        column,
+                        e
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2235,11 +2437,13 @@ fn parse_status(s: &str) -> MissionStatus {
         "active" => MissionStatus::Active,
         "awaiting_user" => MissionStatus::AwaitingUser,
         "acknowledged" => MissionStatus::Acknowledged,
+        "waiting_background" => MissionStatus::WaitingBackground,
         "completed" => MissionStatus::Completed,
         "failed" => MissionStatus::Failed,
         "interrupted" => MissionStatus::Interrupted,
         "blocked" => MissionStatus::Blocked,
         "not_feasible" => MissionStatus::NotFeasible,
+        "paused" => MissionStatus::Paused,
         _ => MissionStatus::Pending,
     }
 }
@@ -2250,12 +2454,57 @@ fn status_to_string(status: MissionStatus) -> &'static str {
         MissionStatus::Active => "active",
         MissionStatus::AwaitingUser => "awaiting_user",
         MissionStatus::Acknowledged => "acknowledged",
+        MissionStatus::WaitingBackground => "waiting_background",
         MissionStatus::Completed => "completed",
         MissionStatus::Failed => "failed",
         MissionStatus::Interrupted => "interrupted",
         MissionStatus::Blocked => "blocked",
         MissionStatus::NotFeasible => "not_feasible",
+        MissionStatus::Paused => "paused",
     }
+}
+
+/// Serialize mission tags to a JSON array string for storage. `None` when empty
+/// (keeps the column NULL rather than `"[]"`).
+fn tags_to_json(tags: &[String]) -> Option<String> {
+    if tags.is_empty() {
+        None
+    } else {
+        serde_json::to_string(tags).ok()
+    }
+}
+
+/// Parse a stored JSON array of tags. Tolerates NULL / malformed values.
+fn tags_from_json(raw: Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default()
+}
+
+/// Read the trailing project/activity columns from a mission row in the
+/// canonical order `project, track, intent, github_pr, tags, desired_state,
+/// next_check_at, awaiting_kind, last_status_change_at` starting at `base`.
+/// Shared by the full SELECTs so the index math lives in one place. Returns the
+/// project metadata, the awaiting classification, and `last_status_change_at`.
+fn read_project_columns(
+    row: &rusqlite::Row,
+    base: usize,
+) -> rusqlite::Result<(MissionProject, Option<AwaitingKind>, Option<String>)> {
+    let project = MissionProject {
+        project: row.get(base)?,
+        track: row.get(base + 1)?,
+        intent: row.get(base + 2)?,
+        github_pr: row.get(base + 3)?,
+        tags: tags_from_json(row.get(base + 4)?),
+        desired_state: row.get(base + 5)?,
+        next_check_at: row.get(base + 6)?,
+    };
+    let awaiting_kind = row
+        .get::<_, Option<String>>(base + 7)?
+        .as_deref()
+        .and_then(AwaitingKind::from_str_opt);
+    let last_status_change_at: Option<String> = row.get(base + 8)?;
+    Ok((project, awaiting_kind, last_status_change_at))
 }
 
 #[async_trait]
@@ -2276,7 +2525,9 @@ impl MissionStore for SqliteMissionStore {
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
                             COALESCE(mission_mode, 'task') as mission_mode,
-                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at
+                            COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
+                            COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
+                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2293,6 +2544,8 @@ impl MissionStore for SqliteMissionStore {
                     let session_id: Option<String> = row.get(19)?;
                     let terminal_reason: Option<String> = row.get(20)?;
                     let config_profile: Option<String> = row.get(21)?;
+                    let (project, awaiting_kind, last_status_change_at) =
+                        read_project_columns(row, 32)?;
 
                     Ok(Mission {
                         id: parse_uuid_or_nil(&id_str),
@@ -2315,6 +2568,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
                         interrupted_at: row.get(15)?,
+                        paused_at: row.get(31).ok().flatten(),
                         resumable: row.get::<_, i32>(16)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -2329,6 +2583,17 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
                             first_viewed_at: row.get(27).ok().flatten(),
+                            scheduling: MissionScheduling {
+                                priority: row.get::<_, i32>(28).unwrap_or(0),
+                                not_before: row.get(29).ok().flatten(),
+                                deadline: row.get(30).ok().flatten(),
+                            },
+                            project,
+                            activity: MissionActivity {
+                                last_status_change_at,
+                                ..Default::default()
+                            },
+                            awaiting_kind,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2388,7 +2653,9 @@ impl MissionStore for SqliteMissionStore {
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
                             COALESCE(backend, 'opencode') as backend, session_id, terminal_reason,
                             config_profile, parent_mission_id, working_directory,
-                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at FROM missions WHERE id = ?1",
+                            COALESCE(mission_mode, 'task') as mission_mode, COALESCE(goal_mode, 0) as goal_mode, goal_objective, first_viewed_at,
+                            COALESCE(priority, 0) as priority, not_before, deadline, paused_at,
+                            project, track, intent, github_pr, tags, desired_state, next_check_at, awaiting_kind, last_status_change_at FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -2402,6 +2669,8 @@ impl MissionStore for SqliteMissionStore {
                     let session_id: Option<String> = row.get(19)?;
                     let terminal_reason: Option<String> = row.get(20)?;
                     let config_profile: Option<String> = row.get(21)?;
+                    let (project, awaiting_kind, last_status_change_at) =
+                        read_project_columns(row, 32)?;
 
                     Ok(Mission {
                         id: parse_uuid_or_nil(&id_str),
@@ -2424,6 +2693,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(13)?,
                         updated_at: row.get(14)?,
                         interrupted_at: row.get(15)?,
+                        paused_at: row.get(31).ok().flatten(),
                         resumable: row.get::<_, i32>(16)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -2438,6 +2708,17 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(25).unwrap_or(0) != 0,
                             goal_objective: row.get(26).ok().flatten(),
                             first_viewed_at: row.get(27).ok().flatten(),
+                            scheduling: MissionScheduling {
+                                priority: row.get::<_, i32>(28).unwrap_or(0),
+                                not_before: row.get(29).ok().flatten(),
+                                deadline: row.get(30).ok().flatten(),
+                            },
+                            project,
+                            activity: MissionActivity {
+                                last_status_change_at,
+                                ..Default::default()
+                            },
+                            awaiting_kind,
                     })
                 })
                 .optional()
@@ -2547,6 +2828,7 @@ impl MissionStore for SqliteMissionStore {
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: Some(session_id.clone()),
@@ -2557,6 +2839,10 @@ impl MissionStore for SqliteMissionStore {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: MissionProject::default(),
+            activity: MissionActivity::default(),
+            awaiting_kind: None,
         };
 
         let m = mission.clone();
@@ -2567,8 +2853,8 @@ impl MissionStore for SqliteMissionStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                "INSERT INTO missions (id, status, title, short_description, metadata_updated_at, metadata_source, metadata_model, metadata_version, workspace_id, agent, model_override, model_effort, backend, config_profile, created_at, updated_at, resumable, session_id, parent_mission_id, working_directory, mission_mode, goal_mode, goal_objective, last_status_change_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     m.id.to_string(),
                     status_to_string(m.status),
@@ -2593,6 +2879,7 @@ impl MissionStore for SqliteMissionStore {
                     mission_mode_str,
                     if m.goal_mode { 1i64 } else { 0i64 },
                     m.goal_objective,
+                    m.created_at,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -2634,6 +2921,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(14)?,
                         updated_at: row.get(15)?,
                         interrupted_at: row.get(16)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(17)? != 0,
                         desktop_sessions: Vec::new(),
                         session_id: row.get(18)?,
@@ -2646,6 +2934,10 @@ impl MissionStore for SqliteMissionStore {
                             goal_mode: row.get::<_, i32>(23).unwrap_or(0) != 0,
                             goal_objective: row.get(24).ok().flatten(),
                             first_viewed_at: None,
+                            scheduling: Default::default(),
+                            project: MissionProject::default(),
+                            activity: MissionActivity::default(),
+                            awaiting_kind: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -2660,6 +2952,29 @@ impl MissionStore for SqliteMissionStore {
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {
         self.update_mission_status_with_reason(id, status, None)
             .await
+    }
+
+    async fn set_mission_scheduling(
+        &self,
+        id: Uuid,
+        scheduling: &MissionScheduling,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let priority = scheduling.priority;
+        let not_before = scheduling.not_before.clone();
+        let deadline = scheduling.deadline.clone();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET priority = ?1, not_before = ?2, deadline = ?3, updated_at = ?4 WHERE id = ?5",
+                params![priority, not_before, deadline, now, id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     async fn update_mission_status_with_reason(
@@ -2686,12 +3001,17 @@ impl MissionStore for SqliteMissionStore {
                 | MissionStatus::Failed
                 | MissionStatus::AwaitingUser
                 | MissionStatus::Acknowledged
+                | MissionStatus::WaitingBackground
         );
         let terminal_reason = terminal_reason.map(|s| s.to_string());
         // Transitioning back to Active means the user just sent a new message —
         // clear `first_viewed_at` so the next AwaitingUser round starts fresh
         // (and so the "opened" dot disappears once the agent picks up again).
         let clear_first_viewed_at = matches!(status, MissionStatus::Active);
+        // `awaiting_kind` only describes an `AwaitingUser` mission. Any status
+        // change away from AwaitingUser must clear it so a stale classification
+        // can't leak to consumers once the mission is running/terminal again.
+        let clear_awaiting_kind = !matches!(status, MissionStatus::AwaitingUser);
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -2709,7 +3029,7 @@ impl MissionStore for SqliteMissionStore {
                 .ok();
             if clear_first_viewed_at {
                 conn.execute(
-                    "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5, first_viewed_at = NULL WHERE id = ?6",
+                    "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5, first_viewed_at = NULL, awaiting_kind = CASE WHEN ?7 THEN NULL ELSE awaiting_kind END, last_status_change_at = CASE WHEN status <> ?1 THEN ?2 ELSE last_status_change_at END WHERE id = ?6",
                     params![
                         status_to_string(status),
                         now,
@@ -2717,12 +3037,13 @@ impl MissionStore for SqliteMissionStore {
                         if resumable { 1 } else { 0 },
                         terminal_reason,
                         id.to_string(),
+                        clear_awaiting_kind,
                     ],
                 )
                 .map_err(|e| e.to_string())?;
             } else {
                 conn.execute(
-                    "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5 WHERE id = ?6",
+                    "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5, awaiting_kind = CASE WHEN ?7 THEN NULL ELSE awaiting_kind END, last_status_change_at = CASE WHEN status <> ?1 THEN ?2 ELSE last_status_change_at END WHERE id = ?6",
                     params![
                         status_to_string(status),
                         now,
@@ -2730,6 +3051,7 @@ impl MissionStore for SqliteMissionStore {
                         if resumable { 1 } else { 0 },
                         terminal_reason,
                         id.to_string(),
+                        clear_awaiting_kind,
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -2845,6 +3167,27 @@ impl MissionStore for SqliteMissionStore {
         .map_err(|e| e.to_string())?
     }
 
+    async fn get_waiting_background_mission_ids(&self) -> Result<Vec<Uuid>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT id FROM missions WHERE status = 'waiting_background'")
+                .map_err(|e| e.to_string())?;
+            let ids = stmt
+                .query_map([], |row| {
+                    let id_str: String = row.get(0)?;
+                    Ok(parse_uuid_or_nil(&id_str))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
     async fn update_mission_desktop_sessions(
         &self,
         id: Uuid,
@@ -2888,6 +3231,42 @@ impl MissionStore for SqliteMissionStore {
             )
             .map_err(|e| e.to_string())?;
             Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn save_control_queue(&self, _user_id: &str, payload: &str) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let payload = payload.to_string();
+        let now = now_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO control_queue (id, payload, updated_at) VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET payload = ?1, updated_at = ?2",
+                params![payload, now],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn load_control_queue(&self, _user_id: &str) -> Result<String, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let payload: Option<String> = conn
+                .query_row(
+                    "SELECT payload FROM control_queue WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok(payload.unwrap_or_default())
         })
         .await
         .map_err(|e| e.to_string())?
@@ -3021,6 +3400,134 @@ impl MissionStore for SqliteMissionStore {
                     now,
                     id.to_string()
                 ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn update_mission_project(
+        &self,
+        id: Uuid,
+        patch: MissionProjectPatch,
+    ) -> Result<(), String> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.clone();
+        let now = now_string();
+        let project_set = patch.project.is_some();
+        let track_set = patch.track.is_some();
+        let intent_set = patch.intent.is_some();
+        let github_pr_set = patch.github_pr.is_some();
+        let tags_set = patch.tags.is_some();
+        let desired_state_set = patch.desired_state.is_some();
+        let next_check_at_set = patch.next_check_at.is_some();
+        let project = patch.project.flatten();
+        let track = patch.track.flatten();
+        let intent = patch.intent.flatten();
+        let github_pr = patch.github_pr.flatten();
+        let tags_json = patch.tags.as_deref().and_then(tags_to_json);
+        let desired_state = patch.desired_state.flatten();
+        let next_check_at = patch.next_check_at.flatten();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions
+                 SET project = CASE WHEN ?1 THEN ?2 ELSE project END,
+                     track = CASE WHEN ?3 THEN ?4 ELSE track END,
+                     intent = CASE WHEN ?5 THEN ?6 ELSE intent END,
+                     github_pr = CASE WHEN ?7 THEN ?8 ELSE github_pr END,
+                     tags = CASE WHEN ?9 THEN ?10 ELSE tags END,
+                     desired_state = CASE WHEN ?11 THEN ?12 ELSE desired_state END,
+                     next_check_at = CASE WHEN ?13 THEN ?14 ELSE next_check_at END,
+                     updated_at = ?15
+                 WHERE id = ?16",
+                params![
+                    project_set,
+                    project,
+                    track_set,
+                    track,
+                    intent_set,
+                    intent,
+                    github_pr_set,
+                    github_pr,
+                    tags_set,
+                    tags_json,
+                    desired_state_set,
+                    desired_state,
+                    next_check_at_set,
+                    next_check_at,
+                    now,
+                    id.to_string(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_mission_activity(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, (Option<String>, Option<String>)>, String> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn.clone();
+        let id_strings: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let placeholders = vec!["?"; id_strings.len()].join(",");
+            // last_agent_event_at = newest event of any kind; last_output_at =
+            // newest assistant message (assistant text is logged as either
+            // `assistant_message` or `assistant_message_canonical`). Backed by
+            // idx_events_mission_timestamp.
+            let sql = format!(
+                "SELECT mission_id, MAX(timestamp) AS last_event, \
+                 MAX(CASE WHEN event_type IN ('assistant_message', 'assistant_message_canonical') THEN timestamp END) AS last_output \
+                 FROM mission_events WHERE mission_id IN ({placeholders}) GROUP BY mission_id"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(id_strings.iter()), |row| {
+                    let mid: String = row.get(0)?;
+                    let last_event: Option<String> = row.get(1)?;
+                    let last_output: Option<String> = row.get(2)?;
+                    Ok((mid, last_event, last_output))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut out = std::collections::HashMap::new();
+            for row in rows {
+                let (mid, last_event, last_output) = row.map_err(|e| e.to_string())?;
+                if let Ok(uuid) = Uuid::parse_str(&mid) {
+                    out.insert(uuid, (last_event, last_output));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn set_mission_awaiting_kind(
+        &self,
+        id: Uuid,
+        kind: Option<AwaitingKind>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let kind_str = kind.map(|k| k.as_str().to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET awaiting_kind = ?1 WHERE id = ?2",
+                params![kind_str, id.to_string()],
             )
             .map_err(|e| e.to_string())?;
             Ok(())
@@ -3254,6 +3761,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
                         interrupted_at: row.get(9)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(10)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -3266,6 +3774,10 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: false,
                         goal_objective: None,
                         first_viewed_at: None,
+                        scheduling: Default::default(),
+                        project: MissionProject::default(),
+                        activity: MissionActivity::default(),
+                        awaiting_kind: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3325,6 +3837,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(7)?,
                         updated_at: row.get(8)?,
                         interrupted_at: row.get(9)?,
+                        paused_at: None,
                         resumable: row.get::<_, i32>(10)? != 0,
                         desktop_sessions: desktop_sessions_json
                             .and_then(|s| serde_json::from_str(&s).ok())
@@ -3340,6 +3853,150 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
                         goal_objective: row.get(15).ok().flatten(),
                         first_viewed_at: None,
+                        scheduling: Default::default(),
+                        project: MissionProject::default(),
+                        activity: MissionActivity::default(),
+                        awaiting_kind: None,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+
+            Ok(missions)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn set_deferred_goal(
+        &self,
+        mission_id: Uuid,
+        goal: Option<String>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET deferred_goal = ?1 WHERE id = ?2",
+                params![goal, id],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String> {
+        let conn = self.conn.clone();
+        let id = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT deferred_goal FROM missions WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let id = mission_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE missions SET paused_at = ?1 WHERE id = ?2",
+                params![paused_at, id],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
+                            created_at, updated_at, interrupted_at, resumable, desktop_sessions,
+                            COALESCE(backend, 'opencode') as backend,
+                            COALESCE(mission_mode, 'task') as mission_mode,
+                            COALESCE(goal_mode, 0) as goal_mode,
+                            goal_objective,
+                            COALESCE(priority, 0) as priority, not_before, deadline
+                     FROM missions
+                     WHERE status = 'pending' AND deferred_goal IS NOT NULL
+                     ORDER BY created_at ASC",
+                )
+                .map_err(|e| e.to_string())?;
+
+            let missions = stmt
+                .query_map(params![], |row| {
+                    let id_str: String = row.get(0)?;
+                    let status_str: String = row.get(1)?;
+                    let workspace_id_str: String = row.get(3)?;
+                    let desktop_sessions_json: Option<String> = row.get(11)?;
+                    let backend: String = row.get(12)?;
+
+                    Ok(Mission {
+                        id: parse_uuid_or_nil(&id_str),
+                        status: parse_status(&status_str),
+                        title: row.get(2)?,
+                        short_description: None,
+                        metadata_updated_at: None,
+                        metadata_source: None,
+                        metadata_model: None,
+                        metadata_version: None,
+                        workspace_id: Uuid::parse_str(&workspace_id_str)
+                            .unwrap_or(crate::workspace::DEFAULT_WORKSPACE_ID),
+                        workspace_name: row.get(4)?,
+                        agent: row.get(5)?,
+                        model_override: row.get(6)?,
+                        model_effort: None,
+                        backend,
+                        config_profile: None,
+                        history: vec![],
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        interrupted_at: row.get(9)?,
+                        paused_at: None,
+                        resumable: row.get::<_, i32>(10)? != 0,
+                        desktop_sessions: desktop_sessions_json
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        session_id: None,
+                        terminal_reason: None,
+                        parent_mission_id: None,
+                        working_directory: None,
+                        mission_mode: row
+                            .get::<_, Option<String>>(13)?
+                            .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                            .unwrap_or_default(),
+                        goal_mode: row.get::<_, i32>(14).unwrap_or(0) != 0,
+                        goal_objective: row.get(15).ok().flatten(),
+                        first_viewed_at: None,
+                        scheduling: MissionScheduling {
+                            priority: row.get::<_, i32>(16).unwrap_or(0),
+                            not_before: row.get(17).ok().flatten(),
+                            deadline: row.get(18).ok().flatten(),
+                        },
+                        project: MissionProject::default(),
+                        activity: MissionActivity::default(),
+                        awaiting_kind: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -3561,6 +4218,7 @@ impl MissionStore for SqliteMissionStore {
                 id,
                 content,
                 queued,
+                source,
                 ..
             } => (
                 "user_message",
@@ -3568,7 +4226,17 @@ impl MissionStore for SqliteMissionStore {
                 None,
                 None,
                 content.clone(),
-                serde_json::json!({ "queued": queued }),
+                {
+                    // Always record `queued`; record `source` only when present so
+                    // the persisted metadata is the forensic record of who/what
+                    // posted this message (audit/attribution).
+                    let mut meta = serde_json::Map::new();
+                    meta.insert("queued".to_string(), serde_json::json!(queued));
+                    if let Some(src) = source {
+                        meta.insert("source".to_string(), serde_json::json!(src));
+                    }
+                    serde_json::Value::Object(meta)
+                },
             ),
             AgentEvent::AssistantMessage {
                 id,
@@ -5742,6 +6410,7 @@ impl MissionStore for SqliteMissionStore {
                         created_at: row.get(6).unwrap_or_default(),
                         updated_at: row.get(7).unwrap_or_default(),
                         interrupted_at: None,
+                        paused_at: None,
                         resumable: false,
                         desktop_sessions: vec![],
                         session_id: None,
@@ -5753,6 +6422,10 @@ impl MissionStore for SqliteMissionStore {
                         goal_mode: false,
                         goal_objective: None,
                         first_viewed_at: None,
+                        scheduling: Default::default(),
+                        project: MissionProject::default(),
+                        activity: MissionActivity::default(),
+                        awaiting_kind: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -9111,6 +9784,258 @@ impl MissionStore for SqliteMissionStore {
         .await
         .map_err(|e| e.to_string())?
     }
+
+    // ---- Task board ------------------------------------------------------
+
+    async fn upsert_board_tasks(
+        &self,
+        boss_mission_id: Uuid,
+        tasks: Vec<NewBoardTask>,
+    ) -> Result<Vec<BoardTask>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let now = now_string();
+            let mut out = Vec::with_capacity(tasks.len());
+            for t in tasks {
+                let existing: Option<(String, String)> = conn
+                    .query_row(
+                        "SELECT id, status FROM board_tasks WHERE boss_mission_id = ?1 AND task_key = ?2",
+                        params![boss_mission_id.to_string(), t.task_key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Failed to look up board task: {e}"))?;
+
+                let depends_on_json = serde_json::to_string(&t.depends_on)
+                    .map_err(|e| format!("Failed to serialize depends_on: {e}"))?;
+
+                let row_id = match existing {
+                    Some((id, status)) if status == "pending" => {
+                        conn.execute(
+                            "UPDATE board_tasks SET title = ?1, prompt = ?2, backend = ?3, \
+                             model_override = ?4, model_effort = ?5, working_directory = ?6, \
+                             depends_on = ?7, updated_at = ?8 WHERE id = ?9",
+                            params![
+                                t.title,
+                                t.prompt,
+                                t.backend,
+                                t.model_override,
+                                t.model_effort,
+                                t.working_directory,
+                                depends_on_json,
+                                now,
+                                id,
+                            ],
+                        )
+                        .map_err(|e| format!("Failed to update board task: {e}"))?;
+                        id
+                    }
+                    Some((id, _)) => id, // non-pending: leave untouched
+                    None => {
+                        let id = Uuid::new_v4().to_string();
+                        conn.execute(
+                            "INSERT INTO board_tasks (id, boss_mission_id, task_key, title, prompt, \
+                             backend, model_override, model_effort, working_directory, depends_on, \
+                             status, attempts, created_at, updated_at) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', 0, ?11, ?11)",
+                            params![
+                                id,
+                                boss_mission_id.to_string(),
+                                t.task_key,
+                                t.title,
+                                t.prompt,
+                                t.backend,
+                                t.model_override,
+                                t.model_effort,
+                                t.working_directory,
+                                depends_on_json,
+                                now,
+                            ],
+                        )
+                        .map_err(|e| format!("Failed to insert board task: {e}"))?;
+                        id
+                    }
+                };
+
+                let task = conn
+                    .query_row(
+                        &format!("SELECT {BOARD_TASK_COLUMNS} FROM board_tasks WHERE id = ?1"),
+                        params![row_id],
+                        parse_board_task_row,
+                    )
+                    .map_err(|e| format!("Failed to re-read board task: {e}"))?;
+                out.push(task);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn list_board_tasks(&self, boss_mission_id: Uuid) -> Result<Vec<BoardTask>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {BOARD_TASK_COLUMNS} FROM board_tasks \
+                     WHERE boss_mission_id = ?1 ORDER BY created_at ASC, task_key ASC"
+                ))
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![boss_mission_id.to_string()], parse_board_task_row)
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT boss_mission_id FROM board_tasks \
+                     WHERE status IN ('pending', 'running', 'settled')",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            for r in rows {
+                let s = r.map_err(|e| e.to_string())?;
+                if let Ok(id) = Uuid::parse_str(&s) {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn get_board_task(&self, task_id: Uuid) -> Result<Option<BoardTask>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                &format!("SELECT {BOARD_TASK_COLUMNS} FROM board_tasks WHERE id = ?1"),
+                params![task_id.to_string()],
+                parse_board_task_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn get_board_task_by_worker(
+        &self,
+        worker_mission_id: Uuid,
+    ) -> Result<Option<BoardTask>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                &format!(
+                    "SELECT {BOARD_TASK_COLUMNS} FROM board_tasks \
+                     WHERE worker_mission_id = ?1 ORDER BY updated_at DESC LIMIT 1"
+                ),
+                params![worker_mission_id.to_string()],
+                parse_board_task_row,
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+
+    async fn save_board_task(&self, task: &BoardTask) -> Result<(), String> {
+        let conn = self.conn.clone();
+        let t = task.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let depends_on_json = serde_json::to_string(&t.depends_on)
+                .map_err(|e| format!("Failed to serialize depends_on: {e}"))?;
+            let updated = conn
+                .execute(
+                    "UPDATE board_tasks SET task_key = ?1, title = ?2, prompt = ?3, backend = ?4, \
+                     model_override = ?5, model_effort = ?6, working_directory = ?7, depends_on = ?8, \
+                     status = ?9, outcome = ?10, worker_mission_id = ?11, attempts = ?12, \
+                     result_digest = ?13, notes = ?14, updated_at = ?15 WHERE id = ?16",
+                    params![
+                        t.task_key,
+                        t.title,
+                        t.prompt,
+                        t.backend,
+                        t.model_override,
+                        t.model_effort,
+                        t.working_directory,
+                        depends_on_json,
+                        t.status.to_string(),
+                        t.outcome.map(|o| o.to_string()),
+                        t.worker_mission_id.map(|id| id.to_string()),
+                        t.attempts as i64,
+                        t.result_digest,
+                        t.notes,
+                        now_string(),
+                        t.id.to_string(),
+                    ],
+                )
+                .map_err(|e| format!("Failed to save board task: {e}"))?;
+            if updated == 0 {
+                return Err(format!("Board task {} not found", t.id));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    }
+}
+
+/// Column list shared by every board task SELECT so `parse_board_task_row`
+/// indices stay in sync.
+const BOARD_TASK_COLUMNS: &str = "id, boss_mission_id, task_key, title, prompt, backend, \
+    model_override, model_effort, working_directory, depends_on, status, outcome, \
+    worker_mission_id, attempts, result_digest, notes, created_at, updated_at";
+
+fn parse_board_task_row(row: &rusqlite::Row<'_>) -> Result<BoardTask, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let boss_mission_id: String = row.get(1)?;
+    let depends_on_json: String = row.get(9)?;
+    let status_str: String = row.get(10)?;
+    let outcome_str: Option<String> = row.get(11)?;
+    let worker_mission_id: Option<String> = row.get(12)?;
+    let attempts: i64 = row.get(13)?;
+    Ok(BoardTask {
+        id: Uuid::parse_str(&id)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+        boss_mission_id: Uuid::parse_str(&boss_mission_id)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+        task_key: row.get(2)?,
+        title: row.get(3)?,
+        prompt: row.get(4)?,
+        backend: row.get(5)?,
+        model_override: row.get(6)?,
+        model_effort: row.get(7)?,
+        working_directory: row.get(8)?,
+        depends_on: serde_json::from_str(&depends_on_json).unwrap_or_default(),
+        status: BoardTaskStatus::parse(&status_str).unwrap_or(BoardTaskStatus::Pending),
+        outcome: outcome_str.as_deref().and_then(BoardTaskOutcome::parse),
+        worker_mission_id: worker_mission_id.and_then(|s| Uuid::parse_str(&s).ok()),
+        attempts: attempts as u32,
+        result_digest: row.get(14)?,
+        notes: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+    })
 }
 
 fn telegram_user_role_to_str(role: TelegramUserRole) -> &'static str {
@@ -9643,10 +10568,10 @@ mod tests {
     };
     use crate::api::control::AgentEvent;
     use crate::api::mission_store::{
-        now_string, Automation, AutomationDriver, CommandSource, FreshSession, MissionMode,
-        MissionStatus, MissionStore, PalomaCooldownState, PalomaDecision, PalomaMissionCard,
-        PalomaSchedulerJob, PalomaUserPreferences, RetryConfig, StopPolicy, TelegramAlert,
-        TelegramAlertPreference, TelegramChannel, TelegramConversation,
+        now_string, Automation, AutomationDriver, AwaitingKind, CommandSource, FreshSession,
+        MissionMode, MissionProjectPatch, MissionStatus, MissionStore, PalomaCooldownState,
+        PalomaDecision, PalomaMissionCard, PalomaSchedulerJob, PalomaUserPreferences, RetryConfig,
+        StopPolicy, TelegramAlert, TelegramAlertPreference, TelegramChannel, TelegramConversation,
         TelegramConversationMessage, TelegramConversationMessageDirection,
         TelegramMissionInterestLevel, TelegramMissionSubscription, TelegramStructuredMemoryEntry,
         TelegramStructuredMemoryKind, TelegramStructuredMemoryScope, TelegramTriggerMode,
@@ -10651,6 +11576,187 @@ mod tests {
         assert_eq!(mission.metadata_version, None);
     }
 
+    /// Regression for the #572 incident: a global store and the per-user store
+    /// open the same DB file and run migrations concurrently at startup. The
+    /// `github_pr` INTEGER→TEXT conversion's DROP must NOT fail the store init
+    /// when a racing init already dropped/re-added the column — otherwise the
+    /// service silently falls back to an in-memory store and loses visibility of
+    /// every persisted mission.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_init_on_integer_github_pr_does_not_fall_back() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let base = temp_dir.path().to_path_buf();
+
+        // Seed a DB, then force it into the pre-#572 shape: github_pr is INTEGER
+        // and the newer columns are absent.
+        {
+            let store = SqliteMissionStore::new(base.clone(), "race")
+                .await
+                .expect("seed store");
+            drop(store);
+            let db = base.join("missions-race.db");
+            let conn = rusqlite::Connection::open(&db).expect("open seed");
+            conn.execute("ALTER TABLE missions DROP COLUMN github_pr", [])
+                .expect("drop text github_pr");
+            conn.execute("ALTER TABLE missions ADD COLUMN github_pr INTEGER", [])
+                .expect("re-add integer github_pr");
+            conn.execute("ALTER TABLE missions DROP COLUMN desired_state", [])
+                .ok();
+            conn.execute("ALTER TABLE missions DROP COLUMN next_check_at", [])
+                .ok();
+        }
+
+        // Two concurrent initializations on the SAME db file — both must succeed.
+        let h1 = {
+            let p = base.clone();
+            tokio::spawn(async move { SqliteMissionStore::new(p, "race").await.map(|_| ()) })
+        };
+        let h2 = {
+            let p = base.clone();
+            tokio::spawn(async move { SqliteMissionStore::new(p, "race").await.map(|_| ()) })
+        };
+        let (r1, r2) = tokio::join!(h1, h2);
+        assert!(
+            r1.expect("join1").is_ok(),
+            "concurrent init 1 must not fail (would fall back to in-memory)"
+        );
+        assert!(
+            r2.expect("join2").is_ok(),
+            "concurrent init 2 must not fail (would fall back to in-memory)"
+        );
+
+        // github_pr is TEXT and the new columns exist after the race.
+        let db = base.join("missions-race.db");
+        let conn = rusqlite::Connection::open(&db).expect("open verify");
+        let ty: String = conn
+            .query_row(
+                "SELECT type FROM pragma_table_info('missions') WHERE name = 'github_pr'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("github_pr column present");
+        assert_eq!(ty.to_uppercase(), "TEXT");
+        for col in ["desired_state", "next_check_at"] {
+            let exists: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = ?1")
+                .unwrap()
+                .exists([col])
+                .unwrap();
+            assert!(
+                exists,
+                "{} column must exist after concurrent migration",
+                col
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn project_metadata_and_awaiting_kind_roundtrip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Tagged"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        // Fresh mission has no project metadata or awaiting_kind.
+        assert!(mission.project.is_empty());
+        assert_eq!(mission.awaiting_kind, None);
+
+        store
+            .update_mission_project(
+                mission.id,
+                MissionProjectPatch {
+                    project: Some(Some("verity-core".to_string())),
+                    track: Some(Some("C3-bridge-collapse".to_string())),
+                    intent: Some(Some("review_merge_pr".to_string())),
+                    github_pr: Some(Some("lfglabs-dev/verity#2070".to_string())),
+                    tags: Some(vec!["c3".to_string(), "blocking".to_string()]),
+                    desired_state: Some(Some("waiting_ci".to_string())),
+                    next_check_at: Some(Some("2026-07-01T00:00:00Z".to_string())),
+                },
+            )
+            .await
+            .expect("set project");
+
+        let fetched = store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.project.project.as_deref(), Some("verity-core"));
+        assert_eq!(fetched.project.track.as_deref(), Some("C3-bridge-collapse"));
+        assert_eq!(fetched.project.intent.as_deref(), Some("review_merge_pr"));
+        assert_eq!(
+            fetched.project.github_pr.as_deref(),
+            Some("lfglabs-dev/verity#2070")
+        );
+        assert_eq!(fetched.project.tags, vec!["c3", "blocking"]);
+        assert_eq!(fetched.project.desired_state.as_deref(), Some("waiting_ci"));
+        assert_eq!(
+            fetched.project.next_check_at.as_deref(),
+            Some("2026-07-01T00:00:00Z")
+        );
+
+        // Partial update leaves untouched fields intact and can clear one.
+        store
+            .update_mission_project(
+                mission.id,
+                MissionProjectPatch {
+                    project: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("clear project");
+        let fetched = store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.project.project, None);
+        assert_eq!(fetched.project.track.as_deref(), Some("C3-bridge-collapse"));
+        assert_eq!(
+            fetched.project.github_pr.as_deref(),
+            Some("lfglabs-dev/verity#2070")
+        );
+        assert_eq!(fetched.project.desired_state.as_deref(), Some("waiting_ci"));
+        assert_eq!(fetched.project.tags, vec!["c3", "blocking"]);
+
+        // awaiting_kind persists, and is cleared on a status change away from
+        // AwaitingUser.
+        store
+            .set_mission_awaiting_kind(mission.id, Some(AwaitingKind::Decision))
+            .await
+            .expect("set kind");
+        store
+            .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+            .await
+            .expect("awaiting status");
+        let fetched = store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.awaiting_kind, Some(AwaitingKind::Decision));
+
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("active status");
+        let fetched = store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            fetched.awaiting_kind, None,
+            "awaiting_kind must clear when leaving AwaitingUser"
+        );
+    }
+
     #[tokio::test]
     async fn update_mission_title_marks_user_metadata_source() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -11232,6 +12338,7 @@ mod tests {
                     content: "B".to_string(),
                     queued: true,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11254,6 +12361,7 @@ mod tests {
                     content: "A".to_string(),
                     queued: false,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11286,6 +12394,7 @@ mod tests {
                     content: "B".to_string(),
                     queued: false,
                     mission_id: Some(mission.id),
+                    source: None,
                 },
             )
             .await
@@ -11329,6 +12438,59 @@ mod tests {
                 ("user".to_string(), "B".to_string()),
                 ("assistant".to_string(), "reply B".to_string()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn user_message_source_is_persisted_in_metadata() {
+        use crate::api::control::AgentEvent;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(
+                Some("source attribution"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission");
+
+        store
+            .log_event(
+                mission.id,
+                &AgentEvent::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: "hello".to_string(),
+                    queued: false,
+                    mission_id: Some(mission.id),
+                    source: Some("api:user-123".to_string()),
+                },
+            )
+            .await
+            .expect("user message with source");
+
+        let events = store
+            .get_events(mission.id, None, None, None)
+            .await
+            .expect("events");
+        let user_event = events
+            .iter()
+            .find(|e| e.event_type == "user_message")
+            .expect("user_message row");
+        // The persisted metadata JSON is the forensic record of who/what posted
+        // this message — it must carry the attribution source.
+        assert_eq!(
+            user_event.metadata.get("source").and_then(|v| v.as_str()),
+            Some("api:user-123"),
+            "persisted metadata should contain the attribution source, got {}",
+            user_event.metadata
         );
     }
 
@@ -12423,6 +13585,7 @@ mod tests {
                         content: format!("msg {i}"),
                         queued: false,
                         mission_id: Some(mission.id),
+                        source: None,
                     },
                 )
                 .await
@@ -12522,6 +13685,7 @@ mod tests {
                         content: format!("msg {i}"),
                         queued: false,
                         mission_id: Some(mission.id),
+                        source: None,
                     },
                 )
                 .await
@@ -13120,5 +14284,167 @@ mod tests {
             .await
             .expect("filtered");
         assert!(filtered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn board_tasks_roundtrip() {
+        use crate::api::mission_store::{BoardTaskOutcome, BoardTaskStatus, NewBoardTask};
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("store");
+
+        let boss = store
+            .create_mission(Some("boss"), None, None, None, None, None, None)
+            .await
+            .expect("boss mission");
+
+        let new = |key: &str, deps: Vec<&str>| NewBoardTask {
+            task_key: key.to_string(),
+            title: format!("title-{key}"),
+            prompt: format!("prompt-{key}"),
+            backend: "codex".to_string(),
+            model_override: Some("gpt-5.5".to_string()),
+            model_effort: Some("high".to_string()),
+            working_directory: Some("/workspaces/x/wt-1".to_string()),
+            depends_on: deps.into_iter().map(String::from).collect(),
+        };
+
+        let tasks = store
+            .upsert_board_tasks(boss.id, vec![new("t1", vec![]), new("t2", vec!["t1"])])
+            .await
+            .expect("upsert");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].status, BoardTaskStatus::Pending);
+        assert_eq!(tasks[1].depends_on, vec!["t1".to_string()]);
+
+        // Active boards includes our boss.
+        let active = store.list_active_board_missions().await.expect("active");
+        assert_eq!(active, vec![boss.id]);
+
+        // Bind t1 to a worker, settle it, look it up by worker.
+        let worker = Uuid::new_v4();
+        let mut t1 = tasks[0].clone();
+        t1.worker_mission_id = Some(worker);
+        t1.status = BoardTaskStatus::Running;
+        t1.attempts = 1;
+        store.save_board_task(&t1).await.expect("save running");
+
+        let by_worker = store
+            .get_board_task_by_worker(worker)
+            .await
+            .expect("by worker")
+            .expect("found");
+        assert_eq!(by_worker.task_key, "t1");
+
+        let mut settled = by_worker;
+        settled.status = BoardTaskStatus::Settled;
+        settled.outcome = Some(BoardTaskOutcome::Success);
+        settled.result_digest = Some("did the thing".to_string());
+        store.save_board_task(&settled).await.expect("save settled");
+
+        let listed = store.list_board_tasks(boss.id).await.expect("list");
+        let t1 = listed.iter().find(|t| t.task_key == "t1").unwrap();
+        assert_eq!(t1.status, BoardTaskStatus::Settled);
+        assert_eq!(t1.outcome, Some(BoardTaskOutcome::Success));
+        assert_eq!(t1.result_digest.as_deref(), Some("did the thing"));
+
+        // Upserting an existing pending task updates it; settled stays.
+        let updated = store
+            .upsert_board_tasks(boss.id, vec![new("t2", vec![]), new("t1", vec![])])
+            .await
+            .expect("upsert again");
+        let t2 = updated.iter().find(|t| t.task_key == "t2").unwrap();
+        assert!(t2.depends_on.is_empty(), "pending task should be updated");
+        let t1 = updated.iter().find(|t| t.task_key == "t1").unwrap();
+        assert_eq!(
+            t1.status,
+            BoardTaskStatus::Settled,
+            "settled task must not be reset by upsert"
+        );
+
+        // get_board_task by id.
+        let fetched = store
+            .get_board_task(t2.id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(fetched.task_key, "t2");
+    }
+
+    /// FLEET-001: deferred goals round-trip and the scheduled-pending query
+    /// surfaces only Pending missions that carry a goal, with scheduling fields
+    /// populated (verifies the SELECT column indices).
+    #[tokio::test]
+    async fn deferred_goal_and_scheduled_pending_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Scheduled"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+        store
+            .set_mission_scheduling(
+                mission.id,
+                &crate::api::mission_store::MissionScheduling {
+                    priority: 7,
+                    not_before: Some("2099-01-01T00:00:00Z".to_string()),
+                    deadline: Some("2099-02-01T00:00:00Z".to_string()),
+                },
+            )
+            .await
+            .expect("set scheduling");
+
+        // No goal yet -> not scheduled-pending.
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+
+        store
+            .set_deferred_goal(mission.id, Some("run the report".to_string()))
+            .await
+            .expect("set goal");
+        assert_eq!(
+            store
+                .get_deferred_goal(mission.id)
+                .await
+                .expect("get")
+                .as_deref(),
+            Some("run the report")
+        );
+
+        let pending = store.get_scheduled_pending_missions().await.expect("list");
+        assert_eq!(pending.len(), 1);
+        let m = &pending[0];
+        assert_eq!(m.id, mission.id);
+        assert_eq!(m.scheduling.priority, 7);
+        assert_eq!(
+            m.scheduling.not_before.as_deref(),
+            Some("2099-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            m.scheduling.deadline.as_deref(),
+            Some("2099-02-01T00:00:00Z")
+        );
+
+        // Clearing the goal removes it from the scheduled-pending set.
+        store
+            .set_deferred_goal(mission.id, None)
+            .await
+            .expect("clear");
+        assert!(store
+            .get_deferred_goal(mission.id)
+            .await
+            .expect("get")
+            .is_none());
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
     }
 }

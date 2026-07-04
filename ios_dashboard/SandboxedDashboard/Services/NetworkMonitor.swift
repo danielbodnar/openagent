@@ -192,8 +192,12 @@ final class NetworkMonitor {
             state = .reconnecting(attempt: attempt)
             return
         }
-        let staleness = Date().timeIntervalSince(lastStreamActivity)
-        if staleness > Self.staleAfter || healthFailures > 0 {
+        // A silent stream alone is not "degraded" — quiet missions and
+        // sparse server heartbeats legitimately exceed `staleAfter`, and the
+        // banner flashing "Slow connection" on a healthy link erodes trust.
+        // Staleness only *triggers* health probes; the banner waits for a
+        // probe to actually fail.
+        if healthFailures > 0 {
             state = .degraded
             return
         }

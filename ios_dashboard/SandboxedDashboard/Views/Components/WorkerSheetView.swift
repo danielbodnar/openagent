@@ -12,24 +12,18 @@ struct WorkerSheetView: View {
     let workers: [Mission]
     let runningWorkers: [RunningMissionInfo]
     @State private var peekingWorker: Mission?
+    // Completed workers are terminal and never reused, so they start collapsed
+    // to keep the focus on what's still in flight.
+    @State private var showCompleted = false
 
-    private var activeWorkers: [Mission] {
-        workers.filter { m in
-            m.status == .active || m.status == .pending || m.status == .awaitingUser ||
-            runningWorkers.contains { $0.missionId == m.id }
-        }
+    private var buckets: WorkerBuckets {
+        WorkerBuckets(workers: workers, runningWorkers: runningWorkers)
     }
 
-    private var completedWorkers: [Mission] {
-        workers.filter { $0.status == .completed || $0.status == .acknowledged }
-    }
-
-    private var failedWorkers: [Mission] {
-        workers.filter { m in
-            m.status == .failed || m.status == .notFeasible ||
-            m.status == .interrupted || m.status == .blocked
-        }
-    }
+    private var activeWorkers: [Mission] { buckets.active }
+    private var waitingWorkers: [Mission] { buckets.waiting }
+    private var completedWorkers: [Mission] { buckets.done }
+    private var failedWorkers: [Mission] { buckets.failed }
 
     var body: some View {
         NavigationStack {
@@ -38,19 +32,31 @@ struct WorkerSheetView: View {
                     // Summary cards
                     summaryRow
 
+                    if !workers.isEmpty {
+                        Text("\(workers.count) sub-mission\(workers.count == 1 ? "" : "s") spawned in total. Completed ones have finished and are not reused.")
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textMuted)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
                     // Active workers
                     if !activeWorkers.isEmpty {
                         workerSection("Running", icon: "bolt.fill", tint: Theme.accent, missions: activeWorkers)
                     }
 
-                    // Completed workers
-                    if !completedWorkers.isEmpty {
-                        workerSection("Completed", icon: "checkmark.circle.fill", tint: Theme.success, missions: completedWorkers)
+                    // Waiting on user input
+                    if !waitingWorkers.isEmpty {
+                        workerSection("Waiting", icon: "hourglass", tint: Theme.info, missions: waitingWorkers)
                     }
 
-                    // Failed workers
+                    // Failed workers (actionable — surfaced before completed)
                     if !failedWorkers.isEmpty {
                         workerSection("Failed", icon: "xmark.circle.fill", tint: Theme.error, missions: failedWorkers)
+                    }
+
+                    // Completed workers — collapsed by default (terminal noise).
+                    if !completedWorkers.isEmpty {
+                        collapsibleCompletedSection
                     }
 
                     if workers.isEmpty {
@@ -81,14 +87,19 @@ struct WorkerSheetView: View {
                 tint: Theme.accent
             )
             summaryCard(
-                count: completedWorkers.count,
-                label: "Done",
-                tint: Theme.success
+                count: waitingWorkers.count,
+                label: "Waiting",
+                tint: Theme.info
             )
             summaryCard(
                 count: failedWorkers.count,
                 label: "Failed",
                 tint: Theme.error
+            )
+            summaryCard(
+                count: completedWorkers.count,
+                label: "Done",
+                tint: Theme.success
             )
         }
     }
@@ -108,11 +119,48 @@ struct WorkerSheetView: View {
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(count > 0 ? tint.opacity(0.15) : Theme.borderSubtle, lineWidth: 1)
+                .fill(Theme.surfaceSheen)
+                .allowsHitTesting(false)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(count > 0 ? tint.opacity(0.18) : Theme.borderSubtle, lineWidth: 0.5)
         )
     }
 
     // MARK: - Sections
+
+    private var collapsibleCompletedSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                HapticService.lightTap()
+                withAnimation(.snappy) { showCompleted.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Theme.success)
+                    Text("Completed")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                    Text("(\(completedWorkers.count))")
+                        .font(.caption)
+                        .foregroundStyle(Theme.textMuted)
+                    Spacer()
+                    Image(systemName: showCompleted ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.textMuted)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if showCompleted {
+                ForEach(completedWorkers) { mission in
+                    workerRow(mission)
+                }
+            }
+        }
+    }
 
     private func workerSection(_ title: String, icon: String, tint: Color, missions: [Mission]) -> some View {
         VStack(alignment: .leading, spacing: 8) {

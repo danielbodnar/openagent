@@ -419,7 +419,9 @@ select:focus-visible {
   [class~="text-amber-400/80"],
   [class~="text-amber-400/70"],
   [class~="text-amber-400/60"],
+  [class~="text-amber-300/90"],
   [class~="text-amber-300/80"],
+  [class~="text-amber-200/90"],
   [class~="text-amber-200/80"],
   [class~="text-amber-500/70"],
   [class~="text-amber-500/50"] {

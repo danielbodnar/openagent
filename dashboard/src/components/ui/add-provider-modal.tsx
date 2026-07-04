@@ -19,6 +19,7 @@ import {
 const providerIcons: Record<string, string> = {
   anthropic: '🧠',
   openai: '🤖',
+  'open-router': '🔀',
   google: '🔮',
   'deep-infra': '🚀',
   cerebras: '🧬',
@@ -28,6 +29,7 @@ const providerIcons: Record<string, string> = {
   zai: '⚡',
   xai: '𝕏',
   minimax: 'M',
+  kimi: '🌙',
   custom: '🔧',
 };
 
@@ -75,6 +77,15 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
         description: 'Use your grok.com account through Grok Build',
       },
       { label: 'Enter API Key', type: 'api', description: 'Use an existing xAI API key' },
+    ];
+  }
+  if (providerType === 'kimi') {
+    return [
+      {
+        label: 'Kimi Code (Device OAuth)',
+        type: 'oauth',
+        description: 'Authorize your Kimi Code subscription via device-code login',
+      },
     ];
   }
   return [];
@@ -145,6 +156,33 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [handleClose, open, loading]);
 
+  // Auto-poll the Kimi device-code flow so the user doesn't have to keep
+  // clicking Connect: the backend returns "not connected yet" until the
+  // browser authorization completes, at which point this resolves.
+  useEffect(() => {
+    if (step !== 'oauth-callback') return;
+    if (oauthResponse?.method !== 'auto') return;
+    if (selectedProvider !== 'kimi' || selectedMethodIndex === null) return;
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      if (cancelled || loading) return;
+      try {
+        await oauthCallback(selectedProvider, selectedMethodIndex, '');
+        if (cancelled) return;
+        clearInterval(interval);
+        toast.success('Provider connected');
+        onSuccess();
+        onClose();
+      } catch {
+        // Still pending — keep polling until the user finishes in the browser.
+      }
+    }, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [step, oauthResponse, selectedProvider, selectedMethodIndex, loading, onSuccess, onClose]);
+
   // Handle click outside
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -171,8 +209,11 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     const methods = getProviderAuthMethods(providerType);
 
     // Default backend targeting by provider (may be adjusted after method selection).
+    // Mirror the server's `default_backends_for_provider` (src/api/ai_providers.rs):
+    // Anthropic targets BOTH opencode and claudecode by default — Claude Code is the
+    // primary Anthropic backend, so it must be preselected, not just opencode.
     if (providerType === 'anthropic') {
-      setSelectedBackends(['opencode']);
+      setSelectedBackends(['opencode', 'claudecode']);
     } else if (providerType === 'openai') {
       setSelectedBackends(['opencode', 'codex']);
     } else if (providerType === 'google') {
@@ -202,6 +243,9 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     // Providers that support multiple backends should select targeting first.
     if (selectedProvider === 'anthropic' || selectedProvider === 'openai' || selectedProvider === 'google' || selectedProvider === 'xai') {
       // For OpenAI, default backends depend on auth method.
+      if (selectedProvider === 'anthropic') {
+        setSelectedBackends(['opencode', 'claudecode']);
+      }
       if (selectedProvider === 'openai') {
         setSelectedBackends(['opencode', 'codex']);
       }
@@ -753,6 +797,12 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                   {loading ? <Loader className="h-4 w-4 animate-spin mx-auto" /> : 'Connect'}
                 </button>
               </div>
+              {oauthResponse.method === 'auto' && selectedProvider === 'kimi' && (
+                <div className="flex items-center gap-2 text-xs text-white/40">
+                  <Loader className="h-3 w-3 animate-spin" />
+                  Waiting for authorization in your browser…
+                </div>
+              )}
             </div>
           )}
 

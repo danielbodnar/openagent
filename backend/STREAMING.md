@@ -203,4 +203,4 @@ canonical row rather than the op log.
   reference implementation of the continuation rule.
 - `src/api/control_metrics.rs` records p50/p99 SSE chunk sizes so we
   can spot regressions in the streaming contract.
-- `src/api/control.rs::stream()` is the server-side mission filter.
+- `src/api/control/mod.rs::stream()` is the server-side mission filter.

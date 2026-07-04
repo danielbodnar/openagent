@@ -729,8 +729,13 @@ exec "$SCRIPT_DIR/.sandboxed-sh-telegram-action.py" "$@"
     }
 }
 
-const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
-const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 5;
+// Max concurrent Codex turns per account, enforced by a per-account semaphore.
+// Raised 5 -> 10 (operator decision) to widen the effective Codex ceiling
+// (accounts x limit) and reduce "all accounts at capacity" when many board
+// workers want Codex at once. Higher values risk upstream rate-limiting per
+// ChatGPT/OpenAI account.
+const CODEX_ACCOUNT_CONCURRENCY_LIMIT: usize = 10;
+const CODEX_OAUTH_ACCOUNT_CONCURRENCY_LIMIT: usize = 10;
 const CODEX_ACCOUNT_LEASE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 static CODEX_ACCOUNT_POOL: LazyLock<StdMutex<HashMap<String, Arc<Semaphore>>>> =
@@ -1398,10 +1403,22 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
     }
 }
 
-/// Strip `<think>...</think>` tags from text output.
-/// Some models (e.g. Minimax, DeepSeek) emit internal reasoning inside inline
-/// `<think>` tags that should not be shown in the text output.
+/// Thinking tag pairs leaked into text output by various models:
+/// `<think>` (DeepSeek, GLM) and `<mm:think>` (MiniMax-M3).
+const THINK_TAG_PAIRS: [(&str, &str); 2] = [("<think>", "</think>"), ("<mm:think>", "</mm:think>")];
+
+/// Strip `<think>...</think>` / `<mm:think>...</mm:think>` tags from text
+/// output. Some models (e.g. Minimax, DeepSeek) emit internal reasoning
+/// inside inline thinking tags that should not be shown in the text output.
 pub(crate) fn strip_think_tags(text: &str) -> String {
+    let mut out = text.to_string();
+    for (open, close) in THINK_TAG_PAIRS {
+        out = strip_think_tags_pair(&out, open, close);
+    }
+    out
+}
+
+fn strip_think_tags_pair(text: &str, open_tag: &str, close_tag: &str) -> String {
     // Case-insensitive search directly on the original text to avoid
     // byte-offset misalignment from to_lowercase() on non-ASCII input.
     fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -1415,7 +1432,7 @@ pub(crate) fn strip_think_tags(text: &str) -> String {
             .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
     }
 
-    if find_ci(text, "<think>").is_none() {
+    if find_ci(text, open_tag).is_none() {
         return text.to_string();
     }
 
@@ -1423,21 +1440,21 @@ pub(crate) fn strip_think_tags(text: &str) -> String {
     let mut pos = 0;
 
     while pos < text.len() {
-        if let Some(rel_start) = find_ci(&text[pos..], "<think>") {
+        if let Some(rel_start) = find_ci(&text[pos..], open_tag) {
             let abs_start = pos + rel_start;
-            // find_ci searches for ASCII "<think>", so abs_start always lands on
+            // find_ci searches for an ASCII tag, so abs_start always lands on
             // a char boundary (the `<` byte). No boundary walk-back needed.
             result.push_str(&text[pos..abs_start]);
 
-            let after_open = abs_start + 7; // "<think>" is 7 ASCII bytes
+            let after_open = abs_start + open_tag.len();
             if after_open <= text.len() {
-                if let Some(rel_close) = find_ci(&text[after_open..], "</think>") {
-                    pos = after_open + rel_close + 8; // "</think>" is 8 ASCII bytes — always safe
+                if let Some(rel_close) = find_ci(&text[after_open..], close_tag) {
+                    pos = after_open + rel_close + close_tag.len();
                 } else {
-                    break; // unclosed tag: drop everything from <think> onwards
+                    break; // unclosed tag: drop everything from the opener onwards
                 }
             } else {
-                break; // unclosed tag: drop everything from <think> onwards
+                break; // unclosed tag: drop everything from the opener onwards
             }
         } else {
             result.push_str(&text[pos..]);
@@ -1448,11 +1465,28 @@ pub(crate) fn strip_think_tags(text: &str) -> String {
     result
 }
 
-/// Extract text inside `<think>...</think>` tags. Handles unclosed tags
-/// (the trailing unclosed opener is included verbatim) and multiple blocks
-/// (concatenated in order, separated by a single newline so callers can
-/// distinguish boundaries; trim will absorb the joiner's whitespace).
+/// Extract text inside `<think>...</think>` / `<mm:think>...</mm:think>`
+/// tags. Handles unclosed tags (the trailing unclosed opener is included
+/// verbatim) and multiple blocks (concatenated in order, separated by a
+/// single newline so callers can distinguish boundaries; trim will absorb
+/// the joiner's whitespace).
 pub(crate) fn extract_think_content(text: &str) -> Option<String> {
+    let mut combined: Option<String> = None;
+    for (open, close) in THINK_TAG_PAIRS {
+        if let Some(part) = extract_think_content_pair(text, open, close) {
+            match combined.as_mut() {
+                Some(acc) => {
+                    acc.push('\n');
+                    acc.push_str(&part);
+                }
+                None => combined = Some(part),
+            }
+        }
+    }
+    combined
+}
+
+fn extract_think_content_pair(text: &str, open_tag: &str, close_tag: &str) -> Option<String> {
     fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
         let needle_len = needle.len();
         if haystack.len() < needle_len {
@@ -1464,32 +1498,29 @@ pub(crate) fn extract_think_content(text: &str) -> Option<String> {
             .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
     }
 
-    const OPEN_TAG: &str = "<think>";
-    const CLOSE_TAG: &str = "</think>";
-
     // Walk every `<think>` opener in order. For each one, take everything up
     // to the next `</think>` (or to the end of the string if the close tag
     // is missing — the model streamed the tag header but not the footer yet).
     let mut combined = String::new();
     let mut cursor = 0usize;
     let mut found_any = false;
-    while let Some(open) = find_ci(&text[cursor..], OPEN_TAG) {
+    while let Some(open) = find_ci(&text[cursor..], open_tag) {
         found_any = true;
         let abs_open = cursor + open;
-        let after_open = abs_open + OPEN_TAG.len();
+        let after_open = abs_open + open_tag.len();
         let scan_from = if after_open <= text.len() {
             after_open
         } else {
             text.len()
         };
-        match find_ci(&text[scan_from..], CLOSE_TAG) {
+        match find_ci(&text[scan_from..], close_tag) {
             Some(rel_close) => {
                 let abs_close = scan_from + rel_close;
                 if !combined.is_empty() {
                     combined.push('\n');
                 }
                 combined.push_str(&text[after_open..abs_close]);
-                cursor = abs_close + CLOSE_TAG.len();
+                cursor = abs_close + close_tag.len();
             }
             None => {
                 // Unclosed trailing opener: include the rest of the string
@@ -2436,7 +2467,53 @@ pub struct QueuedMessage {
     pub content: String,
     /// Optional agent override for this specific message (e.g., from @agent mention)
     pub agent: Option<String>,
+    /// Origin of the message (e.g. `api:<user_id>`, `telegram`) for audit. None
+    /// for system-generated messages (resume prompts, board wakeups).
+    pub source: Option<String>,
 }
+
+/// Environment flag gating the background-task auto-resume feature.
+///
+/// Default enabled; set `BACKGROUND_TASK_AUTORESUME=0` (or `false`/`no`/`off`)
+/// to disable. When disabled, capture and the watcher both no-op.
+pub const BACKGROUND_TASK_AUTORESUME_ENV: &str = "BACKGROUND_TASK_AUTORESUME";
+
+/// Whether the background-task auto-resume feature is enabled.
+pub fn background_task_autoresume_enabled() -> bool {
+    crate::util::env_var_bool(BACKGROUND_TASK_AUTORESUME_ENV, true)
+}
+
+/// An in-flight Claude Code background shell task (`Bash` tool with
+/// `run_in_background: true`).
+///
+/// Recorded when the CLI emits the background-start marker (see
+/// `crate::api::runners::claudecode::parse_background_task_start`) and consumed
+/// by the auto-resume watcher (`crate::api::supervision::bg_autoresume`), which
+/// which polls for completion and wakes the agent with the output once the job
+/// finishes.
+#[derive(Debug, Clone)]
+pub struct BackgroundTask {
+    /// CLI-assigned background id (e.g. `bash_1`).
+    pub id: String,
+    /// Path the CLI writes the job's combined output to (inside the workspace).
+    pub output_path: String,
+    /// The shell command that was launched, for the resume message. Best-effort
+    /// (empty if the matching tool_call wasn't observed).
+    pub command: String,
+    /// When we first observed the task start. Used for the overall timeout.
+    pub started_at: Instant,
+}
+
+/// Shared, cross-task registry of in-flight background tasks per mission.
+///
+/// The control actor (writer) records tasks here from the `ToolResult` event
+/// arm, and the supervision watcher (reader) polls and resumes from it. A
+/// shared registry is required because a mission's [`MissionRunner`] is torn
+/// down once its turn ends and the mission parks in `AwaitingUser` — exactly
+/// when the watcher needs to act — so per-runner state alone would not survive.
+///
+/// Keyed by mission id, then by background-task id.
+pub type BackgroundTaskRegistry = Arc<RwLock<HashMap<Uuid, HashMap<String, BackgroundTask>>>>;
 
 /// Isolated runner for a single mission.
 /// Info about a tracked subtask (from delegate_task/Task tool calls).
@@ -2522,6 +2599,15 @@ pub struct MissionRunner {
     /// Shared with the turn loops via Arc so they can increment/decrement
     /// without holding the runner's outer lock.
     pub active_tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+
+    /// In-flight background shell tasks started this mission (`Bash` with
+    /// `run_in_background: true`), keyed by background-task id.
+    ///
+    /// This mirrors the shared [`BackgroundTaskRegistry`], which is the source
+    /// of truth used by the auto-resume watcher (the runner is torn down when
+    /// the mission parks in `AwaitingUser`, so this field is informational and
+    /// for in-process inspection only).
+    pub background_tasks: HashMap<String, BackgroundTask>,
 }
 
 impl MissionRunner {
@@ -2561,6 +2647,7 @@ impl MissionRunner {
             working_directory: None,
             user_id: None,
             active_tool_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            background_tasks: HashMap::new(),
         }
     }
 
@@ -2636,8 +2723,19 @@ impl MissionRunner {
     }
 
     /// Queue a message for this mission.
-    pub fn queue_message(&mut self, id: Uuid, content: String, agent: Option<String>) {
-        self.queue.push_back(QueuedMessage { id, content, agent });
+    pub fn queue_message(
+        &mut self,
+        id: Uuid,
+        content: String,
+        agent: Option<String>,
+        source: Option<String>,
+    ) {
+        self.queue.push_back(QueuedMessage {
+            id,
+            content,
+            agent,
+            source,
+        });
     }
 
     /// Cancel the current execution.
@@ -2711,6 +2809,7 @@ impl MissionRunner {
         let user_id = self.user_id.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
+        let msg_source = msg.source.clone();
         tracing::info!(
             mission_id = %mission_id,
             workspace_id = %workspace_id,
@@ -2726,12 +2825,14 @@ impl MissionRunner {
             cmd_tx: mission_cmd_tx,
         };
 
-        // Emit user message event with mission context
+        // Emit user message event with mission context, preserving the original
+        // attribution (api:/telegram/…) stored on the queued message.
         let _ = events_tx.send(AgentEvent::UserMessage {
             id: msg_id,
             content: user_message.clone(),
             queued: false,
             mission_id: Some(mission_id),
+            source: msg_source,
         });
 
         let handle = tokio::spawn(async move {
@@ -3269,7 +3370,7 @@ async fn run_mission_turn(
     convo.push('\n');
 
     // Ensure mission workspace exists and is configured for OpenCode.
-    let workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+    let mut workspace = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
     if let Err(e) =
         workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &workspace).await
     {
@@ -3284,7 +3385,7 @@ async fn run_mission_turn(
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
         workspace::prepare_mission_workspace_with_skills_backend(
-            &workspace,
+            &mut workspace,
             &mcp,
             lib_ref,
             mission_id,
@@ -3292,6 +3393,7 @@ async fn run_mission_turn(
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
             boss_user_id.as_deref(),
+            Some(&config.working_dir),
         )
         .await
     };
@@ -5668,13 +5770,32 @@ pub(crate) async fn command_available(
         } else {
             args.push(format!("command -v {} 2>/dev/null", program));
         }
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
+        // Probe timeout: generous by default. Under heavy host load a
+        // systemd-run + nsenter + login-shell round trip can take >10s;
+        // with the old 8s budget every probe "failed" and a fully
+        // provisioned container was misreported as "Claude Code CLI not
+        // found and neither npm nor bun is available" (prod, 2026-06-11,
+        // load ~60 from a memory-throttled lean build).
+        let probe_timeout = std::env::var("SANDBOXED_SH_EXEC_PROBE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(probe_timeout),
             workspace_exec.output(cwd, "/bin/sh", &args, HashMap::new()),
         )
         .await
-        .ok()?
-        .ok()?;
+        {
+            Ok(result) => result.ok()?,
+            Err(_) => {
+                tracing::warn!(
+                    program = %program,
+                    timeout_secs = probe_timeout,
+                    "Workspace command probe timed out — host overloaded? Treating as unavailable"
+                );
+                return None;
+            }
+        };
         if !output.status.success() {
             return Some(false);
         }
@@ -5851,6 +5972,21 @@ fn format_exit_status(status: &std::process::ExitStatus) -> String {
     "code <unknown>".to_string()
 }
 
+fn curl_dependency_error(output: &str) -> Option<&'static str> {
+    let lower = output.to_lowercase();
+    if lower.contains("curl: not found")
+        || lower.contains("curl: command not found")
+        || lower.contains("curl: error while loading shared libraries")
+        || lower.contains("error while loading shared libraries: libcurl")
+    {
+        return Some(
+            "curl is missing or not executable in the workspace. \
+             Rebuild the workspace or install curl and ca-certificates in the workspace template.",
+        );
+    }
+    None
+}
+
 /// Check basic internet connectivity using a reliable public endpoint.
 /// This verifies the workspace has any network access at all.
 async fn check_basic_internet_connectivity(
@@ -5900,7 +6036,9 @@ async fn check_basic_internet_connectivity(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
 
-        let err = if combined.contains("Network is unreachable") {
+        let err = if let Some(message) = curl_dependency_error(&combined) {
+            format!("Workspace dependency check failed: {}", message)
+        } else if combined.contains("Network is unreachable") {
             "No internet connectivity: Network is unreachable. \
              The workspace has no network access."
                 .to_string()
@@ -6056,6 +6194,13 @@ async fn check_api_reachability(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{}{}", stdout, stderr);
+
+    if let Some(message) = curl_dependency_error(&combined) {
+        return Err(format!(
+            "Cannot connect to {} API: Workspace dependency check failed: {}",
+            api_name, message
+        ));
+    }
 
     // Check for common error patterns
     if combined.contains("Could not resolve host") {
@@ -6424,10 +6569,24 @@ async fn claude_cli_matches_desired_version(
     desired_version: &str,
 ) -> bool {
     let args = vec!["-lc".to_string(), format!("{} --version", cli_path)];
-    match workspace_exec
-        .output(cwd, "/bin/sh", &args, HashMap::new())
-        .await
+    // Bounded: an unbounded version probe was observed wedged for 51
+    // minutes on an overloaded host, stalling CLI discovery entirely.
+    let result = match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        workspace_exec.output(cwd, "/bin/sh", &args, HashMap::new()),
+    )
+    .await
     {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                cli_path,
+                "Claude CLI version probe timed out after 120s; treating as mismatch"
+            );
+            return false;
+        }
+    };
+    match result {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -7967,18 +8126,18 @@ mod tests {
         codex_final_message_looks_like_progress_update, codex_is_goal_request,
         codex_key_fingerprint, codex_missing_goal_final_response_message,
         codex_tool_stall_should_retry_with_default_model, codex_turn_requires_tool_activity,
-        custom_opencode_provider_definition, ensure_opencode_provider_for_model,
-        extract_codex_reset_window, extract_model_from_message, extract_opencode_session_id,
-        extract_part_text, extract_str, extract_think_content, is_capacity_limited_error,
-        is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper, is_opencode_session_id,
-        is_provider_payload_error, is_rate_limited_error, is_session_corruption_error,
-        is_success_path_auth_error, is_success_path_provider_payload_error,
-        is_success_path_rate_limited_error, is_tool_call_only_output,
-        opencode_goal_terminal_status, opencode_idle_timeout_result_message,
-        opencode_output_needs_fallback, opencode_session_exists_in_data_home,
-        opencode_session_token_from_line, parse_opencode_goal_objective,
-        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
-        preferred_model_for_cost, record_codex_error_message,
+        curl_dependency_error, custom_opencode_provider_definition,
+        ensure_opencode_provider_for_model, extract_codex_reset_window, extract_model_from_message,
+        extract_opencode_session_id, extract_part_text, extract_str, extract_think_content,
+        is_capacity_limited_error, is_codex_chatgpt_account_model_blocked, is_codex_node_wrapper,
+        is_opencode_session_id, is_provider_payload_error, is_rate_limited_error,
+        is_session_corruption_error, is_success_path_auth_error,
+        is_success_path_provider_payload_error, is_success_path_rate_limited_error,
+        is_tool_call_only_output, opencode_goal_terminal_status,
+        opencode_idle_timeout_result_message, opencode_output_needs_fallback,
+        opencode_session_exists_in_data_home, opencode_session_token_from_line,
+        parse_opencode_goal_objective, parse_opencode_session_token, parse_opencode_sse_event,
+        parse_opencode_stderr_text_part, preferred_model_for_cost, record_codex_error_message,
         replace_filepath_artifact_with_tool_output, running_health, sanitized_opencode_stdout,
         set_codex_account_cooldown, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
         strip_think_tags, summarize_codex_usage_caps, summarize_recent_opencode_stderr,
@@ -8002,6 +8161,28 @@ mod tests {
     use std::fs;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn curl_dependency_error_detects_missing_curl() {
+        assert!(curl_dependency_error("/bin/sh: 1: curl: not found").is_some());
+        assert!(curl_dependency_error("curl: command not found").is_some());
+    }
+
+    #[test]
+    fn curl_dependency_error_detects_broken_shared_library() {
+        assert!(
+            curl_dependency_error(
+                "curl: error while loading shared libraries: libcurl.so.4: cannot open shared object file"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn curl_dependency_error_ignores_network_failures() {
+        assert!(curl_dependency_error("curl: (7) Failed to connect to 1.1.1.1").is_none());
+        assert!(curl_dependency_error("Network is unreachable").is_none());
+    }
 
     #[test]
     fn extract_codex_reset_window_pulls_the_reset_time() {
@@ -9467,6 +9648,26 @@ mod tests {
         assert_eq!(result, "beforeafter");
     }
 
+    #[test]
+    fn strip_think_tags_removes_mm_think_blocks() {
+        // MiniMax-M3 leaks `<mm:think>` markup into assistant messages
+        // (seen in prod: assistant bubble starting with raw "<mm:think>").
+        let input = "<mm:think>internal reasoning</mm:think>visible answer";
+        assert_eq!(strip_think_tags(input), "visible answer");
+    }
+
+    #[test]
+    fn strip_think_tags_unclosed_mm_think_drops_rest() {
+        let input = "visible<mm:think>never closed";
+        assert_eq!(strip_think_tags(input), "visible");
+    }
+
+    #[test]
+    fn strip_think_tags_mixed_think_and_mm_think() {
+        let input = "a<think>1</think>b<mm:think>2</mm:think>c";
+        assert_eq!(strip_think_tags(input), "abc");
+    }
+
     // ── extract_think_content tests ───────────────────────────────────
 
     #[test]
@@ -9534,6 +9735,15 @@ mod tests {
         assert_eq!(
             extract_think_content(text).as_deref(),
             Some("mixed case reasoning")
+        );
+    }
+
+    #[test]
+    fn extract_think_content_mm_think_blocks() {
+        let text = "<mm:think>minimax reasoning</mm:think>answer";
+        assert_eq!(
+            extract_think_content(text).as_deref(),
+            Some("minimax reasoning")
         );
     }
 

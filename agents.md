@@ -136,6 +136,42 @@ The UI receives:
 
 This preserves the UI experience while keeping execution isolated per workspace.
 
+## Resource isolation (cgroups: memory + CPU)
+
+Mission work is CPU/RAM-heavy and bursty (a single mission can spawn dozens of
+parallel Lean/proof or contract builds). To keep one mission from starving the
+host, the API service, or even its own harness's response streaming, every
+mission container/exec runs in a **transient systemd scope** under
+`missions.slice` — a cgroup *sibling* of the API service (`system.slice`), not a
+child. Two tiers of caps apply:
+
+- **Aggregate (slice level, ops-owned).** `missions.slice` carries a drop-in
+  with a `CPUWeight` **lower** than `system.slice` (so missions yield CPU to the
+  API tier under contention) plus an aggregate `MemoryHigh`/`MemoryMax` and an
+  optional `CPUQuota` ceiling. This is the guarantee that the API → SSE → UI
+  path stays responsive no matter how hot the missions get. The API service
+  itself runs at a high `CPUWeight` within `system.slice`.
+- **Per-mission (scope level, code-owned).** `MissionResourceCaps`
+  (`workspace_exec.rs`) emits `MemoryMax/High/SwapMax` and `CPUWeight/CPUQuota`
+  on each scope via `systemd-run --property`. Sourced from env with a
+  per-workspace override: `MISSION_MEMORY_{MAX,HIGH,SWAP_MAX}` and
+  `MISSION_CPU_{WEIGHT,QUOTA}` (see `.env.example`). The Resources panel
+  (`POST /api/workspaces/:id/resources`) retunes running scopes live via
+  `systemctl set-property --runtime` and persists the override.
+
+Gotchas:
+- **The harness CLI and the build it spawns share one scope** (the Bash tool's
+  child), so cgroups can't separate harness from build *within* a mission — the
+  per-mission `CPUQuota` (capping the mission) and the slice tiering (capping
+  missions vs the API) are the real levers, not per-process priority.
+- **Emitting a CPU property is what delegates the `cpu` controller into
+  `missions.slice`.** Without any CPU property, `missions.slice`
+  `cgroup.subtree_control` lacks `cpu` and a per-scope `CPUQuota` is silently
+  unenforced. Only memory caps had been shipped, so on prod every slice sat at
+  the default `cpu.weight=100` and Lean fan-outs oversubscribed all cores.
+- Unset env (default) = no scope wrapping at all, so Docker installs without
+  systemd PID 1 stay on the direct path.
+
 ## Operational notes
 
 - **No central OpenCode server needed**: Missions spawn per-workspace CLI

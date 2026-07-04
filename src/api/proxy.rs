@@ -119,6 +119,28 @@ fn header_truthy(headers: &HeaderMap, key: &str) -> bool {
 // Provider Base URLs
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Client-side concurrency gate for Kimi.
+///
+/// Kimi Code subscriptions enforce a 5-hour rolling call/token budget (separate
+/// from the monthly quota), so a burst of parallel requests — e.g. a benchmark
+/// fanning out many tasks — trips upstream 429s and the account gets cooled
+/// down. Cap how many Kimi requests we have in flight so we pace into the
+/// budget instead of bursting. Excess requests wait for a slot (backpressure)
+/// rather than failing. Tunable via `KIMI_MAX_CONCURRENCY` (default 6).
+static KIMI_CONCURRENCY: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| {
+        let n = std::env::var("KIMI_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(6);
+        tracing::info!(
+            max_concurrency = n,
+            "Kimi proxy concurrency gate initialized"
+        );
+        tokio::sync::Semaphore::new(n)
+    });
+
 /// Default base URL for OpenAI-compatible providers.
 ///
 /// Returns `None` for providers that don't have an OpenAI-compatible API
@@ -136,6 +158,8 @@ fn default_base_url(provider_type: ProviderType) -> Option<&'static str> {
         ProviderType::Mistral => Some("https://api.mistral.ai/v1"),
         ProviderType::TogetherAI => Some("https://api.together.xyz/v1"),
         ProviderType::Perplexity => Some("https://api.perplexity.ai"),
+        // Kimi Code subscription endpoint (OpenAI Chat Completions compatible).
+        ProviderType::Kimi => Some("https://api.kimi.com/coding/v1"),
         ProviderType::Custom => None, // uses account's base_url
         // Non-OpenAI-compatible providers
         ProviderType::Anthropic => None,
@@ -241,7 +265,7 @@ struct ModelObject {
 ///
 /// Accepts either the internal `SANDBOXED_PROXY_SECRET` or any user-generated
 /// proxy API key from the `ProxyApiKeyStore`.
-async fn verify_proxy_auth(
+pub(crate) async fn verify_proxy_auth(
     headers: &HeaderMap,
     state: &super::routes::AppState,
 ) -> Result<(), Response> {
@@ -385,6 +409,65 @@ fn parse_direct_model_entry(model: &str) -> Option<crate::provider_health::Chain
     })
 }
 
+/// Parse a direct `provider/model` id whose prefix is a **custom** provider
+/// referenced by its sanitized name (e.g. `spark/step3p7-flash-148b`) — the id
+/// the catalog and model-routing UI expose for self-hosted OpenAI-compatible
+/// routers. Built-in prefixes are handled by [`parse_direct_model_entry`]; this
+/// only matches when no built-in type owns the prefix.
+///
+/// Returns a synthetic entry only when a configured custom provider has that
+/// sanitized name **and** advertises the model — either in its stored
+/// `custom_models` or in its live `/v1/models` catalog (so models discovered
+/// after startup still route). Returning `None` for everything else keeps typos
+/// surfacing as `model_not_found` instead of a generic cooldown error.
+async fn parse_custom_direct_model_entry(
+    state: &super::routes::AppState,
+    model: &str,
+) -> Option<crate::provider_health::ChainEntry> {
+    let (provider, rest) = model.split_once('/')?;
+    if provider.is_empty() || rest.is_empty() {
+        return None;
+    }
+    // Built-in provider prefixes are the other branch's job.
+    if crate::ai_providers::ProviderType::from_id(provider).is_some() {
+        return None;
+    }
+
+    let accounts = state
+        .ai_providers
+        .get_all_by_type(crate::ai_providers::ProviderType::Custom)
+        .await;
+    let name_matches = accounts
+        .iter()
+        .any(|a| crate::api::providers::sanitize_custom_provider_id(&a.name) == provider);
+    if !name_matches {
+        return None;
+    }
+
+    let known_in_store = accounts.iter().any(|a| {
+        crate::api::providers::sanitize_custom_provider_id(&a.name) == provider
+            && a.custom_models
+                .as_ref()
+                .map(|ms| ms.iter().any(|m| m.id == rest))
+                .unwrap_or(false)
+    });
+    let known_in_catalog = {
+        let cached = state.model_catalog.read().await;
+        cached
+            .get(provider)
+            .map(|entries| entries.iter().any(|e| e.id == rest))
+            .unwrap_or(false)
+    };
+    if known_in_store || known_in_catalog {
+        Some(crate::provider_health::ChainEntry {
+            provider_id: provider.to_string(),
+            model_id: rest.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Usage accounting
 // ─────────────────────────────────────────────────────────────────────────────
@@ -500,6 +583,9 @@ pub(crate) async fn chat_completions_inner(
     //        passthrough to that provider's first healthy configured account,
     //        no stored chain required. This lets clients reach ANY supported
     //        model, not just the predefined fallback chains.
+    //    (c) A direct "<custom-provider>/model" id where the prefix is a custom
+    //        provider's sanitized name (e.g. "spark/step3p7-flash-148b") — the
+    //        same id the catalog exposes for self-hosted routers.
     //    Anything else errors — no silent fallback, so typos surface.
     let standard_accounts = super::ai_providers::read_standard_accounts(&state.config.working_dir);
 
@@ -525,8 +611,11 @@ pub(crate) async fn chat_completions_inner(
             )
             .await;
         (id, entries)
-    } else if let Some(direct) = parse_direct_model_entry(&requested_model) {
-        // Direct provider/model passthrough (single synthetic entry).
+    } else if let Some(direct) = parse_direct_model_entry(&requested_model)
+        .or(parse_custom_direct_model_entry(&state, &requested_model).await)
+    {
+        // Direct provider/model passthrough (single synthetic entry) — either a
+        // built-in provider prefix or a custom provider's sanitized name.
         let entries = state
             .chain_store
             .resolve_entries(
@@ -580,10 +669,11 @@ pub(crate) async fn chat_completions_inner(
 
     let chain_length = entries.len() as u32;
     for (entry_idx, entry) in entries.iter().enumerate() {
-        let provider_type = match ProviderType::from_id(&entry.provider_id) {
-            Some(pt) => pt,
-            None => continue,
-        };
+        // Non-builtin prefixes are custom providers referenced by their
+        // sanitized name (e.g. "spark"); they all route as `Custom` through the
+        // OpenAI-compatible path using the account's `base_url`.
+        let provider_type =
+            ProviderType::from_id(&entry.provider_id).unwrap_or(ProviderType::Custom);
 
         // Custom providers may work without an API key (base_url only).
         // Standard providers require credentials (API key or provider OAuth).
@@ -591,6 +681,17 @@ pub(crate) async fn chat_completions_inner(
         {
             continue;
         }
+
+        // Pace Kimi: hold a concurrency slot for the duration of this attempt so
+        // parallel callers (e.g. a benchmark) don't burst past Kimi's rolling
+        // rate limit. Excess requests wait here instead of bursting into 429s.
+        // The guard is dropped at the end of the iteration (on `continue` or
+        // when the response is returned). `None` for every other provider.
+        let _kimi_permit = if provider_type == ProviderType::Kimi {
+            KIMI_CONCURRENCY.acquire().await.ok()
+        } else {
+            None
+        };
 
         // The synthetic "anthropic-cli-proxy" account is the only Anthropic
         // entry without an api_key — `read_standard_accounts` hoists the
@@ -730,8 +831,15 @@ pub(crate) async fn chat_completions_inner(
                 );
                 continue;
             };
-            // Build the upstream request body: replace model with the real model ID
-            let upstream_body = match rewrite_model(&body, &entry.model_id) {
+            // Build the upstream request body: replace model with the real model ID.
+            // Kimi additionally rejects any temperature other than 1, so normalize
+            // sampling params for it (see `rewrite_model_for_kimi`).
+            let rewrite_result = if provider_type == ProviderType::Kimi {
+                rewrite_model_for_kimi(&body, &entry.model_id)
+            } else {
+                rewrite_model(&body, &entry.model_id)
+            };
+            let upstream_body = match rewrite_result {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("Failed to rewrite model in request body: {}", e);
@@ -739,7 +847,13 @@ pub(crate) async fn chat_completions_inner(
                     continue;
                 }
             };
-            (url, upstream_body, HeaderMap::new())
+            // Kimi's coding endpoint returns 403 unless the User-Agent matches a
+            // known coding-agent pattern; pin it to the Kimi CLI's UA.
+            let mut extra = HeaderMap::new();
+            if provider_type == ProviderType::Kimi {
+                extra.insert(header::USER_AGENT, HeaderValue::from_static("KimiCLI/1.5"));
+            }
+            (url, upstream_body, extra)
         };
 
         // Forward the request.
@@ -1015,6 +1129,8 @@ pub(crate) async fn chat_completions_inner(
                 let retry_after = parse_rate_limit_headers(&response_headers, provider_type);
                 let reason = if status.as_u16() == 529 {
                     CooldownReason::Overloaded
+                } else if body_is_quota_exhausted(&resp_body) {
+                    CooldownReason::QuotaExhausted
                 } else {
                     CooldownReason::RateLimit
                 };
@@ -1255,9 +1371,14 @@ pub(crate) async fn chat_completions_inner(
                 let elapsed_ms = request_start.elapsed().as_millis() as u64;
                 let retry_after = parse_google_retry_after(&response_headers, &resp_body)
                     .or_else(|| parse_rate_limit_headers(&response_headers, provider_type));
+                let reason = if body_is_quota_exhausted(&resp_body) {
+                    CooldownReason::QuotaExhausted
+                } else {
+                    CooldownReason::RateLimit
+                };
                 let cooldown = state
                     .health_tracker
-                    .record_entry_failure(entry, CooldownReason::RateLimit, retry_after)
+                    .record_entry_failure(entry, reason, retry_after)
                     .await;
                 pending_fallback_events.push(crate::provider_health::FallbackEvent {
                     timestamp: chrono::Utc::now(),
@@ -1265,7 +1386,7 @@ pub(crate) async fn chat_completions_inner(
                     from_provider: entry.provider_id.clone(),
                     from_model: entry.model_id.clone(),
                     from_account_id: entry.account_id,
-                    reason: CooldownReason::RateLimit,
+                    reason,
                     cooldown_secs: Some(cooldown.as_secs_f64()),
                     to_provider: None,
                     latency_ms: Some(elapsed_ms),
@@ -1282,7 +1403,9 @@ pub(crate) async fn chat_completions_inner(
                 let reason = maybe_reason.unwrap_or(CooldownReason::AuthError);
                 let retry_after = if matches!(
                     reason,
-                    CooldownReason::RateLimit | CooldownReason::Overloaded
+                    CooldownReason::RateLimit
+                        | CooldownReason::QuotaExhausted
+                        | CooldownReason::Overloaded
                 ) {
                     parse_google_retry_after(&response_headers, &resp_body)
                         .or_else(|| parse_rate_limit_headers(&response_headers, provider_type))
@@ -1307,7 +1430,9 @@ pub(crate) async fn chat_completions_inner(
                     chain_length,
                 });
                 match reason {
-                    CooldownReason::RateLimit | CooldownReason::Overloaded => rate_limit_count += 1,
+                    CooldownReason::RateLimit
+                    | CooldownReason::QuotaExhausted
+                    | CooldownReason::Overloaded => rate_limit_count += 1,
                     CooldownReason::AuthError => client_error_count += 1,
                     _ => server_error_count += 1,
                 }
@@ -1401,7 +1526,19 @@ pub(crate) async fn chat_completions_inner(
         // Pre-stream error handling: 429, 529, 5xx → cooldown + try next
         if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
             let elapsed_ms = request_start.elapsed().as_millis() as u64;
-            let retry_after = parse_rate_limit_headers(upstream_resp.headers(), provider_type);
+            let mut retry_after = parse_rate_limit_headers(upstream_resp.headers(), provider_type);
+            // Kimi: keep the rate-limit cooldown short instead of letting it grow
+            // exponentially (5s→300s). Its rolling-window quota frees up
+            // continuously and we already throttle via `KIMI_CONCURRENCY`, so a
+            // brief account-wide pause is enough; a multi-minute cooldown would
+            // outlast a caller's retry budget and make the whole run give up.
+            // Honor a real upstream `retry-after` when present (and shorter).
+            if provider_type == ProviderType::Kimi && status == StatusCode::TOO_MANY_REQUESTS {
+                let capped = retry_after
+                    .unwrap_or(std::time::Duration::from_secs(5))
+                    .min(std::time::Duration::from_secs(15));
+                retry_after = Some(capped);
+            }
             // Passive Codex usage capture (B): a 429 from the local CLIProxyAPI
             // on the Codex path carries a `model_cooldown` body with the weekly
             // (secondary) window reset. The cli-proxy strips the rich x-codex-*
@@ -1410,20 +1547,24 @@ pub(crate) async fn chat_completions_inner(
             // the providers panel reflects "weekly limit reached" without a
             // probe. Keyed by entry.account_id == the provider UUID the usage
             // probe stores under. Only the codex path reads the body here.
+            // Read the 429 body once: used both for passive Codex cooldown
+            // capture and to distinguish a hard quota/usage-limit exhaustion
+            // (long cooldown) from a transient rate limit (short cooldown).
+            let err_body = upstream_resp.bytes().await.unwrap_or_default();
             if use_openai_oauth_cli_proxy_adapter {
                 let store_key = entry.account_id.to_string();
                 let codex_store = state.codex_usage.clone();
-                if let Ok(body) = upstream_resp.bytes().await {
-                    let now_unix = chrono::Utc::now().timestamp();
-                    if let Some(reset_at) =
-                        crate::api::codex_usage::parse_cooldown_reset(&body, now_unix)
-                    {
-                        codex_store.put_passive_cooldown(store_key, reset_at).await;
-                    }
+                let now_unix = chrono::Utc::now().timestamp();
+                if let Some(reset_at) =
+                    crate::api::codex_usage::parse_cooldown_reset(&err_body, now_unix)
+                {
+                    codex_store.put_passive_cooldown(store_key, reset_at).await;
                 }
             }
             let reason = if status.as_u16() == 529 {
                 CooldownReason::Overloaded
+            } else if body_is_quota_exhausted(&err_body) {
+                CooldownReason::QuotaExhausted
             } else {
                 CooldownReason::RateLimit
             };
@@ -1653,7 +1794,9 @@ pub(crate) async fn chat_completions_inner(
                     chain_length,
                 });
                 match reason {
-                    CooldownReason::RateLimit | CooldownReason::Overloaded => rate_limit_count += 1,
+                    CooldownReason::RateLimit
+                    | CooldownReason::QuotaExhausted
+                    | CooldownReason::Overloaded => rate_limit_count += 1,
                     CooldownReason::AuthError => client_error_count += 1,
                     _ => server_error_count += 1,
                 }
@@ -1750,9 +1893,9 @@ pub(crate) async fn chat_completions_inner(
                                 chain_length,
                             });
                             match reason {
-                                CooldownReason::RateLimit | CooldownReason::Overloaded => {
-                                    rate_limit_count += 1
-                                }
+                                CooldownReason::RateLimit
+                                | CooldownReason::QuotaExhausted
+                                | CooldownReason::Overloaded => rate_limit_count += 1,
                                 CooldownReason::AuthError => client_error_count += 1,
                                 _ => server_error_count += 1,
                             }
@@ -2032,6 +2175,28 @@ fn strip_thinking_blocks(messages: &mut [serde_json::Value]) {
             }));
         }
     }
+}
+
+/// Rewrite the model id and normalize sampling params for Kimi's coding endpoint.
+///
+/// `kimi-for-coding` rejects any temperature other than 1 with
+/// `400 invalid temperature: only 1 is allowed for this model`. Clients that
+/// send `temperature: 0` (e.g. deterministic benchmark harnesses) would
+/// therefore 400 on every request. Force the only accepted value when the
+/// caller specified a temperature; leave it absent otherwise so Kimi's own
+/// default applies.
+fn rewrite_model_for_kimi(body: &[u8], new_model: &str) -> Result<bytes::Bytes, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    value["model"] = serde_json::Value::String(new_model.to_string());
+    if let Some(obj) = value.as_object_mut() {
+        if obj.contains_key("temperature") {
+            obj.insert("temperature".to_string(), serde_json::json!(1));
+        }
+    }
+    serde_json::to_vec(&value)
+        .map(bytes::Bytes::from)
+        .map_err(|e| format!("Failed to serialize: {}", e))
 }
 
 fn rewrite_model_for_anthropic_cli_proxy(
@@ -2534,6 +2699,25 @@ fn parse_rate_limit_duration(s: &str) -> Option<std::time::Duration> {
 /// Providers sometimes return HTTP 200 with an error payload.  This function
 /// inspects the parsed JSON to determine the appropriate cooldown reason
 /// instead of blindly treating every such error as a rate limit.
+/// Detect a hard quota/usage-limit exhaustion from a raw upstream error body
+/// (e.g. a 429 response payload). Used to park an exhausted subscription on a
+/// long cooldown instead of the short transient-rate-limit backoff.
+fn body_is_quota_exhausted(body: &[u8]) -> bool {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if matches!(classify_embedded_error(&v), CooldownReason::QuotaExhausted) {
+            return true;
+        }
+    }
+    // Fallback for non-JSON or unusually-shaped bodies: scan for unambiguous
+    // quota phrases only (avoid generic "rate limit" which is transient).
+    let lower = String::from_utf8_lossy(body).to_ascii_lowercase();
+    lower.contains("usage limit")
+        || lower.contains("insufficient_quota")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("out of credits")
+        || lower.contains("insufficient balance")
+}
+
 fn classify_embedded_error(v: &serde_json::Value) -> CooldownReason {
     let error_obj = v.get("error");
 
@@ -2552,6 +2736,33 @@ fn classify_embedded_error(v: &serde_json::Value) -> CooldownReason {
         .unwrap_or("");
 
     let error_type_lower = error_type.to_ascii_lowercase();
+
+    // Free-text message, used to spot hard quota/usage-limit exhaustion that
+    // isn't distinguishable from the error type/code alone (e.g. z.ai returns
+    // a generic 429 whose body says "The usage limit has been reached").
+    let message_lower = error_obj
+        .and_then(|e| e.get("message"))
+        .or_else(|| v.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Hard quota exhaustion → long cooldown (parked, not flapped). Checked
+    // before the transient rate-limit branch since these are more specific.
+    // NOTE: Google's "resource_exhausted" is a *transient* per-minute limit, so
+    // it is deliberately NOT treated as quota exhaustion here.
+    if error_type_lower.contains("insufficient_quota")
+        || error_type_lower.contains("quota_exceeded")
+        || error_type_lower.contains("usage_limit")
+        || message_lower.contains("usage limit")
+        || message_lower.contains("insufficient_quota")
+        || message_lower.contains("quota exceeded")
+        || message_lower.contains("exceeded your current quota")
+        || message_lower.contains("out of credits")
+        || message_lower.contains("insufficient balance")
+    {
+        return CooldownReason::QuotaExhausted;
+    }
 
     if error_type_lower.contains("rate_limit")
         || error_type_lower.contains("rate-limit")
@@ -5074,6 +5285,61 @@ mod tests {
         let reason =
             classify_google_error_reason(serde_json::to_vec(&body).unwrap().as_slice()).unwrap();
         assert!(matches!(reason, CooldownReason::Overloaded));
+    }
+
+    #[test]
+    fn classify_embedded_quota_from_message() {
+        // z.ai-style: generic code, quota signalled only in the message text.
+        let v = serde_json::json!({
+            "error": {"code": "1113", "message": "The usage limit has been reached"}
+        });
+        assert!(matches!(
+            classify_embedded_error(&v),
+            CooldownReason::QuotaExhausted
+        ));
+    }
+
+    #[test]
+    fn classify_embedded_insufficient_quota_type() {
+        let v = serde_json::json!({
+            "error": {"type": "insufficient_quota", "message": "You exceeded your current quota"}
+        });
+        assert!(matches!(
+            classify_embedded_error(&v),
+            CooldownReason::QuotaExhausted
+        ));
+    }
+
+    #[test]
+    fn classify_embedded_transient_rate_limit_stays_rate_limit() {
+        // A transient rate limit must NOT be upgraded to the long quota cooldown.
+        let v = serde_json::json!({
+            "error": {"type": "rate_limit_error", "message": "slow down"}
+        });
+        assert!(matches!(
+            classify_embedded_error(&v),
+            CooldownReason::RateLimit
+        ));
+        // Google's per-minute RESOURCE_EXHAUSTED is also transient.
+        let g = serde_json::json!({"error": {"status": "RESOURCE_EXHAUSTED"}});
+        assert!(matches!(
+            classify_embedded_error(&g),
+            CooldownReason::RateLimit
+        ));
+    }
+
+    #[test]
+    fn body_quota_detector_matches_quota_bodies_only() {
+        assert!(body_is_quota_exhausted(
+            br#"{"error":{"message":"The usage limit has been reached"}}"#
+        ));
+        assert!(body_is_quota_exhausted(
+            br#"{"error":{"type":"insufficient_quota"}}"#
+        ));
+        assert!(!body_is_quota_exhausted(
+            br#"{"error":{"type":"rate_limit_error"}}"#
+        ));
+        assert!(!body_is_quota_exhausted(b"plain transient 429"));
     }
 
     #[test]

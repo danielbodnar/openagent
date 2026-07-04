@@ -257,6 +257,13 @@ const PRICING_ENTRIES: &[PricingEntry] = &[
         pricing: pricing(1_250, 2_500, None, Some(200)),
     },
     PricingEntry {
+        // glm-5.2 list price not yet published separately; mirrors glm-5.1
+        // ($1.4/$4.4 per Mtok, $0.26 cached) until Z.AI publishes it.
+        canonical: "glm-5.2",
+        aliases: &["glm-5.2", "glm-5-2"],
+        pricing: pricing(1_400, 4_400, None, Some(260)),
+    },
+    PricingEntry {
         canonical: "glm-5.1",
         aliases: &["glm-5.1", "glm-5-1"],
         pricing: pricing(1_400, 4_400, None, Some(260)),
@@ -529,6 +536,7 @@ mod tests {
         assert_eq!(normalize_model("xAI/Grok Inference"), "grok-4-fast");
         assert_eq!(normalize_model("grok-build"), "grok-build");
         assert_eq!(normalize_model("zai/glm-5"), "glm-5");
+        assert_eq!(normalize_model("zai/glm-5.2"), "glm-5.2");
         assert_eq!(normalize_model("zai/glm-5.1"), "glm-5.1");
         assert_eq!(normalize_model("zai/glm-5-turbo"), "glm-5-turbo");
         assert_eq!(normalize_model("zai/glm-4.7"), "glm-4.7");
@@ -560,6 +568,7 @@ mod tests {
         assert!(pricing_for_model("xAI/Grok Inference").is_some());
         assert!(pricing_for_model("grok-build").is_some());
         assert!(pricing_for_model("glm-5").is_some());
+        assert!(pricing_for_model("zai/glm-5.2").is_some());
         assert!(pricing_for_model("glm-5.1").is_some());
         assert!(pricing_for_model("zai/glm-5-turbo").is_some());
         assert!(pricing_for_model("zai/glm-4.7").is_some());

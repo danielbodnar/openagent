@@ -1,6 +1,8 @@
 'use client';
 
-import { memo, useEffect, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
+import { LG_MEDIA_QUERY } from '@/lib/responsive-layout';
+import { useMediaQuery } from '@/hooks/use-media-query';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
@@ -18,6 +20,7 @@ import {
   Cpu,
   GearSix,
   GitBranch,
+  GithubLogo,
   Key,
   Layout,
   Lightning,
@@ -77,6 +80,7 @@ const navigation: NavItem[] = [
     children: [
       { name: 'Backends', href: '/settings/backends', icon: Cpu },
       { name: 'Providers', href: '/settings/providers', icon: Key },
+      { name: 'GitHub', href: '/settings/github', icon: GithubLogo },
       { name: 'LLM', href: '/settings/llm', icon: Sparkle },
       { name: 'Security', href: '/settings/secrets', icon: Lock },
       { name: 'Data', href: '/settings/data', icon: Archive },
@@ -84,10 +88,54 @@ const navigation: NavItem[] = [
   },
 ];
 
-export const Sidebar = memo(function Sidebar() {
+export const Sidebar = memo(function Sidebar({
+  id,
+  open = false,
+  onClose,
+}: {
+  id?: string;
+  open?: boolean;
+  onClose?: () => void;
+}) {
   const pathname = usePathname();
+  const asideRef = useRef<HTMLElement>(null);
+  const isDesktop = useMediaQuery(LG_MEDIA_QUERY);
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
   const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
+
+  // Trap focus inside the off-canvas drawer while it is open on mobile.
+  useEffect(() => {
+    if (!open || isDesktop) return;
+    const root = asideRef.current;
+    if (!root) return;
+
+    const focusables = root.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    if (focusables.length === 0) return;
+
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    first.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') return;
+      if (event.shiftKey) {
+        if (document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        }
+        return;
+      }
+      if (document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    root.addEventListener('keydown', onKeyDown);
+    return () => root.removeEventListener('keydown', onKeyDown);
+  }, [open, isDesktop]);
 
   // Auto-expand sections if we're on their subpages
   useEffect(() => {
@@ -156,9 +204,23 @@ export const Sidebar = memo(function Sidebar() {
       : currentMission?.status === 'failed' 
         ? 'text-red-400' 
         : 'text-white/40';
+  const hideClosedMobileNav = !open && !isDesktop;
 
   return (
-    <aside className="fixed left-0 top-0 z-40 flex h-screen w-56 flex-col glass-panel border-r border-white/[0.06]">
+    <aside
+      ref={asideRef}
+      id={id}
+      aria-label="Main navigation"
+      aria-hidden={hideClosedMobileNav ? true : undefined}
+      inert={hideClosedMobileNav ? true : undefined}
+      className={cn(
+        'fixed left-0 top-0 z-40 flex h-screen w-56 flex-col glass-panel border-r border-white/[0.06]',
+        // Off-canvas drawer below lg; always docked at lg+ so desktop is
+        // unchanged (lg:translate-x-0 wins regardless of `open`).
+        'transition-transform duration-200 lg:translate-x-0',
+        open ? 'translate-x-0' : '-translate-x-full',
+      )}
+    >
       {/* Header */}
       <div className="flex h-16 items-center gap-2 border-b border-white/[0.06] px-4">
         <BrainLogo size={32} />
@@ -218,6 +280,7 @@ export const Sidebar = memo(function Sidebar() {
                         <Link
                           key={child.name}
                           href={child.href}
+                          onClick={onClose}
                           className={cn(
                             'flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-all',
                             isChildCurrent
@@ -241,6 +304,7 @@ export const Sidebar = memo(function Sidebar() {
             <Link
               key={item.name}
               href={item.href}
+              onClick={onClose}
               className={cn(
                 'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all relative',
                 isCurrentPath
@@ -262,8 +326,9 @@ export const Sidebar = memo(function Sidebar() {
 
       {/* Current Mission Status */}
       {currentMission && (
-        <Link 
+        <Link
           href={`/control?mission=${currentMission.id}`}
+          onClick={onClose}
           className="mx-3 mb-3 p-3 rounded-xl bg-white/[0.02] border border-white/[0.04] hover:bg-white/[0.04] transition-colors"
         >
           <div className="flex items-center gap-2 mb-1.5">

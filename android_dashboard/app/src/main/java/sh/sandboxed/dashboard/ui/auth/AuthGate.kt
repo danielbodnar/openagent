@@ -27,6 +27,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -39,6 +40,8 @@ import androidx.compose.ui.platform.LocalContext
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.AppSettings
 import sh.sandboxed.dashboard.data.LoginRequest
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.theme.Palette
 import sh.sandboxed.dashboard.util.GitHubAuth
@@ -49,7 +52,16 @@ fun AuthGate(
     settings: AppSettings,
     content: @Composable () -> Unit,
 ) {
-    var phase by remember { mutableStateOf(AuthPhase.RESOLVING) }
+    // Derive the initial phase from settings so an Activity recreate (rotation,
+    // config change) does not bounce an already-authenticated user back to a
+    // RESOLVING spinner while we revalidate against /api/health in the
+    // background.
+    val initialPhase = when {
+        !settings.isConfigured -> AuthPhase.NEEDS_CONFIG
+        settings.jwtToken != null -> AuthPhase.AUTHENTICATED
+        else -> AuthPhase.RESOLVING
+    }
+    var phase by remember { mutableStateOf(initialPhase) }
     var authMode by remember { mutableStateOf<String?>(null) }
     var githubEnabled by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -59,7 +71,11 @@ fun AuthGate(
             phase = AuthPhase.NEEDS_CONFIG
             return@LaunchedEffect
         }
-        phase = AuthPhase.RESOLVING
+        // Only show the RESOLVING spinner when there is no cached token —
+        // otherwise keep the app interactive while the health probe runs.
+        if (settings.jwtToken == null) {
+            phase = AuthPhase.RESOLVING
+        }
         try {
             val health = container.api.health()
             githubEnabled = health.githubEnabled
@@ -71,7 +87,10 @@ fun AuthGate(
             }
         } catch (t: Throwable) {
             error = t.message
-            phase = AuthPhase.NEEDS_CONFIG
+            // Stay on the cached AUTHENTICATED screen if we have a token —
+            // the next API call will surface the network error in context.
+            // Only fall back to NEEDS_CONFIG when we genuinely have nothing.
+            phase = if (settings.jwtToken != null) AuthPhase.AUTHENTICATED else AuthPhase.NEEDS_CONFIG
         }
     }
 
@@ -111,7 +130,7 @@ private fun ConfigSheet(container: AppContainer, settings: AppSettings, error: S
                 onValueChange = { url = it },
                 placeholder = { Text("https://sandboxed.example.com") },
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().tag(TestTags.AUTH_URL_FIELD),
                 colors = TextFieldDefaults.colors(
                     focusedContainerColor = Palette.Card,
                     unfocusedContainerColor = Palette.Card,
@@ -131,7 +150,7 @@ private fun ConfigSheet(container: AppContainer, settings: AppSettings, error: S
                     }
                 },
                 enabled = url.isNotBlank() && !saving,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().tag(TestTags.AUTH_URL_CONTINUE),
                 colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent, contentColor = Palette.TextPrimary),
             ) { Text(if (saving) "Saving…" else "Continue") }
         }
@@ -162,7 +181,7 @@ private fun LoginScreen(container: AppContainer, settings: AppSettings, authMode
                     onValueChange = { username = it },
                     label = { Text("Username") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().tag(TestTags.AUTH_LOGIN_USERNAME),
                     colors = loginFieldColors(),
                 )
             }
@@ -173,7 +192,7 @@ private fun LoginScreen(container: AppContainer, settings: AppSettings, authMode
                 singleLine = true,
                 visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().tag(TestTags.AUTH_LOGIN_PASSWORD),
                 colors = loginFieldColors(),
             )
             error?.let { ErrorBanner(it) }
@@ -190,7 +209,7 @@ private fun LoginScreen(container: AppContainer, settings: AppSettings, authMode
                     }
                 },
                 enabled = password.isNotBlank() && !loading,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().tag(TestTags.AUTH_LOGIN_SUBMIT),
                 colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent, contentColor = Palette.TextPrimary),
             ) { Text(if (loading) "Signing in…" else "Sign in") }
 
@@ -198,7 +217,7 @@ private fun LoginScreen(container: AppContainer, settings: AppSettings, authMode
                 Text("or", color = Palette.TextTertiary, style = MaterialTheme.typography.labelMedium, modifier = Modifier.align(Alignment.CenterHorizontally))
                 OutlinedButton(
                     onClick = { GitHubAuth.launch(ctx, settings.baseUrl) },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().tag(TestTags.AUTH_LOGIN_GITHUB),
                 ) {
                     Icon(Icons.Filled.Code, contentDescription = null)
                     Spacer(Modifier.height(0.dp))

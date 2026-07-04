@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -36,6 +37,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -48,6 +50,8 @@ import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.CreateWorkspaceRequest
 import sh.sandboxed.dashboard.data.Workspace
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.theme.Palette
@@ -96,6 +100,7 @@ fun WorkspacesScreen(container: AppContainer) {
     val vm = remember { WorkspacesViewModel(container) }
     val state by vm.state.collectAsState()
     var showCreate by remember { mutableStateOf(false) }
+    var detail by remember { mutableStateOf<Workspace?>(null) }
 
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -103,8 +108,8 @@ fun WorkspacesScreen(container: AppContainer) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("Workspaces", style = MaterialTheme.typography.headlineSmall, color = Palette.TextPrimary, modifier = Modifier.weight(1f))
-            IconButton(onClick = { showCreate = true }) { Icon(Icons.Filled.Add, "Create workspace", tint = Palette.Accent) }
-            IconButton(onClick = vm::refresh) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
+            IconButton(onClick = { showCreate = true }, modifier = Modifier.tag(TestTags.WORKSPACES_CREATE)) { Icon(Icons.Filled.Add, "Create workspace", tint = Palette.Accent) }
+            IconButton(onClick = vm::refresh, modifier = Modifier.tag(TestTags.WORKSPACES_REFRESH)) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
         }
         state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
         if (state.loading && state.items.isEmpty()) {
@@ -115,9 +120,13 @@ fun WorkspacesScreen(container: AppContainer) {
             }
         } else {
             LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(state.items, key = { it.id }) { workspace -> WorkspaceRow(workspace) }
+                items(state.items, key = { it.id }) { workspace -> WorkspaceRow(workspace) { detail = workspace } }
             }
         }
+    }
+
+    detail?.let { workspace ->
+        WorkspaceDetailDialog(workspace = workspace, onDismiss = { detail = null })
     }
 
     if (showCreate) {
@@ -132,8 +141,8 @@ fun WorkspacesScreen(container: AppContainer) {
 }
 
 @Composable
-private fun WorkspaceRow(workspace: Workspace) {
-    GlassCard(modifier = Modifier.fillMaxWidth()) {
+private fun WorkspaceRow(workspace: Workspace, onClick: () -> Unit) {
+    GlassCard(modifier = Modifier.fillMaxWidth(), onClick = onClick) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -155,6 +164,59 @@ private fun WorkspaceRow(workspace: Workspace) {
     }
 }
 
+/// Full workspace metadata: identity, build status, env vars, and the Library
+/// content (skills/tools/plugins/MCPs) synced into the workspace.
+@Composable
+private fun WorkspaceDetailDialog(workspace: Workspace, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(workspace.name, color = Palette.TextPrimary) },
+        text = {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                item { DetailField("ID", workspace.id) }
+                item { DetailField("Type", workspace.workspaceType) }
+                item { DetailField("Path", workspace.path) }
+                item { DetailField("Status", workspace.status) }
+                if (workspace.createdAt.isNotBlank()) item { DetailField("Created", workspace.createdAt.take(19).replace('T', ' ')) }
+                workspace.template?.takeIf { it.isNotBlank() }?.let { item { DetailField("Template", it) } }
+                workspace.distro?.takeIf { it.isNotBlank() }?.let { item { DetailField("Distro", it) } }
+                if (workspace.envVars.isNotEmpty()) {
+                    item { DetailSection("Environment") }
+                    items(workspace.envVars.entries.sortedBy { it.key }, key = { "env:${it.key}" }) { (k, v) ->
+                        DetailField(k, v)
+                    }
+                }
+                if (workspace.skills.isNotEmpty()) item { DetailField("Skills", workspace.skills.joinToString(", ")) }
+                if (workspace.tools.isNotEmpty()) item { DetailField("Tools", workspace.tools.joinToString(", ")) }
+                if (workspace.plugins.isNotEmpty()) item { DetailField("Plugins", workspace.plugins.joinToString(", ")) }
+                if (workspace.mcps.isNotEmpty()) item { DetailField("MCPs", workspace.mcps.joinToString(", ")) }
+                workspace.errorMessage?.takeIf { it.isNotBlank() }?.let {
+                    item { DetailSection("Error") }
+                    item { Text(it, color = Palette.Error, style = MaterialTheme.typography.bodySmall) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss, modifier = Modifier.tag(TestTags.WORKSPACES_DETAIL_CLOSE)) { Text("Close") } },
+        containerColor = Palette.Card,
+    )
+}
+
+@Composable
+private fun DetailSection(title: String) {
+    Text(title.uppercase(), color = Palette.TextTertiary, style = MaterialTheme.typography.labelMedium)
+}
+
+@Composable
+private fun DetailField(label: String, value: String) {
+    Column(Modifier.fillMaxWidth()) {
+        Text(label, color = Palette.TextTertiary, style = MaterialTheme.typography.labelSmall)
+        Text(value, color = Palette.TextPrimary, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
 @Composable
 private fun CreateWorkspaceDialog(onCancel: () -> Unit, onCreate: (String, String, String?) -> Unit) {
     var name by remember { mutableStateOf("") }
@@ -172,22 +234,27 @@ private fun CreateWorkspaceDialog(onCancel: () -> Unit, onCreate: (String, Strin
                     onValueChange = { name = it },
                     label = { Text("Name") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().tag(TestTags.WORKSPACES_NEW_NAME),
                     colors = fieldColors(),
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("container" to "Container", "host" to "Host").forEach { (value, label) ->
-                        FilterChip(
-                            selected = type == value,
-                            onClick = { type = value },
-                            label = { Text(label, style = MaterialTheme.typography.labelSmall) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                containerColor = Palette.Card,
-                                selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
-                                labelColor = Palette.TextSecondary,
-                                selectedLabelColor = Palette.Accent,
-                            ),
-                        )
+                    listOf(
+                        Triple("container", "Container", TestTags.WORKSPACES_NEW_TYPE_CONTAINER),
+                        Triple("host", "Host", TestTags.WORKSPACES_NEW_TYPE_HOST),
+                    ).forEach { (value, label, chipTag) ->
+                        Box(Modifier.tag(chipTag)) {
+                            FilterChip(
+                                selected = type == value,
+                                onClick = { type = value },
+                                label = { Text(label, style = MaterialTheme.typography.labelSmall) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    containerColor = Palette.Card,
+                                    selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
+                                    labelColor = Palette.TextSecondary,
+                                    selectedLabelColor = Palette.Accent,
+                                ),
+                            )
+                        }
                     }
                 }
                 if (type == "host") {
@@ -196,7 +263,7 @@ private fun CreateWorkspaceDialog(onCancel: () -> Unit, onCreate: (String, Strin
                         onValueChange = { path = it },
                         label = { Text("Host path") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().tag(TestTags.WORKSPACES_NEW_PATH),
                         colors = fieldColors(),
                     )
                 }
@@ -210,9 +277,10 @@ private fun CreateWorkspaceDialog(onCancel: () -> Unit, onCreate: (String, Strin
                 onClick = { onCreate(name, type, path) },
                 enabled = name.isNotBlank() && !hostNeedsPath,
                 colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+                modifier = Modifier.tag(TestTags.WORKSPACES_NEW_CREATE),
             ) { Text("Create") }
         },
-        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = onCancel, modifier = Modifier.tag(TestTags.WORKSPACES_NEW_CANCEL)) { Text("Cancel") } },
         containerColor = Palette.Card,
     )
 }

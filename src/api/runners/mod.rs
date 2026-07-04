@@ -10,6 +10,7 @@ pub(crate) mod codex;
 pub(crate) mod errors;
 pub(crate) mod gemini;
 pub(crate) mod grok;
+pub(crate) mod midturn;
 pub(crate) mod opencode;
 
 use std::future::Future;
@@ -72,10 +73,20 @@ pub(crate) enum TurnExtras<'a> {
 /// reintroduces the async stack overflow this codebase already fixed once.
 pub(crate) trait HarnessRunner: Send + Sync {
     fn name(&self) -> &'static str;
+    fn mid_turn_kind(&self) -> MidTurnKind {
+        MidTurnKind::None
+    }
     fn run_turn<'a>(
         &'a self,
         ctx: TurnContext<'a>,
     ) -> Pin<Box<dyn Future<Output = AgentResult> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MidTurnKind {
+    None,
+    StreamJsonStdin,
+    CodexAppServer,
 }
 
 pub(crate) struct ClaudeCodeRunner;
@@ -87,6 +98,9 @@ pub(crate) struct GeminiRunner;
 impl HarnessRunner for ClaudeCodeRunner {
     fn name(&self) -> &'static str {
         "claudecode"
+    }
+    fn mid_turn_kind(&self) -> MidTurnKind {
+        MidTurnKind::StreamJsonStdin
     }
     fn run_turn<'a>(
         &'a self,
@@ -155,6 +169,15 @@ impl HarnessRunner for OpenCodeRunner {
 impl HarnessRunner for CodexRunner {
     fn name(&self) -> &'static str {
         "codex"
+    }
+    fn mid_turn_kind(&self) -> MidTurnKind {
+        // Raw backend capability: the app-server accepts a second `turn/start`
+        // on the live thread. NOTE: this is gated OFF in
+        // `effective_mid_turn_kind` — the non-goal driver marks the turn
+        // terminal on the first `turn/completed` (see codex/mod.rs), so an
+        // injected turn would be abandoned. Re-enable once the driver tracks
+        // injected turns (or a `turn/steer`-style append RPC is wired).
+        MidTurnKind::CodexAppServer
     }
     fn run_turn<'a>(
         &'a self,
@@ -236,6 +259,28 @@ pub(crate) fn runner_for(backend_id: &str) -> Option<&'static dyn HarnessRunner>
     }
 }
 
+pub(crate) fn effective_mid_turn_kind(
+    backend_id: &str,
+    stream_input_enabled: bool,
+    is_goal: bool,
+) -> MidTurnKind {
+    // `is_goal` is retained for API stability / future re-enable; Codex is
+    // currently gated off entirely (see below), so it is unused for now.
+    let _ = is_goal;
+    match backend_id {
+        "claudecode" if !stream_input_enabled => MidTurnKind::None,
+        // Codex mid-turn injection is disabled: the app-server can start a
+        // second turn, but the non-goal driver ends the mission on the first
+        // `turn/completed`, so the injected turn is abandoned and the steer
+        // never reaches the model. Fall back to the authoritative next-turn
+        // path until the driver can consume an injected turn.
+        "codex" => MidTurnKind::None,
+        _ => runner_for(backend_id)
+            .map(|runner| runner.mid_turn_kind())
+            .unwrap_or(MidTurnKind::None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +293,43 @@ mod tests {
         }
         assert!(runner_for("unknown").is_none());
         assert!(runner_for("").is_none());
+
+        assert_eq!(
+            runner_for("claudecode").unwrap().mid_turn_kind(),
+            MidTurnKind::StreamJsonStdin
+        );
+        assert_eq!(
+            runner_for("codex").unwrap().mid_turn_kind(),
+            MidTurnKind::CodexAppServer
+        );
+        for backend in ["opencode", "grok", "gemini"] {
+            assert_eq!(
+                runner_for(backend).unwrap().mid_turn_kind(),
+                MidTurnKind::None
+            );
+        }
+        assert_eq!(
+            effective_mid_turn_kind("claudecode", true, false),
+            MidTurnKind::StreamJsonStdin
+        );
+        assert_eq!(
+            effective_mid_turn_kind("claudecode", false, false),
+            MidTurnKind::None
+        );
+        // Codex is gated off in effective_mid_turn_kind (driver can't consume
+        // an injected turn yet) even though its raw mid_turn_kind is
+        // CodexAppServer — regardless of goal mode.
+        assert_eq!(
+            effective_mid_turn_kind("codex", true, false),
+            MidTurnKind::None
+        );
+        assert_eq!(
+            effective_mid_turn_kind("codex", true, true),
+            MidTurnKind::None
+        );
+        assert_eq!(
+            effective_mid_turn_kind("opencode", true, false),
+            MidTurnKind::None
+        );
     }
 }

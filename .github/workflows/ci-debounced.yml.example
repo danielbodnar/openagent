@@ -75,7 +75,7 @@ jobs:
         pr_number: ${{ fromJson(needs.check-stale-prs.outputs.pr_numbers) }}
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           ref: refs/pull/${{ matrix.pr_number }}/head
 

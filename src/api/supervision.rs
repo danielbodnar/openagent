@@ -9,6 +9,8 @@
 //!   detection of silent/orphaned runners (incl. OOM-kill reporting).
 //! - [`stale_mission_cleanup_loop`] — hour-scale cleanup of abandoned
 //!   missions.
+//! - [`background_task_autoresume_loop`] — wakes missions parked in
+//!   `AwaitingUser` when Claude Code background shell tasks finish.
 //!
 //! TODO(Phase 5b): replace their three independent "is this mission alive?"
 //! heuristics with one per-mission LivenessState fed by the event stream —
@@ -27,6 +29,10 @@ use super::control::MissionStatus;
 #[allow(unused_imports)]
 use super::control::*;
 use super::mission_store::MissionStore;
+
+mod bg_autoresume;
+
+pub(crate) use bg_autoresume::{background_task_autoresume_loop, reset_waiting_background_on_boot};
 
 pub(crate) async fn recover_server_shutdown_missions(
     mission_store: Arc<dyn MissionStore>,
@@ -318,6 +324,13 @@ pub(crate) async fn stuck_mission_watchdog_loop(
     // previous tick. Entries for dead scopes are pruned each pass.
     let mut oom_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
+    // Worker missions we have already auto-resumed once this process lifetime.
+    // Auto-resume is a single supervised retry for workers whose runner died
+    // (orphan / deploy SIGTERM) — an environmental interruption, not the
+    // worker's own fault. If the resumed worker dies again it stays
+    // interrupted and the boss handles it, so this can never resume-storm.
+    let mut auto_resumed_workers: HashSet<Uuid> = HashSet::new();
+
     loop {
         tokio::time::sleep(CHECK_INTERVAL).await;
 
@@ -465,6 +478,39 @@ pub(crate) async fn stuck_mission_watchdog_loop(
                         .to_string(),
                 ),
             });
+
+            // One supervised auto-resume for orphaned WORKER missions. The
+            // boss used to babysit this by hand (10 manual resume_worker
+            // calls in one campaign); a runner death is environmental, so a
+            // single retry is safe. Once-only per process: a worker that dies
+            // again stays interrupted for the boss to triage.
+            if mission.parent_mission_id.is_some() && auto_resumed_workers.insert(mission.id) {
+                tracing::info!(
+                    mission_id = %mission.id,
+                    parent = ?mission.parent_mission_id,
+                    "Stuck-mission watchdog: auto-resuming orphaned worker once"
+                );
+                let (resume_tx, resume_rx) = oneshot::channel();
+                if cmd_tx
+                    .send(ControlCommand::ResumeMission {
+                        mission_id: mission.id,
+                        clean_workspace: false,
+                        skip_message: false,
+                        respond: resume_tx,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    match resume_rx.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::warn!(
+                            mission_id = %mission.id,
+                            "Auto-resume failed: {}; leaving interrupted for the boss", e
+                        ),
+                        Err(_) => {}
+                    }
+                }
+            }
         }
     }
 }

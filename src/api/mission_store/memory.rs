@@ -1,7 +1,8 @@
 //! In-memory mission store (non-persistent).
 
 use super::{
-    now_string, Mission, MissionHistoryEntry, MissionStatus, MissionStatusCounts, MissionStore,
+    now_string, BoardTask, BoardTaskStatus, Mission, MissionHistoryEntry, MissionStatus,
+    MissionStatusCounts, MissionStore, NewBoardTask,
 };
 use crate::api::control::{AgentTreeNode, DesktopSessionInfo};
 use async_trait::async_trait;
@@ -17,6 +18,10 @@ const METADATA_SOURCE_USER: &str = "user";
 pub struct InMemoryMissionStore {
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
+    board_tasks: Arc<RwLock<HashMap<Uuid, BoardTask>>>,
+    /// FLEET-001 scheduling: deferred goals held outside the Mission struct
+    /// (mirrors the sqlite `deferred_goal` column).
+    deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
 }
 
 impl InMemoryMissionStore {
@@ -24,6 +29,8 @@ impl InMemoryMissionStore {
         Self {
             missions: Arc::new(RwLock::new(HashMap::new())),
             trees: Arc::new(RwLock::new(HashMap::new())),
+            board_tasks: Arc::new(RwLock::new(HashMap::new())),
+            deferred_goals: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -108,8 +115,9 @@ impl MissionStore for InMemoryMissionStore {
             config_profile: config_profile.map(|s| s.to_string()),
             history: vec![],
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: Some(Uuid::new_v4().to_string()),
@@ -120,6 +128,13 @@ impl MissionStore for InMemoryMissionStore {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: super::MissionActivity {
+                last_status_change_at: Some(now.clone()),
+                ..Default::default()
+            },
+            awaiting_kind: None,
         };
         self.missions
             .write()
@@ -152,9 +167,13 @@ impl MissionStore for InMemoryMissionStore {
         let mission = missions
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
+        let status_changed = mission.status != status;
         mission.status = status;
         let now = now_string();
         mission.updated_at = now.clone();
+        if status_changed {
+            mission.activity.last_status_change_at = Some(now.clone());
+        }
         mission.terminal_reason = terminal_reason.map(|s| s.to_string());
         // AwaitingUser is resumable too (any user message wakes the agent).
         // Failed missions with LlmError are also resumable (transient API errors).
@@ -165,6 +184,7 @@ impl MissionStore for InMemoryMissionStore {
                 | MissionStatus::Failed
                 | MissionStatus::AwaitingUser
                 | MissionStatus::Acknowledged
+                | MissionStatus::WaitingBackground
         );
         mission.interrupted_at =
             if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked) {
@@ -174,6 +194,11 @@ impl MissionStore for InMemoryMissionStore {
             };
         if matches!(status, MissionStatus::Active) {
             mission.first_viewed_at = None;
+        }
+        // awaiting_kind only describes an AwaitingUser mission; clear it on any
+        // change away from that state (parity with the sqlite store).
+        if !matches!(status, MissionStatus::AwaitingUser) {
+            mission.awaiting_kind = None;
         }
         Ok(())
     }
@@ -362,6 +387,56 @@ impl MissionStore for InMemoryMissionStore {
         Ok(())
     }
 
+    async fn update_mission_project(
+        &self,
+        id: Uuid,
+        patch: super::MissionProjectPatch,
+    ) -> Result<(), String> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        if let Some(project) = patch.project {
+            mission.project.project = project;
+        }
+        if let Some(track) = patch.track {
+            mission.project.track = track;
+        }
+        if let Some(intent) = patch.intent {
+            mission.project.intent = intent;
+        }
+        if let Some(github_pr) = patch.github_pr {
+            mission.project.github_pr = github_pr;
+        }
+        if let Some(tags) = patch.tags {
+            mission.project.tags = tags;
+        }
+        if let Some(desired_state) = patch.desired_state {
+            mission.project.desired_state = desired_state;
+        }
+        if let Some(next_check_at) = patch.next_check_at {
+            mission.project.next_check_at = next_check_at;
+        }
+        mission.updated_at = now_string();
+        Ok(())
+    }
+
+    async fn set_mission_awaiting_kind(
+        &self,
+        id: Uuid,
+        kind: Option<super::AwaitingKind>,
+    ) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        mission.awaiting_kind = kind;
+        Ok(())
+    }
+
     async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String> {
         let mut missions = self.missions.write().await;
         let mission = missions
@@ -454,6 +529,52 @@ impl MissionStore for InMemoryMissionStore {
         Ok(missions)
     }
 
+    async fn set_deferred_goal(
+        &self,
+        mission_id: Uuid,
+        goal: Option<String>,
+    ) -> Result<(), String> {
+        let mut goals = self.deferred_goals.write().await;
+        match goal {
+            Some(g) => {
+                goals.insert(mission_id, g);
+            }
+            None => {
+                goals.remove(&mission_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String> {
+        Ok(self.deferred_goals.read().await.get(&mission_id).cloned())
+    }
+
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String> {
+        if let Some(m) = self.missions.write().await.get_mut(&mission_id) {
+            m.paused_at = paused_at;
+        }
+        Ok(())
+    }
+
+    async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String> {
+        let goals = self.deferred_goals.read().await;
+        let mut missions: Vec<Mission> = self
+            .missions
+            .read()
+            .await
+            .values()
+            .filter(|m| m.status == MissionStatus::Pending && goals.contains_key(&m.id))
+            .cloned()
+            .collect();
+        missions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(missions)
+    }
+
     async fn insert_mission_summary(
         &self,
         _mission_id: Uuid,
@@ -463,11 +584,169 @@ impl MissionStore for InMemoryMissionStore {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    // ---- Task board ------------------------------------------------------
+
+    async fn upsert_board_tasks(
+        &self,
+        boss_mission_id: Uuid,
+        tasks: Vec<NewBoardTask>,
+    ) -> Result<Vec<BoardTask>, String> {
+        let mut map = self.board_tasks.write().await;
+        let now = now_string();
+        let mut out = Vec::with_capacity(tasks.len());
+        for t in tasks {
+            let existing_id = map
+                .values()
+                .find(|bt| bt.boss_mission_id == boss_mission_id && bt.task_key == t.task_key)
+                .map(|bt| bt.id);
+            match existing_id {
+                Some(id) => {
+                    let bt = map.get_mut(&id).expect("just found");
+                    if bt.status == BoardTaskStatus::Pending {
+                        bt.title = t.title;
+                        bt.prompt = t.prompt;
+                        bt.backend = t.backend;
+                        bt.model_override = t.model_override;
+                        bt.model_effort = t.model_effort;
+                        bt.working_directory = t.working_directory;
+                        bt.depends_on = t.depends_on;
+                        bt.updated_at = now.clone();
+                    }
+                    out.push(bt.clone());
+                }
+                None => {
+                    let bt = BoardTask {
+                        id: Uuid::new_v4(),
+                        boss_mission_id,
+                        task_key: t.task_key,
+                        title: t.title,
+                        prompt: t.prompt,
+                        backend: t.backend,
+                        model_override: t.model_override,
+                        model_effort: t.model_effort,
+                        working_directory: t.working_directory,
+                        depends_on: t.depends_on,
+                        status: BoardTaskStatus::Pending,
+                        outcome: None,
+                        worker_mission_id: None,
+                        attempts: 0,
+                        result_digest: None,
+                        notes: None,
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    };
+                    map.insert(bt.id, bt.clone());
+                    out.push(bt);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_board_tasks(&self, boss_mission_id: Uuid) -> Result<Vec<BoardTask>, String> {
+        let map = self.board_tasks.read().await;
+        let mut tasks: Vec<BoardTask> = map
+            .values()
+            .filter(|bt| bt.boss_mission_id == boss_mission_id)
+            .cloned()
+            .collect();
+        tasks.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.task_key.cmp(&b.task_key))
+        });
+        Ok(tasks)
+    }
+
+    async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {
+        let map = self.board_tasks.read().await;
+        let mut ids: Vec<Uuid> = map
+            .values()
+            .filter(|bt| !bt.status.is_terminal())
+            .map(|bt| bt.boss_mission_id)
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    async fn get_board_task(&self, task_id: Uuid) -> Result<Option<BoardTask>, String> {
+        Ok(self.board_tasks.read().await.get(&task_id).cloned())
+    }
+
+    async fn get_board_task_by_worker(
+        &self,
+        worker_mission_id: Uuid,
+    ) -> Result<Option<BoardTask>, String> {
+        let map = self.board_tasks.read().await;
+        Ok(map
+            .values()
+            .filter(|bt| bt.worker_mission_id == Some(worker_mission_id))
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+            .cloned())
+    }
+
+    async fn save_board_task(&self, task: &BoardTask) -> Result<(), String> {
+        let mut map = self.board_tasks.write().await;
+        if !map.contains_key(&task.id) {
+            return Err(format!("Board task {} not found", task.id));
+        }
+        let mut saved = task.clone();
+        saved.updated_at = now_string();
+        map.insert(task.id, saved);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waiting_background_is_never_ack_promoted() {
+        // A mission parked in WaitingBackground has live background work; the
+        // stale-ack sweep must skip it even after its view-grace elapses,
+        // otherwise it would be archived while work is still running.
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("bg mission"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+        store
+            .update_mission_status(mission.id, MissionStatus::WaitingBackground)
+            .await
+            .expect("set waiting_background");
+        // Mark it viewed well in the past so the grace window is definitely
+        // exceeded — the only thing that should save it is the status guard.
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        store
+            .set_mission_first_viewed_at_if_unset(mission.id, &long_ago)
+            .await
+            .expect("set first viewed");
+
+        let promoted = store
+            .acknowledge_stale_awaiting_user_missions(0)
+            .await
+            .expect("run ack sweep");
+        assert!(
+            !promoted.contains(&mission.id),
+            "waiting_background must not be ack-promoted"
+        );
+
+        let after = store
+            .get_mission(mission.id)
+            .await
+            .expect("get mission")
+            .expect("mission exists");
+        assert_eq!(after.status, MissionStatus::WaitingBackground);
+
+        let waiting = store
+            .get_waiting_background_mission_ids()
+            .await
+            .expect("list waiting_background");
+        assert!(waiting.contains(&mission.id));
+    }
 
     #[tokio::test]
     async fn update_mission_metadata_is_noop_when_fields_missing() {

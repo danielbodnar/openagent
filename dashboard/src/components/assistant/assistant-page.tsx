@@ -694,7 +694,7 @@ export default function AssistantPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full min-w-[720px] max-w-5xl space-y-6">
+      <div className="w-full min-w-[720px] max-w-5xl space-y-6 max-lg:min-w-0">
         {/* Header */}
         <header className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">

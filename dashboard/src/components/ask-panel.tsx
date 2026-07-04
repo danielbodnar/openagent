@@ -26,6 +26,8 @@ import {
   type AskMessage,
 } from "@/lib/api";
 import { LazyMarkdownContent } from "@/components/markdown-content";
+import { useMediaQuery } from "@/hooks/use-media-query";
+import { LG_MEDIA_QUERY } from "@/lib/responsive-layout";
 import { cn } from "@/lib/utils";
 
 interface AskPanelProps {
@@ -58,6 +60,20 @@ export function AskPanel({
   const [threadId, setThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<AskMessage[]>([]);
   const [input, setInput] = useState("");
+  // Resizable: persisted so the chat/co-pilot split survives reloads.
+  // Lazy initializer reads the saved width on first render so the panel never
+  // mounts at the default and then jumps to the stored value.
+  const [panelWidth, setPanelWidthRaw] = useState(() => {
+    if (typeof window === "undefined") return 380;
+    const saved = Number(window.localStorage.getItem("ask-panel-width"));
+    return Number.isFinite(saved) && saved >= 300 && saved <= 760 ? saved : 380;
+  });
+  const setPanelWidth = useCallback((w: number) => {
+    setPanelWidthRaw(w);
+  }, []);
+  const persistPanelWidth = useCallback((w: number) => {
+    localStorage.setItem("ask-panel-width", String(Math.round(w)));
+  }, []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showThreadList, setShowThreadList] = useState(false);
@@ -351,9 +367,45 @@ export function AskPanel({
   const copilot = "text-[rgb(var(--copilot))]";
   const ctrl =
     "border border-[rgb(var(--foreground)/0.1)] bg-[rgb(var(--foreground)/0.04)] text-[rgb(var(--foreground)/0.6)] hover:bg-[rgb(var(--foreground)/0.07)] hover:text-[rgb(var(--foreground)/0.85)]";
+  const isDesktop = useMediaQuery(LG_MEDIA_QUERY);
 
   return (
-    <div className="flex h-full w-[380px] shrink-0 flex-col rounded-2xl border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--background-elevated)/0.72)] backdrop-blur-xl">
+    <div
+      className={cn(
+        "@container relative flex h-full shrink-0 flex-col rounded-2xl border border-[rgb(var(--copilot)/0.25)] bg-[rgb(var(--background-elevated)/0.72)] backdrop-blur-xl",
+        !isDesktop && "w-full max-lg:h-[60vh]",
+      )}
+      style={isDesktop ? { width: panelWidth } : undefined}
+    >
+      {/* Drag the left edge to trade width between the chat and the co-pilot. */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        className="absolute -left-1 top-0 z-10 hidden h-full w-2 cursor-col-resize hover:bg-[rgb(var(--copilot)/0.25)] lg:block"
+        onPointerDown={(e) => {
+          e.preventDefault();
+          const startX = e.clientX;
+          const startWidth = panelWidth;
+          const onMove = (ev: PointerEvent) => {
+            const next = Math.min(
+              760,
+              Math.max(300, startWidth + (startX - ev.clientX)),
+            );
+            setPanelWidth(next);
+          };
+          const onUp = (ev: PointerEvent) => {
+            persistPanelWidth(
+              Math.min(760, Math.max(300, startWidth + (startX - ev.clientX))),
+            );
+            window.removeEventListener("pointermove", onMove);
+            window.removeEventListener("pointerup", onUp);
+            window.removeEventListener("pointercancel", onUp);
+          };
+          window.addEventListener("pointermove", onMove);
+          window.addEventListener("pointerup", onUp);
+          window.addEventListener("pointercancel", onUp);
+        }}
+      />
       {/* Header */}
       <div className="flex items-center justify-between gap-2 border-b border-[rgb(var(--foreground)/0.1)] px-3 py-2.5">
         <div className="flex items-center gap-2">
@@ -640,7 +692,7 @@ function AskBubble({
             {content}
           </p>
         </div>
-        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--foreground)/0.07)]">
+        <div className="@max-[24rem]:hidden flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--foreground)/0.07)]">
           <User className="h-3.5 w-3.5 text-[rgb(var(--foreground)/0.5)]" />
         </div>
       </div>
@@ -667,7 +719,7 @@ function AskBubble({
   // assistant
   return (
     <div className="flex justify-start gap-2">
-      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--copilot)/0.15)] ring-1 ring-inset ring-[rgb(var(--copilot)/0.25)]">
+      <div className="@max-[24rem]:hidden flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--copilot)/0.15)] ring-1 ring-inset ring-[rgb(var(--copilot)/0.25)]">
         <Sparkles className="h-3.5 w-3.5 text-[rgb(var(--copilot))]" />
       </div>
       <div className="group max-w-[85%] rounded-2xl rounded-tl-md border border-[rgb(var(--copilot)/0.18)] bg-[rgb(var(--copilot)/0.07)] px-3 py-2">

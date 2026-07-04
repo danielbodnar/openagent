@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 // Control event/command types (Phase 6 of the decomposition).
+pub mod board;
 pub mod events;
 pub use events::*;
 
@@ -40,8 +41,9 @@ use uuid::Uuid;
 
 #[allow(unused_imports)]
 use super::supervision::{
-    ack_promotion_loop, cleanup_stale_active_missions_once, recover_server_shutdown_missions,
-    stale_mission_cleanup_loop, stuck_mission_watchdog_loop,
+    ack_promotion_loop, background_task_autoresume_loop, cleanup_stale_active_missions_once,
+    recover_server_shutdown_missions, reset_waiting_background_on_boot, stale_mission_cleanup_loop,
+    stuck_mission_watchdog_loop,
 };
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
@@ -54,13 +56,18 @@ use super::auth::AuthUser;
 use super::desktop;
 use super::library::SharedLibrary;
 use super::mission_store::{
-    self, create_mission_store, now_string, Mission, MissionHistoryEntry, MissionStore,
-    MissionStoreType,
+    self, create_mission_store, now_string, AwaitingKind, BoardTask, BoardTaskStatus, Mission,
+    MissionHistoryEntry, MissionStore, MissionStoreType, NewBoardTask,
 };
 use super::routes::AppState;
 
 pub(crate) const SERVER_SHUTDOWN_AUTO_RESUME_MAX_AGE_HOURS: u64 = 48;
 const INTERRUPTED_RESUME_PROMPT: &str = "You were interrupted, resume your work.";
+
+/// One entry in the main control queue: (message id, content, optional per-message
+/// agent override, target mission id, source). Aliased to keep signatures under
+/// clippy's `type_complexity` threshold.
+type ControlQueueEntry = (Uuid, String, Option<String>, Option<Uuid>, Option<String>);
 
 /// Silence threshold before declaring a mission stuck. Conservative so
 /// legitimately long codex turns (Lean compiles, CI polls) don't trigger
@@ -77,6 +84,29 @@ pub(crate) const ACK_GRACE_SECONDS: u64 = 3600;
 /// How often the ack-promotion tick scans for stale `AwaitingUser` missions.
 pub(crate) const ACK_PROMOTION_TICK_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
+
+/// Whether an incoming user message (a real one, or the background-task
+/// auto-resume synthetic message) should re-activate `status` to `Active`.
+///
+/// Kept as one predicate so every message-dequeue site agrees. It deliberately
+/// includes `WaitingBackground`: a resume delivered while background jobs were
+/// still live must flip the mission to `Active` — which clears `first_viewed_at`
+/// (see `MissionStore::update_mission_status`) — otherwise the stale timestamp
+/// survives the later demotion back to `AwaitingUser` and the ack-promotion
+/// sweep can archive a mission whose next turn just started.
+pub(crate) fn message_activates_mission(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Pending
+            | MissionStatus::Interrupted
+            | MissionStatus::Blocked
+            | MissionStatus::Completed
+            | MissionStatus::Failed
+            | MissionStatus::AwaitingUser
+            | MissionStatus::WaitingBackground
+            | MissionStatus::Acknowledged
+    )
+}
 
 /// Returns a safe index to truncate a string at, ensuring we don't cut UTF-8 characters.
 pub(crate) fn safe_truncate_index(s: &str, max: usize) -> usize {
@@ -424,6 +454,178 @@ const METADATA_SOURCE_USER: &str = "user";
 const METADATA_VERSION_V1: &str = "v1";
 static MISSION_TITLE_UPDATE_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
+
+/// Stall-guard: number of consecutive auto-armed fallback wakeups per mission,
+/// since the last real user message or self-armed automation. Bounds how many
+/// times the server will auto-resume an orchestrator that keeps parking without
+/// scheduling its own wakeup, so a genuinely-finished orchestrator isn't woken
+/// forever (after the cap it's left for a human).
+static STALL_GUARD_CONSECUTIVE_ARMS: std::sync::LazyLock<std::sync::Mutex<HashMap<Uuid, u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+const STALL_GUARD_MAX_CONSECUTIVE_ARMS: u32 = 3;
+const STALL_GUARD_WAKEUP_SECONDS: u64 = 1200;
+
+/// Clear a mission's stall-guard counter — called when a real user message
+/// arrives (the operator is steering it) so the guard's budget resets.
+pub(crate) fn reset_stall_guard(mission_id: Uuid) {
+    if let Ok(mut m) = STALL_GUARD_CONSECUTIVE_ARMS.lock() {
+        m.remove(&mission_id);
+    }
+}
+
+/// If an orchestrator mission (one that has spawned child missions) parks in
+/// `AwaitingUser` with no active automation, arm a one-shot fallback wakeup so
+/// it re-checks and continues instead of stalling on an auto-notification that
+/// won't arrive. Leaf missions (no children) are never touched, so a mission
+/// legitimately awaiting a human answer is never auto-resumed. Bounded per
+/// mission; a no-op when the agent already armed its own wakeup.
+/// Returns `true` when a fallback wakeup was armed (used by tests; callers may
+/// ignore it).
+async fn maybe_arm_stall_guard_wakeup(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+) -> bool {
+    // Only orchestrators are guarded — leaf missions awaiting a human are not.
+    let has_children = mission_store
+        .get_child_missions(mission_id)
+        .await
+        .map(|c| !c.is_empty())
+        .unwrap_or(false);
+    if !has_children {
+        return false;
+    }
+    // The agent self-armed a wakeup → it manages its own cadence; reset + skip.
+    if mission_has_active_automation(mission_store, mission_id).await {
+        reset_stall_guard(mission_id);
+        return false;
+    }
+    // Bound consecutive auto-arms.
+    let count = {
+        let Ok(mut m) = STALL_GUARD_CONSECUTIVE_ARMS.lock() else {
+            return false;
+        };
+        let c = m.entry(mission_id).or_insert(0);
+        if *c >= STALL_GUARD_MAX_CONSECUTIVE_ARMS {
+            return false;
+        }
+        *c += 1;
+        *c
+    };
+    tracing::info!(
+        mission_id = %mission_id,
+        arm = count,
+        max = STALL_GUARD_MAX_CONSECUTIVE_ARMS,
+        "Stall-guard: orchestrator parked in awaiting_user with no wakeup armed; arming fallback"
+    );
+    let prompt = "Auto-resume (stall-guard): your previous turn ended in awaiting_user \
+without scheduling a wakeup, but you are an orchestrator with work that may still be in \
+flight. Re-check your workers / board tasks / open PRs + CI and continue. If something is \
+genuinely async (CI, a long build), call ScheduleWakeup so you resume yourself. If \
+everything is truly done, report completion and stop."
+        .to_string();
+    let reason = format!(
+        "stall-guard auto-resume {}/{} (orchestrator parked with no wakeup armed)",
+        count, STALL_GUARD_MAX_CONSECUTIVE_ARMS
+    );
+    crate::api::mission_runner::spawn_claude_builtin_wakeup_automation(
+        mission_id,
+        STALL_GUARD_WAKEUP_SECONDS,
+        prompt,
+        reason,
+    );
+    true
+}
+
+#[cfg(test)]
+mod stall_guard_tests {
+    use super::*;
+
+    async fn mk(store: &Arc<dyn MissionStore>, parent: Option<Uuid>) -> Uuid {
+        store
+            .create_mission_with_parent(Some("m"), None, None, None, None, None, None, parent, None)
+            .await
+            .expect("create")
+            .id
+    }
+
+    #[tokio::test]
+    async fn leaf_mission_is_never_guarded() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let leaf = mk(&store, None).await;
+        // No children → never armed, regardless of how many times it parks.
+        for _ in 0..5 {
+            assert!(!maybe_arm_stall_guard_wakeup(&store, leaf).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_arms_then_caps_then_resets() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let boss = mk(&store, None).await;
+        let _child = mk(&store, Some(boss)).await; // makes `boss` an orchestrator
+        reset_stall_guard(boss);
+        // Arms up to the cap, then stops (leaves it for a human).
+        for _ in 0..STALL_GUARD_MAX_CONSECUTIVE_ARMS {
+            assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
+        }
+        assert!(!maybe_arm_stall_guard_wakeup(&store, boss).await); // capped
+                                                                    // A real user message resets the budget.
+        reset_stall_guard(boss);
+        assert!(maybe_arm_stall_guard_wakeup(&store, boss).await);
+        reset_stall_guard(boss);
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_paused_mission_until_resumed_or_cancelled() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mid = mk(&store, None).await;
+        store
+            .update_mission_status(mid, MissionStatus::Paused)
+            .await
+            .expect("pause");
+
+        // Deleting a paused mission is refused with 409 and leaves it intact.
+        let err = delete_mission_with_children(&store, mid, &[])
+            .await
+            .expect_err("paused delete should be refused");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(store.get_mission(mid).await.expect("get").is_some());
+
+        // Once it leaves Paused (e.g. resumed → Interrupted), delete succeeds.
+        store
+            .update_mission_status(mid, MissionStatus::Interrupted)
+            .await
+            .expect("resume");
+        delete_mission_with_children(&store, mid, &[])
+            .await
+            .expect("delete after resume");
+        assert!(store.get_mission(mid).await.expect("get").is_none());
+    }
+
+    #[test]
+    fn resolve_actor_prefers_explicit_then_falls_back_to_user() {
+        let user = AuthUser {
+            id: "u-123".to_string(),
+            username: "thomas".to_string(),
+        };
+        // Explicit override wins (trimmed).
+        assert_eq!(
+            resolve_actor(Some("  system:fleet-watcher ".to_string()), &user),
+            "system:fleet-watcher"
+        );
+        // Blank override is ignored → falls back to the user.
+        assert_eq!(resolve_actor(Some("   ".to_string()), &user), "user:thomas");
+        assert_eq!(resolve_actor(None, &user), "user:thomas");
+        // No username → fall back to the id.
+        let anon = AuthUser {
+            id: "u-123".to_string(),
+            username: String::new(),
+        };
+        assert_eq!(resolve_actor(None, &anon), "user:u-123");
+    }
+}
+
 struct MetadataRefreshTaskEntry {
     handle: tokio::task::JoinHandle<()>,
     force_refresh: bool,
@@ -2441,24 +2643,85 @@ pub struct ControlMessageRequest {
     pub agent: Option<String>,
     /// Target mission ID. If provided and differs from the currently running mission,
     /// the backend will automatically start this mission in parallel (if capacity allows).
-    #[serde(default)]
+    /// `target_mission_id` is accepted as an alias — unknown fields are otherwise
+    /// silently ignored, and a mistyped targeting field would silently reroute the
+    /// message to the session's current mission.
+    #[serde(default, alias = "target_mission_id")]
     pub mission_id: Option<Uuid>,
+    /// Catch-all for unrecognized request fields — surfaced as `warnings` in
+    /// the response instead of being silently dropped (a mistyped targeting
+    /// field once silently rerouted a message to the wrong mission).
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ControlMessageResponse {
     pub id: Uuid,
     pub queued: bool,
+    /// Non-fatal request problems (e.g. unrecognized fields that were
+    /// ignored). Empty on clean requests; omitted from the JSON then.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 /// A message waiting in the queue
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedMessage {
     pub id: Uuid,
     pub content: String,
     pub agent: Option<String>,
     /// Which mission this queued message belongs to
     pub mission_id: Option<Uuid>,
+    /// Attribution for the message (e.g. `api:<user_id>`, `telegram`). Persisted
+    /// so a queued message keeps its source after a restart. Defaults to `None`
+    /// for snapshots written before this field existed.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Serialize the control session queue to a stable JSON snapshot for
+/// persistence across restarts (see `MissionStore::save_control_queue`).
+fn serialize_queue_snapshot(queue: &VecDeque<ControlQueueEntry>) -> String {
+    let items: Vec<QueuedMessage> = queue
+        .iter()
+        .map(|(id, content, agent, target_mid, source)| QueuedMessage {
+            id: *id,
+            content: content.clone(),
+            agent: agent.clone(),
+            mission_id: *target_mid,
+            source: source.clone(),
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Persist the control queue snapshot iff it changed since `last_persisted`
+/// (debounced so unchanged iterations don't churn the DB).
+///
+/// Called both at the actor-loop top and immediately after every dequeue. The
+/// post-dequeue call is what prevents stale double-execution: without it, a
+/// popped message lingers in the persisted snapshot until the next loop pass, so
+/// a crash after the pop (during the potentially-awaiting work that starts the
+/// run) would restore and re-run a message that already started — bypassing the
+/// in-memory idempotency guard.
+async fn persist_control_queue_if_changed(
+    mission_store: &Arc<dyn MissionStore>,
+    session_user_id: &str,
+    queue: &VecDeque<ControlQueueEntry>,
+    last_persisted: &mut String,
+) {
+    let snapshot = serialize_queue_snapshot(queue);
+    if snapshot != *last_persisted {
+        if let Err(e) = mission_store
+            .save_control_queue(session_user_id, &snapshot)
+            .await
+        {
+            tracing::warn!("Failed to persist control queue: {e}");
+        } else {
+            *last_persisted = snapshot;
+        }
+    }
 }
 
 /// Tool result posted by the frontend for an interactive tool call.
@@ -3131,6 +3394,23 @@ pub async fn post_message(
     let id = req.client_message_id.unwrap_or_else(Uuid::new_v4);
     let agent = req.agent;
     let target_mission_id = req.mission_id;
+    // Fail loud on unrecognized fields (see ControlMessageRequest::extra).
+    let mut warnings: Vec<String> = Vec::new();
+    if !req.extra.is_empty() {
+        let ignored: Vec<&str> = req.extra.keys().map(String::as_str).collect();
+        let joined = ignored.join(",");
+        tracing::warn!(
+            user_id = %user.id,
+            ignored_fields = %joined,
+            "control message request carried unrecognized fields (ignored)"
+        );
+        warnings.push(format!("unrecognized fields ignored: {joined}"));
+    }
+    // A real user message means the operator is steering this mission — reset
+    // its stall-guard budget so future genuine stalls get the full allowance.
+    if let Some(mid) = target_mission_id {
+        reset_stall_guard(mid);
+    }
     let control = control_for_user(&state, &user).await;
     let (queued_tx, queued_rx) = oneshot::channel();
     tracing::info!(
@@ -3149,6 +3429,8 @@ pub async fn post_message(
             content,
             agent,
             target_mission_id,
+            strict: false,
+            source: Some(format!("api:{}", user.id)),
             respond: queued_tx,
         })
         .await
@@ -3163,7 +3445,291 @@ pub async fn post_message(
             status.state != ControlRunState::Idle
         }
     };
-    Ok(Json(ControlMessageResponse { id, queued }))
+    Ok(Json(ControlMessageResponse {
+        id,
+        queued,
+        warnings,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Task board API (see `board` module for the scheduler).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BoardUpsertRequest {
+    pub tasks: Vec<NewBoardTask>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BoardUtilization {
+    pub pending: usize,
+    pub running: usize,
+    pub settled: usize,
+    pub accepted: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub total: usize,
+    pub max_parallel: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct BoardResponse {
+    pub tasks: Vec<BoardTask>,
+    pub utilization: BoardUtilization,
+}
+
+fn board_utilization(tasks: &[BoardTask], max_parallel: usize) -> BoardUtilization {
+    let count = |s: BoardTaskStatus| tasks.iter().filter(|t| t.status == s).count();
+    BoardUtilization {
+        pending: count(BoardTaskStatus::Pending),
+        running: count(BoardTaskStatus::Running),
+        settled: count(BoardTaskStatus::Settled),
+        accepted: count(BoardTaskStatus::Accepted),
+        failed: count(BoardTaskStatus::Failed),
+        cancelled: count(BoardTaskStatus::Cancelled),
+        total: tasks.len(),
+        max_parallel,
+    }
+}
+
+/// GET /api/control/missions/:id/board — full board for a boss mission.
+pub async fn get_mission_board(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<BoardResponse>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let tasks = control
+        .mission_store
+        .list_board_tasks(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
+    Ok(Json(BoardResponse {
+        utilization: board_utilization(&tasks, max_parallel),
+        tasks,
+    }))
+}
+
+/// POST /api/control/missions/:id/board/tasks — register/update tasks.
+/// The scheduler picks up ready tasks within one pass (~3s).
+pub async fn upsert_mission_board_tasks(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<BoardUpsertRequest>,
+) -> Result<Json<BoardResponse>, (StatusCode, String)> {
+    if req.tasks.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tasks is required".to_string()));
+    }
+    for t in &req.tasks {
+        if t.task_key.trim().is_empty() || t.prompt.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "every task needs a non-empty task_key and prompt".to_string(),
+            ));
+        }
+        // Same operator policy as the orchestrator MCP: worker missions never
+        // burn Claude tokens. Enforced here too so the API can't be used to
+        // bypass the MCP-level check.
+        let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let is_claude = t.backend.eq_ignore_ascii_case("claudecode")
+            || t.model_override
+                .as_deref()
+                .map(|m| m.to_ascii_lowercase().contains("claude"))
+                .unwrap_or(false);
+        if t.backend.trim().is_empty() || (is_claude && !claude_allowed) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "task `{}`: workers need an explicit non-Claude backend (got `{}`)",
+                    t.task_key, t.backend
+                ),
+            ));
+        }
+    }
+
+    let control = control_for_user(&state, &user).await;
+    // The boss mission must exist — tasks attached to a typo'd uuid would
+    // never be scheduled against the right workspace.
+    let boss = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("mission {} not found", id)))?;
+
+    control
+        .mission_store
+        .upsert_board_tasks(boss.id, req.tasks)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let tasks = control
+        .mission_store
+        .list_board_tasks(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
+    Ok(Json(BoardResponse {
+        utilization: board_utilization(&tasks, max_parallel),
+        tasks,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BoardVerdictRequest {
+    /// "accept" or "reject".
+    pub action: String,
+    /// Required for reject: feedback delivered to the worker.
+    #[serde(default)]
+    pub feedback: Option<String>,
+}
+
+/// POST /api/control/board/tasks/:task_id/verdict — boss judgment on a
+/// settled task. Accept is terminal; reject resumes the worker with feedback
+/// (or re-queues the task if the worker mission is gone).
+pub async fn board_task_verdict(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(task_id): Path<Uuid>,
+    Json(req): Json<BoardVerdictRequest>,
+) -> Result<Json<BoardTask>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut task = control
+        .mission_store
+        .get_board_task(task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
+
+    match req.action.as_str() {
+        "accept" => {
+            if task.status != BoardTaskStatus::Settled && task.status != BoardTaskStatus::Failed {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("task `{}` is {}, not settled", task.task_key, task.status),
+                ));
+            }
+            task.status = BoardTaskStatus::Accepted;
+        }
+        "reject" => {
+            let feedback = req
+                .feedback
+                .as_deref()
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "reject requires non-empty feedback".to_string(),
+                ))?;
+            if task.status.is_terminal() && task.status != BoardTaskStatus::Failed {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("task `{}` is already {}", task.task_key, task.status),
+                ));
+            }
+            task.notes = {
+                let stamp = now_string();
+                Some(match &task.notes {
+                    Some(n) => format!("{n}\n[{stamp}] rejected: {feedback}"),
+                    None => format!("[{stamp}] rejected: {feedback}"),
+                })
+            };
+            // Prefer resuming the existing worker (it has the context); fall
+            // back to a fresh spawn via the scheduler when the worker is gone.
+            let resumed = if let Some(worker_id) = task.worker_mission_id {
+                let (tx, _rx) = oneshot::channel();
+                control
+                    .cmd_tx
+                    .send(ControlCommand::UserMessage {
+                        id: Uuid::new_v4(),
+                        content: format!(
+                            "[task-board] The boss rejected your result for task `{}`. \
+                             Address this feedback, then end your turn with the same \
+                             done/BLOCKED contract as before:\n\n{}",
+                            task.task_key, feedback
+                        ),
+                        agent: None,
+                        target_mission_id: Some(worker_id),
+                        strict: false,
+                        source: Some("task-board".to_string()),
+                        respond: tx,
+                    })
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            if resumed {
+                task.status = BoardTaskStatus::Running;
+                // A rejection grants a fresh retry budget: the boss explicitly
+                // asked for another attempt.
+                task.attempts = 1;
+            } else {
+                task.status = BoardTaskStatus::Pending;
+                task.attempts = 0;
+                task.worker_mission_id = None;
+                task.prompt = format!(
+                    "{}\n\n[task-board] Previous attempt was rejected with feedback:\n{}",
+                    task.prompt, feedback
+                );
+            }
+            task.outcome = None;
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown action `{}` (use accept|reject)", other),
+            ));
+        }
+    }
+
+    control
+        .mission_store
+        .save_board_task(&task)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(task))
+}
+
+/// POST /api/control/board/tasks/:task_id/cancel — mark a task cancelled.
+/// A running worker is left to finish its current turn; its settle is ignored.
+pub async fn cancel_board_task(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<BoardTask>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let mut task = control
+        .mission_store
+        .get_board_task(task_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or((StatusCode::NOT_FOUND, format!("task {} not found", task_id)))?;
+    if task.status.is_terminal() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("task `{}` is already {}", task.task_key, task.status),
+        ));
+    }
+    task.status = BoardTaskStatus::Cancelled;
+    task.notes = {
+        let stamp = now_string();
+        Some(match &task.notes {
+            Some(n) => format!("{n}\n[{stamp}] cancelled"),
+            None => format!("[{stamp}] cancelled"),
+        })
+    };
+    control
+        .mission_store
+        .save_board_task(&task)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(task))
 }
 
 /// Submit a frontend tool result to resume the running agent.
@@ -3315,6 +3881,18 @@ pub struct ListMissionsQuery {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: Option<usize>,
+    /// Optional filter: exact mission status (e.g. "awaiting_user").
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Optional filter: exact project identifier.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Optional filter: missions carrying this tag.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Optional filter: workspace by id or (case-insensitive) name.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 pub async fn list_missions(
@@ -3325,15 +3903,300 @@ pub async fn list_missions(
     let control = control_for_user(&state, &user).await;
     // Default to the most recent 50; honor an explicit limit so callers (e.g.
     // the assistant MCP) can request more, capped to keep the response bounded.
+    let has_filters = query.status.is_some()
+        || query.project.is_some()
+        || query.tag.is_some()
+        || query.workspace.is_some();
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0);
-    let mut missions = control
+
+    let mut missions = if !has_filters {
+        // Fast path: no filters, list the page directly.
+        let mut page = control
+            .mission_store
+            .list_missions(limit, offset)
+            .await
+            .map_err(internal_error)?;
+        populate_workspace_names(&state, &mut page).await;
+        page
+    } else {
+        // Filtered path: predicate-match runs in memory, so a single 200-row
+        // page would silently drop matches on a larger fleet. Scan from the
+        // start, collecting matches, until we have `offset + limit` of them or
+        // hit a bounded ceiling. `offset` here means "skip this many MATCHING
+        // missions" (consistent with filtered pagination), not raw rows.
+        const PAGE: usize = 200;
+        const MAX_SCAN: usize = 5_000;
+        let status = query.status.as_deref();
+        let project = query.project.as_deref();
+        let tag = query.tag.as_deref();
+        let workspace_lower = query.workspace.as_deref().map(|w| w.to_lowercase());
+        let workspace_raw = query.workspace.as_deref();
+        let want = offset.saturating_add(limit);
+
+        let mut matched: Vec<Mission> = Vec::new();
+        let mut scan_offset = 0usize;
+        let mut scanned = 0usize;
+        loop {
+            let mut page = control
+                .mission_store
+                .list_missions(PAGE, scan_offset)
+                .await
+                .map_err(internal_error)?;
+            let page_len = page.len();
+            populate_workspace_names(&state, &mut page).await;
+            for m in page {
+                let keep = status.is_none_or(|s| m.status.to_string() == s)
+                    && project.is_none_or(|p| m.project.project.as_deref() == Some(p))
+                    && tag.is_none_or(|t| m.project.tags.iter().any(|x| x == t))
+                    && match (workspace_raw, workspace_lower.as_deref()) {
+                        (Some(raw), Some(lower)) => {
+                            m.workspace_id.to_string() == raw
+                                || m.workspace_name
+                                    .as_deref()
+                                    .is_some_and(|name| name.to_lowercase() == lower)
+                        }
+                        _ => true,
+                    };
+                if keep {
+                    matched.push(m);
+                    if matched.len() >= want {
+                        break;
+                    }
+                }
+            }
+            scanned += page_len;
+            if matched.len() >= want || page_len < PAGE || scanned >= MAX_SCAN {
+                if scanned >= MAX_SCAN && matched.len() < want {
+                    tracing::warn!(
+                        "list_missions filter scan hit cap ({}); results may be incomplete",
+                        MAX_SCAN
+                    );
+                }
+                break;
+            }
+            scan_offset += PAGE;
+        }
+        // Apply the offset to matches (not raw rows) and cap at limit.
+        matched.into_iter().skip(offset).take(limit).collect()
+    };
+
+    populate_activity(&control, &mut missions).await;
+    Ok(Json(missions))
+}
+
+/// Targeted post-deploy/observability health for the mission fleet (P#8). One
+/// authenticated GET confirms the critical loop is alive after a restart:
+/// the control actor responds (scheduler heartbeat), the webhook forwarder and
+/// offload are configured, and the current queue/running/status counts.
+#[derive(Debug, Serialize)]
+pub struct FleetHealth {
+    pub status: &'static str,
+    pub version: String,
+    /// True iff the control actor answered our ListRunning/GetQueue probes —
+    /// i.e. the scheduler/dispatch loop is not wedged.
+    pub control_responsive: bool,
+    pub running: usize,
+    pub queue_depth: usize,
+    pub missions: crate::api::mission_store::MissionStatusCounts,
+    pub webhook_forwarder_configured: bool,
+    pub offload_configured: bool,
+}
+
+pub async fn fleet_health(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<FleetHealth>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    // Probe the control actor; a wedged scheduler surfaces as a failed probe.
+    let running = get_running_missions(&control).await.map(|r| r.len());
+    let (tx, rx) = oneshot::channel();
+    let queue_depth = if control
+        .cmd_tx
+        .send(ControlCommand::GetQueue { respond: tx })
+        .await
+        .is_ok()
+    {
+        rx.await.ok().map(|q| q.len())
+    } else {
+        None
+    };
+    let control_responsive = running.is_ok() && queue_depth.is_some();
+
+    let missions = control
         .mission_store
-        .list_missions(limit, offset)
+        .count_missions_by_status()
         .await
         .map_err(internal_error)?;
-    populate_workspace_names(&state, &mut missions).await;
-    Ok(Json(missions))
+
+    let cfg = &state.config;
+    Ok(Json(FleetHealth {
+        status: if control_responsive { "ok" } else { "degraded" },
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        control_responsive,
+        running: running.unwrap_or(0),
+        queue_depth: queue_depth.unwrap_or(0),
+        missions,
+        webhook_forwarder_configured: cfg.paloma_webhook_forward_url.is_some(),
+        offload_configured: cfg.spark_arbiter_url.is_some() || cfg.spark_ssh_target.is_some(),
+    }))
+}
+
+/// Per project/track rollup so Paloma can reason about a track in one call
+/// instead of scanning the fleet and parsing titles. Keyed by (project, track).
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackSummary {
+    pub project: Option<String>,
+    pub track: Option<String>,
+    pub total: usize,
+    pub active: usize,
+    pub pending: usize,
+    pub awaiting_user: usize,
+    /// `updated_at` of the most recently updated mission in the track.
+    pub last_activity_at: Option<String>,
+    /// `updated_at` of the most recent terminal (completed/failed/…) mission.
+    pub latest_terminal_at: Option<String>,
+    /// Operator-declared state / PR / next-check, taken from the most recently
+    /// updated mission in the track that has each set.
+    pub desired_state: Option<String>,
+    pub github_pr: Option<String>,
+    pub next_check_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TracksQuery {
+    /// Optional: restrict to one project.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// GET /api/control/tracks — roll missions up by (project, track). Untagged
+/// missions (no project and no track) are omitted. Scans newest-first up to a
+/// bounded ceiling.
+pub async fn list_tracks(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<TracksQuery>,
+) -> Result<Json<Vec<TrackSummary>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    const PAGE: usize = 200;
+    const MAX_SCAN: usize = 5_000;
+
+    // Preserve newest-first arrival order of groups, and let the first (most
+    // recent) mission seed each track's desired_state/github_pr/next_check_at.
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut groups: std::collections::HashMap<(String, String), TrackSummary> =
+        std::collections::HashMap::new();
+
+    let mut offset = 0usize;
+    while offset < MAX_SCAN {
+        let page = control
+            .mission_store
+            .list_missions(PAGE, offset)
+            .await
+            .map_err(internal_error)?;
+        let page_len = page.len();
+        for m in page {
+            let proj = m.project.project.clone();
+            let track = m.project.track.clone();
+            if proj.is_none() && track.is_none() {
+                continue; // untagged — not part of any track
+            }
+            if let Some(want) = query.project.as_deref() {
+                if proj.as_deref() != Some(want) {
+                    continue;
+                }
+            }
+            let key = (
+                proj.clone().unwrap_or_default(),
+                track.clone().unwrap_or_default(),
+            );
+            let entry = groups.entry(key.clone()).or_insert_with(|| {
+                order.push(key.clone());
+                TrackSummary {
+                    project: proj.clone(),
+                    track: track.clone(),
+                    total: 0,
+                    active: 0,
+                    pending: 0,
+                    awaiting_user: 0,
+                    last_activity_at: None,
+                    latest_terminal_at: None,
+                    desired_state: None,
+                    github_pr: None,
+                    next_check_at: None,
+                }
+            });
+            entry.total += 1;
+            match m.status {
+                MissionStatus::Active => entry.active += 1,
+                MissionStatus::Pending => entry.pending += 1,
+                MissionStatus::AwaitingUser => entry.awaiting_user += 1,
+                _ => {}
+            }
+            // Missions arrive newest-first, so the first non-None value wins
+            // (most recent). last_activity_at is the first (max) updated_at.
+            if entry.last_activity_at.is_none() {
+                entry.last_activity_at = Some(m.updated_at.clone());
+            }
+            if entry.latest_terminal_at.is_none() && m.status.is_terminal() {
+                entry.latest_terminal_at = Some(m.updated_at.clone());
+            }
+            if entry.desired_state.is_none() {
+                entry.desired_state = m.project.desired_state.clone();
+            }
+            if entry.github_pr.is_none() {
+                entry.github_pr = m.project.github_pr.clone();
+            }
+            if entry.next_check_at.is_none() {
+                entry.next_check_at = m.project.next_check_at.clone();
+            }
+        }
+        if page_len < PAGE {
+            break;
+        }
+        offset += PAGE;
+    }
+
+    let tracks = order
+        .into_iter()
+        .filter_map(|k| groups.remove(&k))
+        .collect::<Vec<_>>();
+    Ok(Json(tracks))
+}
+
+/// Enrich missions with computed activity timestamps (P#5): the most recent
+/// event and assistant output from the event log, plus a `last_activity_at`
+/// convenience = max(updated_at, last_agent_event_at). Best-effort: a store
+/// without an event log (or a failed query) leaves the computed fields unset.
+async fn populate_activity(control: &ControlState, missions: &mut [Mission]) {
+    if missions.is_empty() {
+        return;
+    }
+    let ids: Vec<Uuid> = missions.iter().map(|m| m.id).collect();
+    let activity = match control.mission_store.get_mission_activity(&ids).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!("Failed to load mission activity: {}", e);
+            return;
+        }
+    };
+    for mission in missions.iter_mut() {
+        if let Some((last_event, last_output)) = activity.get(&mission.id) {
+            mission.activity.last_agent_event_at = last_event.clone();
+            mission.activity.last_output_at = last_output.clone();
+        }
+        // last_activity_at = the most recent of updated_at and the newest event.
+        let last_activity = [
+            Some(mission.updated_at.clone()),
+            mission.activity.last_agent_event_at.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        mission.activity.last_activity_at = last_activity;
+    }
 }
 
 async fn populate_workspace_names(state: &Arc<AppState>, missions: &mut [Mission]) {
@@ -3687,7 +4550,7 @@ pub async fn get_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Mission>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     match control
         .mission_store
@@ -3696,14 +4559,217 @@ pub async fn get_mission(
         .map_err(internal_error)?
     {
         Some(mut mission) => {
-            // Populate workspace_name
-            if let Some(workspace) = state.workspaces.get(mission.workspace_id).await {
-                mission.workspace_name = Some(workspace.name);
+            // Populate workspace_name + spark_offload from the workspace (P#7).
+            let workspace = state.workspaces.get(mission.workspace_id).await;
+            if let Some(ws) = workspace.as_ref() {
+                mission.workspace_name = Some(ws.name.clone());
             }
-            Ok(Json(mission))
+            let mut one = [mission];
+            populate_activity(&control, &mut one).await;
+            let [mission] = one;
+
+            // Serialize then attach the computed spark_offload block so Paloma
+            // can route heavy builds without probing the host each time.
+            let mut value = serde_json::to_value(&mission).map_err(internal_error)?;
+            let host_configured =
+                state.config.spark_arbiter_url.is_some() || state.config.spark_ssh_target.is_some();
+            let enabled = workspace
+                .as_ref()
+                .map(|ws| ws.spark_offload_enabled())
+                .unwrap_or(false);
+            let env_injected = workspace
+                .as_ref()
+                .map(|ws| ws.spark_offload_env(mission.id).is_some())
+                .unwrap_or(false);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "spark_offload".to_string(),
+                    serde_json::json!({
+                        "enabled": enabled,
+                        "env_injected": env_injected,
+                        "host_configured": host_configured,
+                    }),
+                );
+            }
+            Ok(Json(value))
         }
         None => Err((StatusCode::NOT_FOUND, format!("Mission {} not found", id))),
     }
+}
+
+/// Compact, orchestrator-friendly view of a mission: status, last exchange,
+/// and PR links — without the full transcript. Recap/orchestration sessions
+/// previously pulled entire mission histories (multi-KB each) just to answer
+/// "where is this mission at?"; this answers the same question in ~2 KB.
+pub async fn get_mission_digest(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let Some(mut mission) = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Err((StatusCode::NOT_FOUND, format!("Mission {} not found", id)));
+    };
+    if mission.workspace_name.is_none() {
+        mission.workspace_name = state
+            .workspaces
+            .get(mission.workspace_id)
+            .await
+            .map(|ws| ws.name);
+    }
+
+    fn truncate_chars(s: &str, max: usize) -> String {
+        let total = s.chars().count();
+        if total <= max {
+            s.to_string()
+        } else {
+            let cut: String = s.chars().take(max).collect();
+            format!("{cut}… [+{} chars truncated]", total - max)
+        }
+    }
+
+    let last_assistant = mission
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.role == "assistant" && !e.content.trim().is_empty())
+        .map(|e| truncate_chars(&e.content, 2000));
+    let last_user = mission
+        .history
+        .iter()
+        .rev()
+        .find(|e| e.role == "user")
+        .map(|e| truncate_chars(&e.content, 500));
+
+    // GitHub PR links mentioned near the end of the transcript (most recent
+    // first, deduped) — the fact orchestrators most often dig transcripts for.
+    let mut github_prs: Vec<String> = Vec::new();
+    for entry in mission.history.iter().rev().take(10) {
+        for word in entry.content.split_whitespace() {
+            let word = word.trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '/' && c != ':' && c != '.'
+            });
+            if word.starts_with("https://github.com/") && word.contains("/pull/") {
+                let url = word.trim_end_matches(|c: char| !c.is_ascii_digit());
+                if !url.is_empty() && !github_prs.iter().any(|u| u == url) {
+                    github_prs.push(url.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "id": mission.id,
+        "title": mission.title,
+        "status": mission.status,
+        "awaiting_kind": mission.awaiting_kind.map(|k| k.as_str()),
+        "terminal_reason": mission.terminal_reason,
+        "short_description": mission.short_description,
+        "backend": mission.backend,
+        "model_override": mission.model_override,
+        "model_effort": mission.model_effort,
+        "workspace_id": mission.workspace_id,
+        "workspace_name": mission.workspace_name,
+        "project": mission.project,
+        "created_at": mission.created_at,
+        "updated_at": mission.updated_at,
+        "history_len": mission.history.len(),
+        "last_user_message": last_user,
+        "last_assistant_message": last_assistant,
+        "github_prs": github_prs,
+    })))
+}
+
+/// Fleet integrity report: mission-store anomalies that otherwise fail
+/// silently — pending missions nothing will ever dispatch, active missions
+/// with no recent progress, and long-idle awaiting_user rows. Read-only;
+/// intended for a daily sweep or an on-demand health check (178 orphaned
+/// pending missions once accumulated unnoticed before this existed).
+pub async fn missions_integrity(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    let missions = control
+        .mission_store
+        .list_missions(5000, 0)
+        .await
+        .map_err(internal_error)?;
+    let now = chrono::Utc::now();
+    let age_minutes = |ts: &str| -> i64 {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|t| (now - t.with_timezone(&chrono::Utc)).num_minutes())
+            .unwrap_or(0)
+    };
+    let brief = |m: &Mission| {
+        serde_json::json!({
+            "id": m.id,
+            "title": m.title,
+            "status": m.status,
+            "updated_age_minutes": age_minutes(&m.updated_at),
+        })
+    };
+
+    // Pending missions: split into scheduler-visible (deferred goal set,
+    // waiting on capacity/not_before) vs orphaned (nothing will dispatch them).
+    let mut orphaned_pending: Vec<serde_json::Value> = Vec::new();
+    let mut scheduled_waiting: Vec<serde_json::Value> = Vec::new();
+    for m in missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::Pending)
+    {
+        if age_minutes(&m.created_at) < 15 {
+            continue; // freshly created; give the caller time to deliver a goal
+        }
+        let has_goal = control
+            .mission_store
+            .get_deferred_goal(m.id)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if has_goal {
+            scheduled_waiting.push(brief(m));
+        } else {
+            orphaned_pending.push(brief(m));
+        }
+    }
+
+    let stale_active: Vec<serde_json::Value> = missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::Active && age_minutes(&m.updated_at) > 24 * 60)
+        .map(brief)
+        .collect();
+    let stale_awaiting: Vec<serde_json::Value> = missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::AwaitingUser && age_minutes(&m.updated_at) > 72 * 60)
+        .map(brief)
+        .collect();
+
+    let truncate = |mut v: Vec<serde_json::Value>| -> (usize, Vec<serde_json::Value>) {
+        let count = v.len();
+        v.truncate(20);
+        (count, v)
+    };
+    let (orphaned_count, orphaned_pending) = truncate(orphaned_pending);
+    let (scheduled_count, scheduled_waiting) = truncate(scheduled_waiting);
+    let (stale_active_count, stale_active) = truncate(stale_active);
+    let (stale_awaiting_count, stale_awaiting) = truncate(stale_awaiting);
+
+    Ok(Json(serde_json::json!({
+        "generated_at": now.to_rfc3339(),
+        "scanned": missions.len(),
+        "healthy": orphaned_count == 0 && stale_active_count == 0,
+        "orphaned_pending": { "count": orphaned_count, "missions": orphaned_pending },
+        "scheduled_waiting": { "count": scheduled_count, "missions": scheduled_waiting },
+        "stale_active": { "count": stale_active_count, "missions": stale_active },
+        "stale_awaiting_user": { "count": stale_awaiting_count, "missions": stale_awaiting },
+    })))
 }
 
 /// Create a new mission and switch to it.
@@ -3727,6 +4793,44 @@ pub struct CreateMissionRequest {
     pub parent_mission_id: Option<Uuid>,
     /// Working directory override (for git worktrees etc.)
     pub working_directory: Option<String>,
+    /// FLEET-001 scheduling hint: dispatch priority (higher = more important,
+    /// default 0). The scheduler dispatches higher-priority scheduled missions
+    /// first, FIFO within the same priority.
+    pub priority: Option<i32>,
+    /// FLEET-001 scheduling hint: do not dispatch before this timestamp. The
+    /// mission's first message is held (as `deferred_goal`) until then.
+    pub not_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// FLEET-001 scheduling hint: deadline. A scheduled mission that never
+    /// dispatches before this is failed with reason `deadline_exceeded`.
+    pub deadline: Option<chrono::DateTime<chrono::Utc>>,
+    /// Project tagging: stable project identifier (e.g. "verity-core").
+    pub project: Option<String>,
+    /// Project tagging: track / workstream within the project.
+    pub track: Option<String>,
+    /// Project tagging: intent (e.g. "review_merge_pr").
+    pub intent: Option<String>,
+    /// Project tagging: associated GitHub PR ref (e.g. "owner/repo#123").
+    pub github_pr: Option<String>,
+    /// Project tagging: freeform tags.
+    pub tags: Option<Vec<String>>,
+    /// Track state, e.g. "waiting_ci" / "waiting_review" / "blocked_external".
+    pub desired_state: Option<String>,
+    /// When the track should next be checked (RFC3339).
+    pub next_check_at: Option<String>,
+    /// Initial prompt for the mission. Stored as the mission's deferred goal:
+    /// the FLEET-001 scheduler dispatches it as the first user message as soon
+    /// as parallel capacity allows (immediately when a slot is free, honoring
+    /// `not_before` when set). This makes create+start atomic — callers no
+    /// longer need a follow-up `POST /api/control/message`, whose delivery
+    /// used to be droppable at capacity, orphaning the mission.
+    pub prompt: Option<String>,
+    /// Catch-all for unrecognized request fields. Serde ignores unknown fields
+    /// by default, which has repeatedly hidden client bugs (a `prompt` sent
+    /// before the field existed, a mistyped `target_mission_id`). Captured
+    /// here so the handler can surface them via the `X-Ignored-Fields`
+    /// response header and a warning log instead of dropping them silently.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 fn deserialize_string_patch<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
@@ -3769,7 +4873,9 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
     let normalized = normalize_model_effort(raw)?;
     match (backend, normalized.as_str()) {
         (Some("claudecode"), "low" | "medium" | "high" | "xhigh" | "max") => Some(normalized),
-        (Some("codex"), "low" | "medium" | "high") => Some(normalized),
+        // Codex CLI accepts `model_reasoning_effort=xhigh` (verified on
+        // codex-cli 0.137); the config value is passed through verbatim.
+        (Some("codex"), "low" | "medium" | "high" | "xhigh") => Some(normalized),
         _ => None,
     }
 }
@@ -3777,7 +4883,7 @@ fn normalize_model_effort_for_backend(backend: Option<&str>, raw: &str) -> Optio
 fn supported_model_efforts_for_backend(backend: Option<&str>) -> &'static str {
     match backend {
         Some("claudecode") => "low, medium, high, xhigh, max",
-        Some("codex") => "low, medium, high",
+        Some("codex") => "low, medium, high, xhigh",
         _ => "none",
     }
 }
@@ -3812,7 +4918,7 @@ pub async fn create_mission(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
     body: Option<Json<CreateMissionRequest>>,
-) -> Result<Json<Mission>, (StatusCode, String)> {
+) -> Result<(axum::http::HeaderMap, Json<Mission>), (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
     let req = body.map(|b| b.0).unwrap_or(CreateMissionRequest {
@@ -3825,7 +4931,36 @@ pub async fn create_mission(
         backend: None,
         parent_mission_id: None,
         working_directory: None,
+        priority: None,
+        not_before: None,
+        deadline: None,
+        project: None,
+        track: None,
+        intent: None,
+        github_pr: None,
+        tags: None,
+        desired_state: None,
+        next_check_at: None,
+        prompt: None,
+        extra: Default::default(),
     });
+
+    // Fail loud on unrecognized fields: log + surface in a response header so
+    // a client bug (typo, field sent to the wrong endpoint) is observable
+    // instead of silently changing behavior.
+    let mut headers = axum::http::HeaderMap::new();
+    if !req.extra.is_empty() {
+        let ignored: Vec<&str> = req.extra.keys().map(String::as_str).collect();
+        let joined = ignored.join(",");
+        tracing::warn!(
+            user_id = %user.id,
+            ignored_fields = %joined,
+            "create_mission request carried unrecognized fields (ignored)"
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&joined) {
+            headers.insert("x-ignored-fields", value);
+        }
+    }
 
     let title = req.title.clone();
     let workspace_id = req.workspace_id;
@@ -3955,15 +5090,178 @@ pub async fn create_mission(
             config_profile: effective_config_profile,
             parent_mission_id: req.parent_mission_id,
             working_directory: req.working_directory,
+            scheduling: crate::api::mission_store::MissionScheduling {
+                priority: req.priority.unwrap_or(0),
+                not_before: req.not_before.map(|t| t.to_rfc3339()),
+                deadline: req.deadline.map(|t| t.to_rfc3339()),
+            },
             respond: tx,
         })
         .await
         .map_err(session_unavailable)?;
 
-    rx.await
-        .map_err(recv_failed)?
-        .map(Json)
-        .map_err(internal_error)
+    let mut mission = rx.await.map_err(recv_failed)?.map_err(internal_error)?;
+
+    // Apply project tagging metadata if provided at creation time. Empty/blank
+    // strings are treated as unset; tags are trimmed and empties dropped.
+    let nonblank = |s: &Option<String>| -> Option<String> {
+        s.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let project = nonblank(&req.project);
+    let track = nonblank(&req.track);
+    let intent = nonblank(&req.intent);
+    let github_pr = nonblank(&req.github_pr);
+    let desired_state = nonblank(&req.desired_state);
+    let next_check_at = nonblank(&req.next_check_at);
+    let tags: Option<Vec<String>> = req.tags.as_ref().map(|tags| {
+        tags.iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    });
+    if project.is_some()
+        || track.is_some()
+        || intent.is_some()
+        || github_pr.is_some()
+        || tags.is_some()
+        || desired_state.is_some()
+        || next_check_at.is_some()
+    {
+        control
+            .mission_store
+            .update_mission_project(
+                mission.id,
+                crate::api::mission_store::MissionProjectPatch {
+                    project: project.clone().map(Some),
+                    track: track.clone().map(Some),
+                    intent: intent.clone().map(Some),
+                    github_pr: github_pr.clone().map(Some),
+                    tags: tags.clone(),
+                    desired_state: desired_state.clone().map(Some),
+                    next_check_at: next_check_at.clone().map(Some),
+                },
+            )
+            .await
+            .map_err(internal_error)?;
+        // Reflect the applied values in the returned mission without a re-fetch.
+        mission.project.project = project.or(mission.project.project);
+        mission.project.track = track.or(mission.project.track);
+        mission.project.intent = intent.or(mission.project.intent);
+        mission.project.github_pr = github_pr.or(mission.project.github_pr);
+        mission.project.desired_state = desired_state.or(mission.project.desired_state);
+        mission.project.next_check_at = next_check_at.or(mission.project.next_check_at);
+        if let Some(v) = tags {
+            mission.project.tags = v;
+        }
+    }
+
+    // Atomic create+start: stash the initial prompt as the deferred goal. The
+    // FLEET-001 scheduler pass (every ~5s) dispatches pending missions with a
+    // deferred goal as soon as parallel capacity allows, honoring `not_before`
+    // when set. Unlike the old create-then-message pattern, this cannot be
+    // dropped at capacity.
+    if let Some(prompt) = nonblank(&req.prompt) {
+        control
+            .mission_store
+            .set_deferred_goal(mission.id, Some(prompt.clone()))
+            .await
+            .map_err(internal_error)?;
+        // Surface the queued goal so UIs show it as pending until dispatch.
+        let _ = control.events_tx.send(AgentEvent::UserMessage {
+            id: Uuid::new_v4(),
+            content: prompt,
+            queued: true,
+            mission_id: Some(mission.id),
+            source: Some(format!("api:{}", user.id)),
+        });
+    }
+
+    Ok((headers, Json(mission)))
+}
+
+/// Request body for `POST /api/control/missions/:id/project`. Tri-state per
+/// field: omit to leave unchanged, `null` to clear, a value to set. `tags`
+/// replaces the whole list when present.
+#[derive(Debug, Deserialize)]
+pub struct UpdateMissionProjectRequest {
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub project: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub track: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub intent: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub github_pr: Option<Option<String>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub desired_state: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_patch")]
+    pub next_check_at: Option<Option<String>>,
+}
+
+/// Set or update project tagging metadata for a mission.
+pub async fn update_mission_project(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateMissionProjectRequest>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+    control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+
+    // Normalize: blank string patches clear the field; tags are trimmed.
+    let normalize = |patch: Option<Option<String>>| -> Option<Option<String>> {
+        patch.map(|inner| {
+            inner.and_then(|s| {
+                let t = s.trim().to_string();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            })
+        })
+    };
+    let tags: Option<Vec<String>> = req.tags.map(|tags| {
+        tags.into_iter()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    });
+
+    control
+        .mission_store
+        .update_mission_project(
+            id,
+            crate::api::mission_store::MissionProjectPatch {
+                project: normalize(req.project),
+                track: normalize(req.track),
+                intent: normalize(req.intent),
+                github_pr: normalize(req.github_pr),
+                tags,
+                desired_state: normalize(req.desired_state),
+                next_check_at: normalize(req.next_check_at),
+            },
+        )
+        .await
+        .map_err(internal_error)?;
+
+    let updated = control
+        .mission_store
+        .get_mission(id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Mission {} not found", id)))?;
+    Ok(Json(updated))
 }
 
 /// Update mission run settings for future turns.
@@ -4509,6 +5807,13 @@ fn conversation_profile_enabled(profile: Option<&str>) -> bool {
     matches!(profile, Some("conversation"))
 }
 
+/// Interactive/frontend tools whose call args (the question payload) must
+/// survive history projection so the dashboard can render the item — even
+/// after it's answered. Mirrors the dashboard's `isUiTool` check.
+fn is_interactive_ui_tool(name: &str) -> bool {
+    name == "question" || name == "AskUserQuestion" || name.starts_with("ui_")
+}
+
 fn project_conversation_events(
     events: Vec<mission_store::StoredEvent>,
     keep_full_tool_call_ids: &HashSet<String>,
@@ -4559,6 +5864,19 @@ fn project_conversation_events(
             continue;
         };
         if keep_full_tool_call_ids.contains(&tool_call_id) {
+            projected.push(event);
+            continue;
+        }
+        // Interactive UI tools (question / AskUserQuestion / ui_*) carry the
+        // question payload the dashboard needs to render the item even after
+        // it's answered. Stubbing them drops the args, so an answered question
+        // would reload as an empty "reply below" prompt. Never stub them or
+        // their results, regardless of the recency window.
+        if event
+            .tool_name
+            .as_deref()
+            .is_some_and(is_interactive_ui_tool)
+        {
             projected.push(event);
             continue;
         }
@@ -5124,6 +6442,221 @@ pub async fn cancel_mission(
         .map_err(|e| (StatusCode::NOT_FOUND, e))
 }
 
+/// Optional body for the pause endpoint (FLEET-004). Carries attribution only.
+#[derive(Debug, Default, Deserialize)]
+pub struct PauseMissionRequest {
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Pause a mission (FLEET-004). Sets the mission to `Paused`, a non-terminal
+/// state the dispatcher deliberately skips when selecting the next runnable
+/// mission. Resume via `POST /missions/:id/resume`, which transitions a
+/// `Paused` mission back to `Pending` so the dispatcher re-queues it.
+///
+/// Rejects missions that are already terminal (nothing to pause) or already
+/// paused (no-op kept explicit for the operator).
+pub async fn pause_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    body: Option<Json<PauseMissionRequest>>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let actor = resolve_actor(body.and_then(|b| b.0.actor), &user);
+    let control = control_for_user(&state, &user).await;
+    let mission = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    if mission.status == MissionStatus::Paused {
+        return Err((
+            StatusCode::CONFLICT,
+            "Mission is already paused".to_string(),
+        ));
+    }
+    if mission_status_is_terminal(mission.status) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot pause a terminal mission (status: {})",
+                mission.status
+            ),
+        ));
+    }
+
+    // Route through the control loop so any in-flight runner is actually
+    // stopped before the mission is parked. A bare store update would leave the
+    // active turn executing and let its completion overwrite `Paused`.
+    let (tx, rx) = oneshot::channel();
+    control
+        .cmd_tx
+        .send(ControlCommand::PauseMission {
+            mission_id,
+            respond: tx,
+        })
+        .await
+        .map_err(session_unavailable)?;
+    rx.await
+        .map_err(recv_failed)?
+        .map_err(|e| (StatusCode::CONFLICT, e))?;
+    tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission paused");
+
+    let updated = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+    Ok(Json(updated))
+}
+
+/// Resolve the acting principal for a FLEET control action. An explicit
+/// `actor` override (e.g. `"system:fleet-watcher"`) wins; otherwise we attribute
+/// it to the authenticated user. Recorded in structured logs so a post-mortem
+/// can answer "who paused/cloned/resumed this mission?".
+fn resolve_actor(explicit: Option<String>, user: &AuthUser) -> String {
+    explicit
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| {
+            let who = if user.username.is_empty() {
+                &user.id
+            } else {
+                &user.username
+            };
+            format!("user:{}", who)
+        })
+}
+
+/// Overrides accepted when cloning a mission (FLEET-002). Any field left unset
+/// inherits from the source mission.
+#[derive(Debug, Default, Deserialize)]
+pub struct CloneMissionRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub model_effort: Option<String>,
+    #[serde(default)]
+    pub model_override: Option<String>,
+    /// When true, copy the source mission's conversation history into the clone
+    /// (retry-with-context). Default false — the clone starts fresh.
+    #[serde(default)]
+    pub clone_messages: bool,
+    /// Optional parent to record on the clone for lineage tracing in the UI.
+    /// Left unset, the clone has no parent (independent mission).
+    #[serde(default)]
+    pub parent_mission_id: Option<Uuid>,
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Clone an existing mission's configuration into a fresh `Pending` mission
+/// (FLEET-002). Copies title, workspace, agent, config profile, working
+/// directory and model settings; the optional body overrides
+/// title/backend/model_effort/model_override. Conversation history is **not**
+/// copied — the clone starts fresh. Reuses the standard create path so all
+/// backend/agent/model validation applies identically.
+pub async fn clone_mission(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Path(mission_id): Path<Uuid>,
+    body: Option<Json<CloneMissionRequest>>,
+) -> Result<Json<Mission>, (StatusCode, String)> {
+    let overrides = body.map(|b| b.0).unwrap_or_default();
+    let actor = resolve_actor(overrides.actor.clone(), &user);
+    let clone_messages = overrides.clone_messages;
+    let parent_mission_id = overrides.parent_mission_id;
+
+    let control = control_for_user(&state, &user).await;
+    let source = control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Mission {} not found", mission_id),
+            )
+        })?;
+
+    let req = CreateMissionRequest {
+        title: overrides.title.or_else(|| source.title.clone()),
+        workspace_id: Some(source.workspace_id),
+        agent: source.agent.clone(),
+        model_override: overrides
+            .model_override
+            .or_else(|| source.model_override.clone()),
+        model_effort: overrides
+            .model_effort
+            .or_else(|| source.model_effort.clone()),
+        config_profile: source.config_profile.clone(),
+        backend: overrides.backend.or_else(|| Some(source.backend.clone())),
+        parent_mission_id,
+        working_directory: source.working_directory.clone(),
+        priority: None,
+        not_before: None,
+        deadline: None,
+        // Inherit project tagging from the source mission so clones stay
+        // grouped under the same project/track/intent.
+        project: source.project.project.clone(),
+        track: source.project.track.clone(),
+        intent: source.project.intent.clone(),
+        github_pr: source.project.github_pr.clone(),
+        tags: if source.project.tags.is_empty() {
+            None
+        } else {
+            Some(source.project.tags.clone())
+        },
+        desired_state: source.project.desired_state.clone(),
+        next_check_at: source.project.next_check_at.clone(),
+        prompt: None,
+        extra: Default::default(),
+    };
+
+    let (_headers, cloned) = create_mission(State(state), Extension(user), Some(Json(req))).await?;
+    let clone_id = cloned.0.id;
+
+    // Optionally seed the clone with the source's conversation history
+    // (retry-with-context). `control` still holds the store handle after the
+    // create above moved `state`.
+    if clone_messages && !source.history.is_empty() {
+        control
+            .mission_store
+            .update_mission_history(clone_id, &source.history)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    tracing::info!(
+        source_mission = %mission_id,
+        clone_mission = %clone_id,
+        actor = %actor,
+        clone_messages,
+        parent = ?parent_mission_id,
+        "FLEET-002 mission cloned"
+    );
+
+    Ok(cloned)
+}
+
 /// Request body for resuming a mission
 #[derive(Debug, Deserialize, Default)]
 pub struct ResumeMissionRequest {
@@ -5134,6 +6667,9 @@ pub struct ResumeMissionRequest {
     /// Useful when the user is about to send their own custom message.
     #[serde(default)]
     pub skip_message: bool,
+    /// Optional attribution override (e.g. `"system:fleet-watcher"`).
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 /// Resume an interrupted mission.
@@ -5144,27 +6680,83 @@ pub async fn resume_mission(
     Path(mission_id): Path<Uuid>,
     body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
-    let (clean_workspace, skip_message) = body
-        .map(|b| (b.clean_workspace, b.skip_message))
-        .unwrap_or((false, false));
-    let (tx, rx) = oneshot::channel();
+    let (clean_workspace, skip_message, actor_override) = body
+        .map(|b| {
+            let r = b.0;
+            (r.clean_workspace, r.skip_message, r.actor)
+        })
+        .unwrap_or((false, false, None));
+    let actor = resolve_actor(actor_override, &user);
 
     let control = control_for_user(&state, &user).await;
-    control
-        .cmd_tx
-        .send(ControlCommand::ResumeMission {
-            mission_id,
-            clean_workspace,
-            skip_message,
-            respond: tx,
-        })
-        .await
-        .map_err(session_unavailable)?;
+    tracing::info!(mission_id = %mission_id, actor = %actor, "FLEET-004 mission resume requested");
 
-    rx.await
-        .map_err(recv_failed)?
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    // FLEET-004: a Paused mission resumes its *prior work* from history, so it
+    // first transitions to Interrupted (the status `resume_mission_impl`
+    // accepts) and then falls through to the ResumeMission path below to rebuild
+    // context and restart the runner. (Pending would be wrong here: the FLEET-001
+    // dispatcher only dispatches `not_before`-scheduled missions that carry a
+    // fresh `deferred_goal`, not paused missions continuing from history.)
+    let was_paused = matches!(
+        control.mission_store.get_mission(mission_id).await,
+        Ok(Some(ref m)) if m.status == MissionStatus::Paused
+    );
+    if was_paused {
+        control
+            .mission_store
+            .update_mission_status(mission_id, MissionStatus::Interrupted)
+            .await
+            .map_err(internal_error)?;
+        // FLEET-004: leaving Paused clears the pause timestamp.
+        let _ = control
+            .mission_store
+            .set_mission_paused_at(mission_id, None)
+            .await;
+        let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+            mission_id,
+            status: MissionStatus::Interrupted,
+            summary: None,
+        });
+    }
+
+    let outcome: Result<Mission, (StatusCode, String)> = async {
+        let (tx, rx) = oneshot::channel();
+        control
+            .cmd_tx
+            .send(ControlCommand::ResumeMission {
+                mission_id,
+                clean_workspace,
+                skip_message,
+                respond: tx,
+            })
+            .await
+            .map_err(session_unavailable)?;
+        rx.await
+            .map_err(recv_failed)?
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))
+    }
+    .await;
+
+    match outcome {
+        Ok(mission) => Ok(Json(mission)),
+        Err(err) => {
+            // A failed resume must not leave a paused mission stranded in
+            // Interrupted: restore the operator-visible Paused state (best
+            // effort) before surfacing the error.
+            if was_paused {
+                let _ = control
+                    .mission_store
+                    .update_mission_status(mission_id, MissionStatus::Paused)
+                    .await;
+                let _ = control.events_tx.send(AgentEvent::MissionStatusChanged {
+                    mission_id,
+                    status: MissionStatus::Paused,
+                    summary: None,
+                });
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Delete a mission by ID.
@@ -5233,13 +6825,26 @@ async fn delete_mission_with_children(
     mission_id: Uuid,
     running: &[super::mission_runner::RunningMissionInfo],
 ) -> Result<Vec<Uuid>, (StatusCode, String)> {
-    let Some(_) = mission_store
+    let Some(target) = mission_store
         .get_mission(mission_id)
         .await
         .map_err(internal_error)?
     else {
         return Err((StatusCode::NOT_FOUND, "Mission not found".to_string()));
     };
+
+    // FLEET-004: a Paused mission is deliberately parked for later resume —
+    // deleting it would silently discard work the operator chose to keep. Require
+    // an explicit resume-or-cancel first (mirrors the pause endpoint's 409s).
+    if target.status == MissionStatus::Paused {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot delete a paused mission ({}). Resume or cancel it first.",
+                mission_id
+            ),
+        ));
+    }
 
     let child_ids = collect_child_mission_ids(mission_store, mission_id).await?;
     let mut ids_to_delete = Vec::with_capacity(child_ids.len() + 1);
@@ -5502,6 +7107,11 @@ fn stored_event_to_agent_event(event: &mission_store::StoredEvent) -> Option<Age
             content: event.content.clone(),
             queued: false,
             mission_id,
+            source: event
+                .metadata
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         }),
         "assistant_message" => {
             let meta = event.metadata.as_object();
@@ -6164,6 +7774,217 @@ pub async fn stream(
     ))
 }
 
+/// Statuses worth forwarding to an external consumer (Paloma/Hermes): a mission
+/// that FINISHED, hit a terminal failure, now needs the user, or was
+/// acknowledged. We still skip the live churn (pending→active→paused) so a
+/// callback means "something actionable happened", not "the status field moved".
+///
+/// `Interrupted` is included (P#1 asks for it) even though it can be emitted
+/// transiently as resume-prep when a paused mission resumes — consumers dedupe
+/// on the `event_id`/`sequence` carried in the payload and can treat a quickly
+/// superseded interrupted→active as a no-op.
+fn webhook_forwardable_status(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Completed
+            | MissionStatus::Failed
+            | MissionStatus::NotFeasible
+            | MissionStatus::Blocked
+            | MissionStatus::AwaitingUser
+            | MissionStatus::Interrupted
+            | MissionStatus::Acknowledged
+    )
+}
+
+async fn paloma_webhook_forwarder_loop(
+    mut events_rx: broadcast::Receiver<AgentEvent>,
+    mission_store: Arc<dyn MissionStore>,
+    workspaces: workspace::SharedWorkspaceStore,
+    url: String,
+    secret: Option<String>,
+    http: reqwest::Client,
+) {
+    tracing::info!(webhook_url = %url, "Paloma mission-status webhook forwarder started");
+    // Track the last status seen per mission (for ALL transitions, not just
+    // forwardable ones) so we forward a status only when it actually CHANGED.
+    // This drops the re-emit `mark_mission_opened` broadcasts (it re-sends the
+    // current, unchanged status on first view) while still forwarding a genuine
+    // re-entry into a state. Single-task loop → a plain map needs no locking.
+    let mut last_status: std::collections::HashMap<Uuid, MissionStatus> =
+        std::collections::HashMap::new();
+    // Bound concurrent in-flight callbacks (each does a get_mission + HTTP POST).
+    let sem = Arc::new(tokio::sync::Semaphore::new(8));
+    // Process-monotonic sequence so the consumer can order events and dedupe
+    // (at-least-once delivery: a single logical event keeps one `event_id`
+    // across retries). Resets on restart — `event_id` is the durable key.
+    let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    loop {
+        match events_rx.recv().await {
+            Ok(AgentEvent::MissionStatusChanged {
+                mission_id, status, ..
+            }) => {
+                // `insert` returns the prior value; forward only on a real change.
+                let changed = last_status.insert(mission_id, status) != Some(status);
+                if !changed || !webhook_forwardable_status(status) {
+                    continue;
+                }
+
+                // Stable per-logical-event identity for idempotent consumers.
+                let event_id = Uuid::new_v4();
+                let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                // Everything else (the mission load + POST) runs in a spawned,
+                // concurrency-bounded task so neither a slow DB read nor a slow
+                // webhook can stall the broadcast receiver and lag-drop events.
+                let http = http.clone();
+                let url = url.clone();
+                let secret = secret.clone();
+                let mission_store = Arc::clone(&mission_store);
+                let workspaces = workspaces.clone();
+                let sem = Arc::clone(&sem);
+                tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await;
+                    let mission = mission_store.get_mission(mission_id).await.ok().flatten();
+                    let title = mission
+                        .as_ref()
+                        .and_then(|mission| mission.title.clone())
+                        .unwrap_or_else(|| mission_id.to_string());
+                    let project = mission.as_ref().map(|m| &m.project);
+                    // Resolve workspace_name from the registry (the store row
+                    // usually leaves it null), so the payload is self-contained.
+                    let workspace_name = match mission.as_ref() {
+                        Some(m) => match m.workspace_name.clone() {
+                            Some(name) => Some(name),
+                            None => workspaces.get(m.workspace_id).await.map(|ws| ws.name),
+                        },
+                        None => None,
+                    };
+                    let body = serde_json::json!({
+                        // Idempotency / ordering (P#6): consumers dedupe on
+                        // `event_id` and may order by `sequence`.
+                        "event_id": event_id,
+                        "sequence": seq,
+                        "mission_id": mission_id,
+                        "status": status,
+                        // Event-type mirror of `status` so consumers with
+                        // route-level event filters (e.g. the Hermes webhook
+                        // platform reads `payload.type`) can drop unwanted
+                        // transitions like `acknowledged` before spawning an
+                        // agent run.
+                        "type": status,
+                        "title": title,
+                        "short_description": mission
+                            .as_ref()
+                            .and_then(|m| m.short_description.clone()),
+                        "workspace_id": mission.as_ref().map(|m| m.workspace_id),
+                        "workspace_name": workspace_name,
+                        "backend": mission.as_ref().map(|m| m.backend.clone()),
+                        "updated_at": mission.as_ref().map(|m| m.updated_at.clone()),
+                        // When the status itself last changed (P#5) — the most
+                        // relevant staleness anchor for a status-change webhook.
+                        "last_status_change_at": mission
+                            .as_ref()
+                            .and_then(|m| m.activity.last_status_change_at.clone()),
+                        // Project tagging so Paloma can route by project/track/
+                        // intent/PR instead of parsing titles.
+                        "project": project.and_then(|p| p.project.clone()),
+                        "track": project.and_then(|p| p.track.clone()),
+                        "intent": project.and_then(|p| p.intent.clone()),
+                        "github_pr": project.and_then(|p| p.github_pr.clone()),
+                        "tags": project.map(|p| p.tags.clone()).unwrap_or_default(),
+                        // Track state so a watchdog can tell "intentionally
+                        // waiting (CI/review/external)" from "no worker = stuck".
+                        "desired_state": project.and_then(|p| p.desired_state.clone()),
+                        "next_check_at": project.and_then(|p| p.next_check_at.clone()),
+                        // For awaiting_user, whether the agent needs a decision
+                        // or is just waiting to be acked/merged.
+                        "awaiting_kind": mission
+                            .as_ref()
+                            .and_then(|m| m.awaiting_kind)
+                            .map(|k| k.as_str()),
+                    });
+
+                    // Serialize once so the signature is computed over the
+                    // exact bytes sent (consumers verify HMAC over the raw
+                    // body, e.g. the Hermes webhook platform's GitHub-style
+                    // `X-Hub-Signature-256` check).
+                    let payload = match serde_json::to_vec(&body) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to serialize Paloma webhook payload: {}",
+                                err
+                            );
+                            return;
+                        }
+                    };
+                    let signature = secret.as_ref().and_then(|secret| {
+                        use hmac::{Hmac, Mac};
+                        let mut mac =
+                            Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).ok()?;
+                        mac.update(&payload);
+                        Some(format!(
+                            "sha256={}",
+                            hex::encode(mac.finalize().into_bytes())
+                        ))
+                    });
+
+                    // At-least-once: retry transient failures with the SAME
+                    // event_id so the consumer can dedupe. Bounded so a dead
+                    // endpoint can't pile up tasks.
+                    const MAX_ATTEMPTS: u32 = 3;
+                    for attempt in 1..=MAX_ATTEMPTS {
+                        let mut request = http
+                            .post(&url)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .body(payload.clone());
+                        if let Some(signature) = signature.as_deref() {
+                            request = request.header("X-Hub-Signature-256", signature);
+                        }
+                        match request.send().await {
+                            Ok(resp) if resp.status().is_success() => break,
+                            Ok(resp) => {
+                                tracing::warn!(
+                                    mission_id = %mission_id,
+                                    webhook_url = %url,
+                                    attempt,
+                                    status = %resp.status(),
+                                    "Paloma webhook returned non-success status"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    mission_id = %mission_id,
+                                    webhook_url = %url,
+                                    attempt,
+                                    "Failed to forward Paloma mission status webhook: {}",
+                                    err
+                                );
+                            }
+                        }
+                        if attempt < MAX_ATTEMPTS {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                250 * attempt as u64,
+                            ))
+                            .await;
+                        }
+                    }
+                });
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                tracing::warn!(
+                    dropped,
+                    webhook_url = %url,
+                    "Paloma webhook forwarder lagged; continuing with latest event"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 /// Spawn the global control session actor.
 #[allow(clippy::too_many_arguments)]
 fn spawn_control_session(
@@ -6251,6 +8072,37 @@ fn spawn_control_session(
         mission_search_cache,
     };
 
+    // Mission-status alerts are event-driven for low latency. The existing
+    // Paloma scheduler poll still runs as a restart/missed-event backstop and
+    // continues to own the other periodic Paloma jobs.
+    if let Some(bridge) = telegram_bridge.as_ref() {
+        bridge.start_event_alert_loop(events_tx.subscribe());
+    }
+
+    if let Some(url) = config
+        .paloma_webhook_forward_url
+        .as_ref()
+        .filter(|url| !url.is_empty())
+    {
+        tokio::spawn(paloma_webhook_forwarder_loop(
+            events_tx.subscribe(),
+            Arc::clone(&state.mission_store),
+            workspaces.clone(),
+            url.clone(),
+            config.paloma_webhook_secret.clone(),
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        ));
+    }
+
+    // Shared registry of in-flight Claude Code background shell tasks. Written
+    // by the control actor's ToolResult arm; read by the auto-resume watcher.
+    let background_tasks: super::mission_runner::BackgroundTaskRegistry =
+        Arc::new(RwLock::new(std::collections::HashMap::new()));
+
     // Spawn the main control actor
     tokio::spawn(control_actor_loop(
         config.clone(),
@@ -6261,6 +8113,7 @@ fn spawn_control_session(
         cmd_rx,
         mission_cmd_rx,
         mission_cmd_tx,
+        state.cmd_tx.clone(),
         events_tx.clone(),
         events_rx,
         tool_hub.clone(),
@@ -6271,6 +8124,7 @@ fn spawn_control_session(
         mission_store,
         secrets,
         user_id,
+        Arc::clone(&background_tasks),
     ));
 
     // Recover missions stopped by the previous backend process. Graceful
@@ -6319,6 +8173,39 @@ fn spawn_control_session(
             Arc::clone(&state.mission_store),
             events_tx.clone(),
         ));
+    }
+
+    // Spawn the background-task auto-resume watcher. When a mission agent
+    // launches a `Bash` job with `run_in_background: true` and then ends its
+    // turn, the mission parks in `AwaitingUser` with nothing to wake it when the
+    // job finishes. This watcher polls captured background tasks, detects
+    // completion inside the workspace, and resumes the agent with the output.
+    // Uses an in-memory registry (no persistent store required). Gated by
+    // `BACKGROUND_TASK_AUTORESUME` (default enabled).
+    // Settle any mission left in `WaitingBackground` by a previous process:
+    // the in-memory background-task registry is empty at boot, so those jobs are
+    // no longer tracked and the mission would be stranded outside every terminal
+    // path. Runs regardless of whether the watcher below is enabled.
+    if state.mission_store.is_persistent() {
+        let store = Arc::clone(&state.mission_store);
+        let tx = events_tx.clone();
+        tokio::spawn(async move {
+            reset_waiting_background_on_boot(store, tx).await;
+        });
+    }
+
+    if super::mission_runner::background_task_autoresume_enabled() {
+        tokio::spawn(background_task_autoresume_loop(
+            Arc::clone(&state.mission_store),
+            state.cmd_tx.clone(),
+            events_tx.clone(),
+            workspaces.clone(),
+            Arc::clone(&background_tasks),
+        ));
+    } else {
+        tracing::info!(
+            "Background-task auto-resume watcher not started (BACKGROUND_TASK_AUTORESUME disabled)"
+        );
     }
 
     // Spawn event logger task (logs all events to SQLite for debugging/replay)
@@ -6909,6 +8796,8 @@ async fn automation_scheduler_loop(
                         content: substituted_content.clone(),
                         agent: None,
                         target_mission_id: Some(mission.id),
+                        strict: false,
+                        source: None,
                         respond: respond_tx,
                     })
                     .await;
@@ -7097,7 +8986,7 @@ struct RoutedAutomationMessage {
 }
 
 fn enqueue_agent_finished_messages(
-    queue: &mut VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
+    queue: &mut VecDeque<ControlQueueEntry>,
     messages: Vec<RoutedAutomationMessage>,
 ) {
     for message in messages {
@@ -7106,6 +8995,7 @@ fn enqueue_agent_finished_messages(
             message.content,
             None,
             Some(message.target_mission_id),
+            Some("automation".to_string()),
         ));
     }
 }
@@ -7383,13 +9273,10 @@ async fn post_turn_handle_grok_goal(
     }
 }
 
-fn queue_has_pending_target_mission(
-    queue: &VecDeque<(Uuid, String, Option<String>, Option<Uuid>)>,
-    mission_id: Uuid,
-) -> bool {
+fn queue_has_pending_target_mission(queue: &VecDeque<ControlQueueEntry>, mission_id: Uuid) -> bool {
     queue
         .iter()
-        .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id))
+        .any(|(_id, _msg, _agent, target_mid, _source)| *target_mid == Some(mission_id))
 }
 
 fn accept_user_message_id(accepted: &mut HashSet<Uuid>, id: Uuid) -> bool {
@@ -7421,6 +9308,66 @@ fn mission_status_for_terminal_reason(
         TerminalReason::RateLimited => Some((MissionStatus::Failed, "rate_limited")),
         TerminalReason::CapacityLimited => Some((MissionStatus::Failed, "capacity_limited")),
         TerminalReason::AuthError => Some((MissionStatus::Failed, "auth_error")),
+    }
+}
+
+/// Classify *why* a mission is parking in `AwaitingUser` by inspecting the last
+/// assistant message: a trailing question (or interrogative phrasing) means the
+/// agent needs a `Decision`; anything else means it finished its turn / work and
+/// is waiting for an `Ack`. This is a heuristic — consumers (Paloma) can refine
+/// it — but it is far better than the old all-`awaiting_user`-is-the-same signal.
+///
+/// Prefer [`classify_awaiting_kind_text`] with the just-completed turn's output
+/// when available: mission history is derived from the event log, which can lag
+/// behind the in-hand turn output at finalization time.
+fn classify_awaiting_kind(history: &[MissionHistoryEntry]) -> AwaitingKind {
+    match history.iter().rev().find(|entry| entry.role == "assistant") {
+        Some(last) => classify_awaiting_kind_text(&last.content),
+        // No assistant text to read (e.g. tool-only turn) — default to Ack so a
+        // "done" turn doesn't masquerade as an open question.
+        None => AwaitingKind::Ack,
+    }
+}
+
+/// Heuristic core of [`classify_awaiting_kind`], operating on a raw assistant
+/// message string (the authoritative turn output).
+fn classify_awaiting_kind_text(text: &str) -> AwaitingKind {
+    let text = text.trim();
+    if text.is_empty() {
+        return AwaitingKind::Ack;
+    }
+
+    // Only look at the tail of the message — the closing lines carry the intent
+    // (a long answer that ends with "Want me to proceed?" is a decision).
+    let tail: String = text.chars().rev().take(600).collect::<String>();
+    let tail: String = tail.chars().rev().collect();
+    let lower = tail.to_lowercase();
+
+    let ends_with_question = tail.trim_end().ends_with('?');
+    // Interrogative / approval-seeking lead-ins that signal an open decision even
+    // when the literal '?' lands earlier than the very last character.
+    const DECISION_CUES: &[&str] = &[
+        "should i ",
+        "shall i ",
+        "do you want",
+        "would you like",
+        "which option",
+        "which one",
+        "let me know",
+        "how would you like",
+        "what would you like",
+        "can you confirm",
+        "please confirm",
+        "your call",
+        "proceed?",
+        "go ahead?",
+    ];
+    let has_cue = DECISION_CUES.iter().any(|cue| lower.contains(cue));
+
+    if ends_with_question || has_cue {
+        AwaitingKind::Decision
+    } else {
+        AwaitingKind::Ack
     }
 }
 
@@ -7701,6 +9648,7 @@ fn looks_like_structured_provider_error(output: &str) -> bool {
         || lower.contains("internal server error")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_finalize_terminal_mission(
     mission_store: &Arc<dyn MissionStore>,
     events_tx: &tokio::sync::broadcast::Sender<AgentEvent>,
@@ -7708,6 +9656,10 @@ async fn maybe_finalize_terminal_mission(
     terminal_reason: Option<TerminalReason>,
     completion_confidence: Option<crate::agents::CompletionConfidence>,
     complete_turn_without_follow_up: bool,
+    // The just-completed turn's assistant output, if available. Used to classify
+    // `awaiting_kind` authoritatively — the mission's event-log-derived history
+    // can lag behind at finalization time.
+    final_output: Option<&str>,
     log_context: &str,
 ) {
     let Some(reason) = terminal_reason else {
@@ -7815,6 +9767,20 @@ async fn maybe_finalize_terminal_mission(
                 context = log_context,
                 "Finalizing mission after terminal turn"
             );
+            // Classify the awaiting reason now (uses the in-hand turn output;
+            // falls back to history only when the caller didn't supply it, since
+            // the event log can lag the turn). Applied *after* a successful
+            // status write below so a failed write can't orphan awaiting_kind on
+            // a mission that never became AwaitingUser.
+            let awaiting_kind = if new_status == MissionStatus::AwaitingUser {
+                Some(match final_output {
+                    Some(text) if !text.trim().is_empty() => classify_awaiting_kind_text(text),
+                    _ => classify_awaiting_kind(&mission.history),
+                })
+            } else {
+                None
+            };
+
             if let Err(e) = mission_store
                 .update_mission_status_with_reason(
                     mission_id,
@@ -7830,6 +9796,23 @@ async fn maybe_finalize_terminal_mission(
                     e
                 );
             } else {
+                // Set awaiting_kind after the status is committed to AwaitingUser
+                // and before emitting the event the Paloma webhook keys on, so
+                // the webhook sees it without risking an orphan on write failure.
+                if let Some(kind) = awaiting_kind {
+                    if let Err(e) = mission_store
+                        .set_mission_awaiting_kind(mission_id, Some(kind))
+                        .await
+                    {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            context = log_context,
+                            "Failed to set awaiting_kind: {}",
+                            e
+                        );
+                    }
+                }
+
                 maybe_schedule_mission_metadata_refresh_for_status(
                     mission_store,
                     events_tx,
@@ -7841,6 +9824,12 @@ async fn maybe_finalize_terminal_mission(
                     status: new_status,
                     summary: mission_status_summary_for_terminal_reason(reason),
                 });
+
+                // Stall-guard: orchestrators that park in awaiting_user with no
+                // wakeup armed can't resume themselves — arm a bounded fallback.
+                if new_status == MissionStatus::AwaitingUser {
+                    maybe_arm_stall_guard_wakeup(mission_store, mission_id).await;
+                }
             }
         }
         Ok(None) => {
@@ -8131,6 +10120,10 @@ async fn control_actor_loop(
     mut cmd_rx: mpsc::Receiver<ControlCommand>,
     mut mission_cmd_rx: mpsc::Receiver<crate::tools::mission::MissionControlCommand>,
     mission_cmd_tx: mpsc::Sender<crate::tools::mission::MissionControlCommand>,
+    // Clone of the actor's own command sender, used by the task-board
+    // scheduler to spawn workers and deliver digests through the normal
+    // message-routing path (always try_send, never await — see board.rs).
+    self_cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
     mut events_rx: broadcast::Receiver<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
@@ -8141,10 +10134,62 @@ async fn control_actor_loop(
     mission_store: Arc<dyn MissionStore>,
     secrets: Option<Arc<SecretsStore>>,
     session_user_id: String,
+    // Shared registry of in-flight Claude Code background shell tasks. Written
+    // here from the `ToolResult` event arm; read by the auto-resume watcher.
+    background_tasks: super::mission_runner::BackgroundTaskRegistry,
 ) {
     // Queue stores (id, content, agent, target_mission_id) for the current/primary mission
     // The target_mission_id tracks which mission each queued message is intended for
-    let mut queue: VecDeque<(Uuid, String, Option<String>, Option<Uuid>)> = VecDeque::new();
+    let mut queue: VecDeque<ControlQueueEntry> = VecDeque::new();
+    // Re-drive any messages that were queued before the last restart. They are
+    // persisted as a JSON snapshot (see `persist_control_queue_if_changed`) so a
+    // restart doesn't lose pending work. We re-inject them through the normal
+    // command channel rather than pushing straight onto `queue`: an idle actor
+    // never dequeues a pre-filled `queue` on its own, so the work would
+    // otherwise sit forever. Routing them as commands also de-duplicates against
+    // a client retry of the same id via `accept_user_message_id` (whichever
+    // arrives first runs; the other is dropped), so nothing executes twice.
+    let mut restored_db_snapshot = String::new();
+    if let Ok(payload) = mission_store.load_control_queue(&session_user_id).await {
+        if !payload.trim().is_empty() {
+            match serde_json::from_str::<Vec<QueuedMessage>>(&payload) {
+                Ok(items) => {
+                    let count = items.len();
+                    for it in items {
+                        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+                        if let Err(e) = self_cmd_tx.try_send(ControlCommand::UserMessage {
+                            id: it.id,
+                            content: it.content,
+                            agent: it.agent,
+                            target_mission_id: it.mission_id,
+                            strict: false,
+                            source: it.source,
+                            respond: ack_tx,
+                        }) {
+                            tracing::warn!("Failed to re-queue restored control message: {e}");
+                        }
+                    }
+                    if count > 0 {
+                        // Remember the stale on-disk snapshot so the first
+                        // loop-top persist below rewrites the DB to the real
+                        // (re-injected) state instead of leaving it stale.
+                        restored_db_snapshot = payload;
+                        tracing::info!("Re-queued {count} message(s) from the previous session");
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to parse persisted control queue: {e}"),
+            }
+        }
+    }
+    // Snapshot of the queue as last written to the store; used to debounce
+    // persistence so we only write to the DB when the queue actually changes.
+    // When messages were restored, seed it with the stale on-disk snapshot so
+    // the first loop-top persist overwrites it with the live queue.
+    let mut last_persisted_queue: String = if restored_db_snapshot.is_empty() {
+        serialize_queue_snapshot(&queue)
+    } else {
+        restored_db_snapshot
+    };
     let mut history: Vec<(String, String)> = Vec::new(); // (role, content) pairs (user/assistant)
     let mut running: Option<tokio::task::JoinHandle<(Uuid, String, crate::agents::AgentResult)>> =
         None;
@@ -8157,10 +10202,11 @@ async fn control_actor_loop(
     // Track current activity label for the main runner
     let mut main_runner_activity: Option<String> = None;
     // Idempotency guard for user sends. The dashboard may retry a POST if a
-    // weak connection drops after the command reached this actor but before
-    // the HTTP response got back. Since the client can now provide the UUID,
-    // ignore repeated commands with the same id instead of queueing/running
-    // the same user message twice.
+    // weak connection drops after the command reached this actor but before the
+    // HTTP response got back; since the client provides the UUID, repeated
+    // commands with the same id are ignored instead of running twice. Restored
+    // messages (re-injected as commands above) rely on this same guard: the
+    // first occurrence runs, any later duplicate is dropped.
     let mut accepted_user_message_ids: HashSet<Uuid> = HashSet::new();
     // Track subtasks for the main runner
     let mut main_runner_subtasks: Vec<super::mission_runner::SubtaskInfo> = Vec::new();
@@ -8185,6 +10231,39 @@ async fn control_actor_loop(
         Uuid,
         super::mission_runner::MissionRunner,
     > = std::collections::HashMap::new();
+
+    // Correlate Bash `tool_call_id` -> command string so that when the matching
+    // `Bash` ToolResult carries a background-start marker we can record the
+    // launched command in the background-task registry. Capped to avoid
+    // unbounded growth if a result is ever dropped; entries are removed when
+    // the matching result arrives. Only `Bash` calls are tracked.
+    let mut pending_bash_commands: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    const MAX_PENDING_BASH_COMMANDS: usize = 256;
+    let background_autoresume_enabled = super::mission_runner::background_task_autoresume_enabled();
+
+    // Task-board scheduler cadence: the 100ms tick is far too hot for store
+    // scans, so passes run every few seconds. Each pass spawns ready workers,
+    // sweeps zombies, and wakes idle bosses whose board needs a decision.
+    const BOARD_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    let mut last_board_pass = tokio::time::Instant::now();
+    // FLEET-001 scheduling dispatch cadence: same throttling rationale as the
+    // board pass — a store scan on every 100ms tick is wasteful. Each pass
+    // expires past-deadline scheduled missions and, when the main session is
+    // idle, dispatches the highest-priority dispatchable one.
+    const SCHEDULER_PASS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut last_scheduler_pass = tokio::time::Instant::now();
+    // Guards against double-dispatch: a scheduled mission stays Pending (with its
+    // goal) until the dispatched message is processed and flips it to Active. If
+    // the actor is slow or the start is dropped, that window can exceed one pass,
+    // so we record each dispatch and skip re-dispatching the same mission until
+    // this cooldown elapses (after which a still-Pending mission is retried).
+    const SCHEDULER_DISPATCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut scheduler_inflight: std::collections::HashMap<Uuid, tokio::time::Instant> =
+        std::collections::HashMap::new();
+    // Per-boss "wake outstanding" flags, coalescing board wakes across passes.
+    let mut board_wake_state: std::collections::HashMap<Uuid, bool> =
+        std::collections::HashMap::new();
 
     // Helper to extract file paths from text (for mission summaries)
     fn extract_file_paths(text: &str) -> Vec<String> {
@@ -8253,6 +10332,28 @@ async fn control_actor_loop(
         None
     }
 
+    /// Extract the human-readable text from a tool result `Value`.
+    ///
+    /// The Claude Code runner emits either a plain string or an object of the
+    /// form `{ "content": ..., "stdout": ..., "stderr": ..., "is_error": ... }`
+    /// (see `runners::claudecode`). We prefer `content`, falling back to
+    /// `stdout`, then the whole string. Returns `None` when no text is present.
+    fn tool_result_text(result: &serde_json::Value) -> Option<String> {
+        if let Some(s) = result.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(obj) = result.as_object() {
+            for key in ["content", "stdout"] {
+                if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // Helper to load a mission and return a Mission struct
     async fn load_mission_record(
         mission_store: &Arc<dyn MissionStore>,
@@ -8277,11 +10378,13 @@ async fn control_actor_loop(
             None,
             None,
             None,
+            crate::api::mission_store::MissionScheduling::default(),
         )
         .await
     }
 
     // Helper to create a new mission with title
+    #[allow(clippy::too_many_arguments)]
     async fn create_new_mission_with_title(
         mission_store: &Arc<dyn MissionStore>,
         title: Option<&str>,
@@ -8293,8 +10396,9 @@ async fn control_actor_loop(
         config_profile: Option<&str>,
         parent_mission_id: Option<Uuid>,
         working_directory: Option<&str>,
+        scheduling: crate::api::mission_store::MissionScheduling,
     ) -> Result<Mission, String> {
-        mission_store
+        let mut mission = mission_store
             .create_mission_with_parent(
                 title,
                 workspace_id,
@@ -8306,7 +10410,16 @@ async fn control_actor_loop(
                 parent_mission_id,
                 working_directory,
             )
-            .await
+            .await?;
+        // FLEET-001: persist scheduling metadata as a focused follow-up write so
+        // the wide `create_mission_with_parent` signature stays untouched.
+        if scheduling != crate::api::mission_store::MissionScheduling::default() {
+            mission_store
+                .set_mission_scheduling(mission.id, &scheduling)
+                .await?;
+            mission.scheduling = scheduling;
+        }
+        Ok(mission)
     }
 
     // Helper to validate and prepare an interrupted or blocked mission for resume.
@@ -8356,11 +10469,24 @@ async fn control_actor_loop(
     }
 
     loop {
+        // Persist the pending queue whenever it changes so a restart doesn't
+        // lose queued messages. Debounced by snapshot comparison — the DB is
+        // written only when the queue actually changed (no per-iteration churn
+        // during streaming, where the queue is usually unchanged). Each dequeue
+        // site below also persists immediately so a popped message can't be
+        // re-run after a crash (see `persist_control_queue_if_changed`).
+        persist_control_queue_if_changed(
+            &mission_store,
+            &session_user_id,
+            &queue,
+            &mut last_persisted_queue,
+        )
+        .await;
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, respond } => {
+                    ControlCommand::UserMessage { id, content, agent: msg_agent, target_mission_id, strict, source, respond } => {
                         if !accept_user_message_id(&mut accepted_user_message_ids, id) {
                             let status_snapshot = status.read().await;
                             let _ = respond.send(if status_snapshot.state != ControlRunState::Idle {
@@ -8385,21 +10511,38 @@ async fn control_actor_loop(
 
                         // If no explicit target but current_mission differs from the
                         // running mission (i.e., CreateMission switched the pointer),
-                        // infer the target as current_mission so it auto-starts in parallel.
-                        let effective_target = target_mission_id.or_else(|| {
-                            if main_is_running {
-                                if let Some(cid) = current_mission_id {
-                                    if running_mid != Some(cid) {
-                                        tracing::info!(
-                                            "Inferred target mission {} (current differs from running {:?})",
-                                            cid, running_mid
-                                        );
-                                        return Some(cid);
-                                    }
+                        // No inference: a message without an explicit mission_id used to be
+                        // silently re-targeted to the actor's "current" mission when it
+                        // differed from the running one. In practice every legitimate caller
+                        // (dashboard, MCP) sends mission_id explicitly, and the fallback
+                        // mis-delivered API messages twice in one night (a worker diagnosis
+                        // and an oracle priming both landed in unrelated missions). Messages
+                        // without a target now follow the plain default-mission path —
+                        // and when even that is ambiguous (a runner busy on one mission
+                        // while the session pointer is on another), the message is
+                        // DROPPED LOUDLY instead of delivered somewhere surprising.
+                        let effective_target = target_mission_id;
+                        if effective_target.is_none() && main_is_running {
+                            if let Some(cid) = current_mission_id {
+                                if running_mid != Some(cid) {
+                                    tracing::warn!(
+                                        running = ?running_mid,
+                                        current = %cid,
+                                        "Untargeted message rejected: ambiguous target; pass mission_id explicitly"
+                                    );
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: format!(
+                                            "Untargeted message rejected: running mission {:?} differs from current {}; pass mission_id explicitly",
+                                            running_mid, cid
+                                        ),
+                                        mission_id: Some(cid),
+                                        resumable: false,
+                                    });
+                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    continue;
                                 }
                             }
-                            None
-                        });
+                        }
 
                         // Determine if target is already running somewhere
                         let target_in_parallel = effective_target
@@ -8416,26 +10559,90 @@ async fn control_actor_loop(
                         // through unchanged. See `api/grok_goal.rs`.
                         let goal_target_mission = effective_target.or(main_mission_id);
                         let mut content = content;
-                        match maybe_begin_grok_goal(
-                            &mission_store,
-                            &events_tx,
-                            goal_target_mission,
-                            &content,
-                        )
-                        .await
-                        {
-                            GrokGoalKickoff::Passthrough => {}
-                            GrokGoalKickoff::Rewritten { prompt } => {
-                                content = prompt;
+                        // Strict (control-plane) messages are system-generated and must
+                        // never be reinterpreted as a `/goal` kickoff — skip the rewrite.
+                        if !strict {
+                            match maybe_begin_grok_goal(
+                                &mission_store,
+                                &events_tx,
+                                goal_target_mission,
+                                &content,
+                            )
+                            .await
+                            {
+                                GrokGoalKickoff::Passthrough => {}
+                                GrokGoalKickoff::Rewritten { prompt } => {
+                                    content = prompt;
+                                }
+                                GrokGoalKickoff::Rejected { reason } => {
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: reason,
+                                        mission_id: goal_target_mission,
+                                        resumable: true,
+                                    });
+                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    continue;
+                                }
                             }
-                            GrokGoalKickoff::Rejected { reason } => {
-                                let _ = events_tx.send(AgentEvent::Error {
-                                    message: reason,
-                                    mission_id: goal_target_mission,
-                                    resumable: true,
-                                });
-                                let _ = respond.send(UserMessageAck::Dropped);
-                                continue;
+                        }
+
+                        // FLEET-001 scheduled-mission deferral: if the target is a
+                        // Pending mission whose `not_before` is still in the future
+                        // and it isn't already running, stash the goal and leave it
+                        // Pending. The scheduler tick re-injects it as a normal user
+                        // message once the dispatch window opens. Strict control-plane
+                        // messages are operational and never deferred.
+                        if !strict {
+                            if let Some(tid) = effective_target {
+                                let target_running =
+                                    target_in_parallel || running_mid == Some(tid);
+                                if !target_running {
+                                    if let Ok(Some(m)) = mission_store.get_mission(tid).await {
+                                        let now = chrono::Utc::now();
+                                        if m.status == MissionStatus::Pending
+                                            && !m.is_dispatchable_at(now)
+                                        {
+                                            // Append to any previously-stashed goal so
+                                            // multiple pre-dispatch messages aren't lost.
+                                            let combined = match mission_store
+                                                .get_deferred_goal(tid)
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                            {
+                                                Some(prev) if !prev.is_empty() => {
+                                                    format!("{prev}\n{content}")
+                                                }
+                                                _ => content.clone(),
+                                            };
+                                            if let Err(e) = mission_store
+                                                .set_deferred_goal(tid, Some(combined))
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    mission_id = %tid,
+                                                    "Failed to stash deferred goal: {e}"
+                                                );
+                                            }
+                                            // Surface the queued goal so the UI shows it
+                                            // as pending until dispatch.
+                                            let _ = events_tx.send(AgentEvent::UserMessage {
+                                                id,
+                                                content: content.clone(),
+                                                queued: true,
+                                                mission_id: Some(tid),
+                                                source: source.clone(),
+                                            });
+                                            tracing::info!(
+                                                mission_id = %tid,
+                                                not_before = ?m.scheduling.not_before,
+                                                "Deferred scheduled mission: goal stashed until dispatch window"
+                                            );
+                                            let _ = respond.send(UserMessageAck::Queued);
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -8444,12 +10651,13 @@ async fn control_actor_loop(
                             if target_in_parallel {
                                 if let Some(runner) = parallel_runners.get_mut(&tid) {
                                     let was_running = runner.is_running();
-                                    runner.queue_message(id, content.clone(), msg_agent);
+                                    runner.queue_message(id, content.clone(), msg_agent, source.clone());
                                     let _ = events_tx.send(AgentEvent::UserMessage {
                                         id,
                                         content: content.clone(),
                                         queued: was_running,
                                         mission_id: Some(tid),
+                                        source: source.clone(),
                                     });
                                     // Surface the parallel queue growth to all
                                     // clients (Status events otherwise only
@@ -8499,36 +10707,81 @@ async fn control_actor_loop(
                                 let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
                                 if total_running >= max_parallel {
-                                    tracing::warn!(
-                                        "Cannot start parallel mission {}: max {} reached. \
-                                         Dropping targeted message to avoid sending to wrong mission.",
-                                        tid, max_parallel
-                                    );
-                                    let _ = events_tx.send(AgentEvent::Error {
-                                        message: format!(
-                                            "Cannot start mission {}: max parallel missions ({}) reached",
-                                            tid, max_parallel
-                                        ),
-                                        mission_id: Some(tid),
-                                        resumable: true,
-                                    });
-                                    let _ = respond.send(UserMessageAck::Dropped);
+                                    // At capacity, dropping the message would orphan the
+                                    // mission: it stays Pending with no deferred_goal, so
+                                    // the FLEET-001 scheduler never dispatches it and the
+                                    // HTTP response (`queued: false`) is indistinguishable
+                                    // from a successful delivery. Stash the content as the
+                                    // deferred goal instead — the scheduler pass re-injects
+                                    // it as a normal targeted message once a slot frees.
+                                    let combined = match mission_store
+                                        .get_deferred_goal(tid)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                    {
+                                        Some(prev) if !prev.is_empty() => {
+                                            format!("{prev}\n{content}")
+                                        }
+                                        _ => content.clone(),
+                                    };
+                                    match mission_store.set_deferred_goal(tid, Some(combined)).await
+                                    {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                mission_id = %tid,
+                                                max_parallel,
+                                                "At capacity: deferring targeted message as scheduled goal"
+                                            );
+                                            let _ = events_tx.send(AgentEvent::UserMessage {
+                                                id,
+                                                content: content.clone(),
+                                                queued: true,
+                                                mission_id: Some(tid),
+                                                source: source.clone(),
+                                            });
+                                            let _ = respond.send(UserMessageAck::Queued);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                mission_id = %tid,
+                                                "Cannot start parallel mission (max {} reached) and \
+                                                 failed to stash deferred goal: {e}",
+                                                max_parallel
+                                            );
+                                            let _ = events_tx.send(AgentEvent::Error {
+                                                message: format!(
+                                                    "Cannot start mission {}: max parallel missions ({}) reached",
+                                                    tid, max_parallel
+                                                ),
+                                                mission_id: Some(tid),
+                                                resumable: true,
+                                            });
+                                            let _ = respond.send(UserMessageAck::Dropped);
+                                        }
+                                    }
                                     continue;
                                 } else {
                                     // Load mission and start in parallel
                                     match load_mission_record(&mission_store, tid).await {
                                         Ok(mission) => {
+                                            // A paused mission must not be auto-started by an
+                                            // incoming message — respect the pause. The user
+                                            // resumes it explicitly via the resume API.
+                                            if mission.status == MissionStatus::Paused {
+                                                let _ = events_tx.send(AgentEvent::Error {
+                                                    message: format!(
+                                                        "Mission {} is paused; resume it before sending messages",
+                                                        tid
+                                                    ),
+                                                    mission_id: Some(tid),
+                                                    resumable: true,
+                                                });
+                                                let _ = respond.send(UserMessageAck::Dropped);
+                                                continue;
+                                            }
                                             // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
-                                            if matches!(
-                                                mission.status,
-                                                MissionStatus::Pending
-                                                    | MissionStatus::Interrupted
-                                                    | MissionStatus::Blocked
-                                                    | MissionStatus::Completed
-                                                    | MissionStatus::Failed
-                                                    | MissionStatus::AwaitingUser
-                                                    | MissionStatus::Acknowledged
-                                            ) {
+                                            if message_activates_mission(mission.status) {
                                                 tracing::info!(
                                                     "Activating parallel mission {} (was {})",
                                                     tid, mission.status
@@ -8560,13 +10813,14 @@ async fn control_actor_loop(
                                                 runner.history.push((entry.role.clone(), entry.content.clone()));
                                             }
                                             // Queue the message
-                                            runner.queue_message(id, content.clone(), msg_agent);
+                                            runner.queue_message(id, content.clone(), msg_agent, source.clone());
                                             // Emit user message event
                                             let _ = events_tx.send(AgentEvent::UserMessage {
                                                 id,
                                                 content: content.clone(),
                                                 queued: false,
                                                 mission_id: Some(tid),
+                                                source: source.clone(),
                                             });
                                             // Start execution
                                             runner.start_next(
@@ -8609,6 +10863,28 @@ async fn control_actor_loop(
                             }
                         }
 
+                        // Strict (control-plane) messages must never leak into an
+                        // *unrelated* mission. If the target is some OTHER mission
+                        // than the main session's and we got here, Case 1/2 (queue
+                        // to / start a parallel runner) didn't fire — drop rather
+                        // than fall through to the main session, which would land a
+                        // board wake / bg-autoresume / worker dispatch in the wrong
+                        // mission. The scheduler re-issues on its next pass.
+                        //
+                        // When the target IS the main session's mission, there is
+                        // no leak: Case 3 below is exactly where we want it — it
+                        // activates an idle/AwaitingUser main mission and starts a
+                        // fresh turn (e.g. the bg-task auto-resume waking a mission
+                        // that parked on the user while a background job ran).
+                        if strict && !target_is_main {
+                            tracing::warn!(
+                                target = ?effective_target,
+                                "Dropping strict control-plane message: non-main target not deliverable this pass"
+                            );
+                            let _ = respond.send(UserMessageAck::Dropped);
+                            continue;
+                        }
+
                         // Case 3: Queue to main session (default behavior)
                         // Auto-create mission on first message if none exists
                         {
@@ -8631,16 +10907,7 @@ async fn control_actor_loop(
                                             );
                                         }
                                         // Activate mission if it was pending/interrupted/blocked/completed
-                                        if matches!(
-                                            mission.status,
-                                            MissionStatus::Pending
-                                                | MissionStatus::Interrupted
-                                                | MissionStatus::Blocked
-                                                | MissionStatus::Completed
-                                                | MissionStatus::Failed
-                                                | MissionStatus::AwaitingUser
-                                                | MissionStatus::Acknowledged
-                                        ) {
+                                        if message_activates_mission(mission.status) {
                                             tracing::info!(
                                                 "Activating main mission {} (was {})",
                                                 tid, mission.status
@@ -8679,16 +10946,7 @@ async fn control_actor_loop(
                                                 history.push((entry.role.clone(), entry.content.clone()));
                                             }
                                             // Activate mission if it was pending/interrupted/blocked/completed
-                                            if matches!(
-                                                mission.status,
-                                                MissionStatus::Pending
-                                                    | MissionStatus::Interrupted
-                                                    | MissionStatus::Blocked
-                                                    | MissionStatus::Completed
-                                                    | MissionStatus::Failed
-                                                    | MissionStatus::AwaitingUser
-                                                    | MissionStatus::Acknowledged
-                                            ) {
+                                            if message_activates_mission(mission.status) {
                                                 tracing::info!(
                                                     "Activating switched mission {} (was {})",
                                                     tid, mission.status
@@ -8722,16 +10980,7 @@ async fn control_actor_loop(
                                                 );
                                             }
                                             // Activate mission if it was pending/interrupted/blocked/completed (same mission, reloading)
-                                            if matches!(
-                                                mission.status,
-                                                MissionStatus::Pending
-                                                    | MissionStatus::Interrupted
-                                                    | MissionStatus::Blocked
-                                                    | MissionStatus::Completed
-                                                    | MissionStatus::Failed
-                                                    | MissionStatus::AwaitingUser
-                                                    | MissionStatus::Acknowledged
-                                            ) {
+                                            if message_activates_mission(mission.status) {
                                                 tracing::info!(
                                                     "Activating reloaded mission {} (was {})",
                                                     tid, mission.status
@@ -8754,10 +11003,26 @@ async fn control_actor_loop(
 
                         let was_running = running.is_some();
                         let content_clone = content.clone();
-                        // Capture the target mission ID once, before queuing
-                        // This ensures we use the same mission_id for events and execution
-                        let target_mission_id = *current_mission.read().await;
-                        queue.push_back((id, content, msg_agent, target_mission_id));
+                        // Capture the target mission ID once, before queuing.
+                        // This ensures we use the same mission_id for events and execution.
+                        //
+                        // Honor the message's EXPLICIT target; fall back to the session
+                        // `current_mission` pointer only for untargeted messages. We only
+                        // reach Case 3 when the target is absent or equals the main mission
+                        // (`target_is_main`), so an explicit `effective_target` here is the
+                        // main mission the runner is on — and its history is already what
+                        // the next turn will use. Previously this read `*current_mission`
+                        // unconditionally: when the runner was busy on one mission
+                        // (`running_mission_id`) while the session pointer had drifted to
+                        // another (e.g. the dashboard/MCP moved it), an explicitly-targeted
+                        // follow-up got silently re-pinned to the drifted mission and
+                        // executed there. (Prod 2026-06-23: a Hermes follow-up for mission
+                        // 91f7… ran in the unrelated 4f3f… instead.)
+                        let target_mission_id = match effective_target {
+                            Some(tid) => Some(tid),
+                            None => *current_mission.read().await,
+                        };
+                        queue.push_back((id, content, msg_agent, target_mission_id, source.clone()));
                         let status_mission_id = if running.is_some() {
                             running_mission_id
                         } else {
@@ -8776,10 +11041,20 @@ async fn control_actor_loop(
                                 content: content_clone,
                                 queued: true,
                                 mission_id: target_mission_id,
+                                source: source.clone(),
                             });
                         }
                         if running.is_none() {
-                            if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                            if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
+                                // Persist the dequeue before the awaits that start
+                                // the run, so a crash here can't restore + re-run it.
+                                persist_control_queue_if_changed(
+                                    &mission_store,
+                                    &session_user_id,
+                                    &queue,
+                                    &mut last_persisted_queue,
+                                )
+                                .await;
                                 set_and_emit_status(
                                     &status,
                                     &events_tx,
@@ -8787,7 +11062,7 @@ async fn control_actor_loop(
                                     queue.len(),
                                     msg_target_mid,
                                 ).await;
-                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid });
+                                let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: msg_source.clone() });
 
                                 // Immediately persist user message so it's visible when loading mission
                                 history.push(("user".to_string(), msg.clone()));
@@ -8822,16 +11097,7 @@ async fn control_actor_loop(
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => {
                                             // Activate mission: if pending, interrupted, blocked, completed, or failed, update status to active
-                                            if matches!(
-                                                mission.status,
-                                                MissionStatus::Pending
-                                                    | MissionStatus::Interrupted
-                                                    | MissionStatus::Blocked
-                                                    | MissionStatus::Completed
-                                                    | MissionStatus::Failed
-                                                    | MissionStatus::AwaitingUser
-                                                    | MissionStatus::Acknowledged
-                                            ) {
+                                            if message_activates_mission(mission.status) {
                                                 tracing::info!(
                                                     "Activating mission {} (was {})",
                                                     mid, mission.status
@@ -8992,7 +11258,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, model_effort, backend, config_profile, parent_mission_id, working_directory, scheduling, respond } => {
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -9014,6 +11280,7 @@ async fn control_actor_loop(
                             config_profile.as_deref(),
                             parent_mission_id,
                             working_directory.as_deref(),
+                            scheduling,
                         )
                         .await {
                             Ok(mission) => {
@@ -9106,12 +11373,22 @@ async fn control_actor_loop(
                         let parallel_running = parallel_runners
                             .get(&id)
                             .is_some_and(|runner| runner.is_running());
+                        // Run-settings (backend/model/agent/profile) are read
+                        // per turn, so changing them on a RUNNING mission is
+                        // safe: the in-flight turn keeps what it loaded and the
+                        // next turn picks up the new row (with the backend
+                        // handoff context below when the backend changed).
+                        // Long-lived missions (orchestrators, /goal loops)
+                        // rarely stop, so the previous hard refusal made them
+                        // effectively unswitchable. The fresh session id this
+                        // writes is also fine mid-run: every backend falls
+                        // back to a fresh/continued session when the stored id
+                        // is not loadable.
                         if main_running || parallel_running {
-                            let _ = respond.send(Err(
-                                "Cannot update mission settings while the mission is running"
-                                    .to_string(),
-                            ));
-                            continue;
+                            tracing::info!(
+                                mission_id = %id,
+                                "Updating run settings while mission is running; they apply from the next turn"
+                            );
                         }
 
                         // Capture the backend before the update so we can detect
@@ -9171,6 +11448,7 @@ async fn control_actor_loop(
                                         content: handoff,
                                         queued: false,
                                         mission_id: Some(id),
+                                        source: None,
                                     };
                                     if let Err(e) = mission_store.log_event(id, &event).await {
                                         tracing::warn!(
@@ -9218,6 +11496,15 @@ async fn control_actor_loop(
                                 }
                             };
 
+                            // Don't start a paused mission — resume it explicitly first.
+                            if mission.status == MissionStatus::Paused {
+                                let _ = respond.send(Err(format!(
+                                    "Mission {} is paused; resume it before starting",
+                                    mission_id
+                                )));
+                                continue;
+                            }
+
                             // Create a new MissionRunner
                             let mut runner = super::mission_runner::MissionRunner::new(
                                 mission_id,
@@ -9238,7 +11525,7 @@ async fn control_actor_loop(
                             }
 
                             // Queue the initial message (no per-message agent override for parallel start)
-                            runner.queue_message(Uuid::new_v4(), content, None);
+                            runner.queue_message(Uuid::new_v4(), content, None, None);
 
                             // Start execution
                             let started = runner.start_next(
@@ -9440,6 +11727,69 @@ async fn control_actor_loop(
                             }
                         }
                     }
+                    ControlCommand::PauseMission { mission_id, respond } => {
+                        // Stop any in-flight runner before parking the mission so
+                        // the agent turn can't keep executing (and overwrite the
+                        // paused status on completion). Mirrors CancelMission's
+                        // stop logic but lands on `Paused` instead of `Interrupted`.
+                        if let Some(runner) = parallel_runners.get_mut(&mission_id) {
+                            runner.cancel();
+                            parallel_runners.remove(&mission_id);
+                            close_mission_desktop_sessions(
+                                &mission_store,
+                                mission_id,
+                                &config.working_dir,
+                            )
+                            .await;
+                        } else if running_mission_id == Some(mission_id) {
+                            if let Some(token) = &running_cancel {
+                                token.cancel();
+                                // Arm the force-clear deadline so a zombie runner
+                                // that never observes the cancel still gets torn
+                                // down (matches CancelMission).
+                                runner_force_clear_deadline = Some(
+                                    tokio::time::Instant::now() + RUNNER_FORCE_CLEAR_GRACE,
+                                );
+                            }
+                            close_mission_desktop_sessions(
+                                &mission_store,
+                                mission_id,
+                                &config.working_dir,
+                            )
+                            .await;
+                        }
+
+                        // Set Paused last so it survives the runner teardown above.
+                        // maybe_finalize_terminal_mission skips non-Active/Pending/
+                        // Interrupted statuses, so the cancelled turn's completion
+                        // won't promote this back out of Paused.
+                        match mission_store
+                            .update_mission_status(mission_id, MissionStatus::Paused)
+                            .await
+                        {
+                            Ok(()) => {
+                                // FLEET-004: stamp the pause time for UI pause-age.
+                                let _ = mission_store
+                                    .set_mission_paused_at(
+                                        mission_id,
+                                        Some(chrono::Utc::now().to_rfc3339()),
+                                    )
+                                    .await;
+                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    mission_id,
+                                    status: MissionStatus::Paused,
+                                    summary: None,
+                                });
+                                let _ = respond.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = respond.send(Err(format!(
+                                    "Failed to pause mission {}: {}",
+                                    mission_id, e
+                                )));
+                            }
+                        }
+                    }
                     ControlCommand::ListRunning { respond } => {
                         // Return info about currently running missions
                         let mut running_list = Vec::new();
@@ -9565,7 +11915,7 @@ async fn control_actor_loop(
                                             .history
                                             .push((entry.role.clone(), entry.content.clone()));
                                     }
-                                    runner.queue_message(Uuid::new_v4(), resume_prompt, None);
+                                    runner.queue_message(Uuid::new_v4(), resume_prompt, None, None);
 
                                     let started = runner.start_next(
                                         config.clone(),
@@ -9660,12 +12010,28 @@ async fn control_actor_loop(
                                 // Skip if the caller just wants to update the status (e.g., before sending a custom message)
                                 if !skip_message {
                                     let msg_id = Uuid::new_v4();
-                                    queue.push_back((msg_id, resume_prompt, None, Some(mission_id)));
+                                    queue.push_back((
+                                        msg_id,
+                                        resume_prompt,
+                                        None,
+                                        Some(mission_id),
+                                        Some("system:resume".to_string()),
+                                    ));
                                 }
 
                                 // Start execution if not already running
                                 if running.is_none() {
-                                    if let Some((mid, msg, _per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                                    if let Some((mid, msg, _per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
+                                        // Persist the dequeue before the awaits that
+                                        // start the run, so a crash here can't
+                                        // restore + re-run it.
+                                        persist_control_queue_if_changed(
+                                            &mission_store,
+                                            &session_user_id,
+                                            &queue,
+                                            &mut last_persisted_queue,
+                                        )
+                                        .await;
                                         let target_mid = msg_target_mid.unwrap_or(mission_id);
                                         set_and_emit_status(
                                             &status,
@@ -9674,7 +12040,7 @@ async fn control_actor_loop(
                                             queue.len(),
                                             Some(target_mid),
                                         ).await;
-                                        let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: Some(target_mid) });
+                                        let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: Some(target_mid), source: msg_source.clone() });
                                         let cfg = config.clone();
                                         let agent = Arc::clone(&root_agent);
                                         let mcp_ref = Arc::clone(&mcp);
@@ -9852,11 +12218,12 @@ async fn control_actor_loop(
                         // Collect queued messages from main runner with their target mission IDs
                         let mut queued: Vec<QueuedMessage> = queue
                             .iter()
-                            .map(|(id, content, agent, target_mid)| QueuedMessage {
+                            .map(|(id, content, agent, target_mid, source)| QueuedMessage {
                                 id: *id,
                                 content: content.clone(),
                                 agent: agent.clone(),
                                 mission_id: *target_mid,
+                                source: source.clone(),
                             })
                             .collect();
                         // Also collect queued messages from parallel runners
@@ -9867,6 +12234,7 @@ async fn control_actor_loop(
                                     content: qm.content.clone(),
                                     agent: qm.agent.clone(),
                                     mission_id: Some(*mid),
+                                    source: qm.source.clone(),
                                 });
                             }
                         }
@@ -9877,7 +12245,7 @@ async fn control_actor_loop(
 
                         // Try to remove from main queue
                         let before_len = queue.len();
-                        queue.retain(|(id, _, _, _)| *id != message_id);
+                        queue.retain(|(id, _, _, _, _)| *id != message_id);
                         if queue.len() < before_len {
                             removed = true;
                             // Emit event for main queue change
@@ -9935,7 +12303,7 @@ async fn control_actor_loop(
                                 // from one mission's view must not wipe other
                                 // missions' queues.
                                 let before_len = queue.len();
-                                queue.retain(|(_, _, _, target_mid)| *target_mid != Some(target));
+                                queue.retain(|(_, _, _, target_mid, _)| *target_mid != Some(target));
                                 let main_removed = before_len - queue.len();
                                 cleared += main_removed;
                                 if main_removed > 0 {
@@ -10202,6 +12570,7 @@ async fn control_actor_loop(
                                     agent_result.terminal_reason,
                                     Some(completion_evidence.completion_confidence),
                                     false,
+                                    Some(agent_result.output.as_str()),
                                     "turn finished before follow-up enqueue",
                                 )
                                 .await;
@@ -10367,7 +12736,7 @@ async fn control_actor_loop(
                         );
                         let already_queued_for_mission = queue
                             .iter()
-                            .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id));
+                            .any(|(_id, _msg, _agent, target_mid, _source)| *target_mid == Some(mission_id));
 
                         // Grok `/goal` post-turn: parse the sentinel from the
                         // assistant's last text and either disable the goal
@@ -10410,6 +12779,7 @@ async fn control_actor_loop(
                                 completed_terminal_reason,
                                 completed_completion_confidence,
                                 true,
+                                Some(completed_agent_output.as_str()),
                                 "turn finished with no same-mission follow-up queued",
                             )
                             .await;
@@ -10418,7 +12788,16 @@ async fn control_actor_loop(
                 }
 
                 // Start next queued message, if any.
-                if let Some((mid, msg, per_msg_agent, msg_target_mid)) = queue.pop_front() {
+                if let Some((mid, msg, per_msg_agent, msg_target_mid, msg_source)) = queue.pop_front() {
+                    // Persist the dequeue before the awaits that start the run, so
+                    // a crash here can't restore + re-run it.
+                    persist_control_queue_if_changed(
+                        &mission_store,
+                        &session_user_id,
+                        &queue,
+                        &mut last_persisted_queue,
+                    )
+                    .await;
                     set_and_emit_status(
                         &status,
                         &events_tx,
@@ -10426,7 +12805,7 @@ async fn control_actor_loop(
                         queue.len(),
                         msg_target_mid,
                     ).await;
-                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid });
+                    let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), queued: false, mission_id: msg_target_mid, source: msg_source.clone() });
 
                     // Immediately persist user message so it's visible when loading mission
                     history.push(("user".to_string(), msg.clone()));
@@ -10679,7 +13058,7 @@ async fn control_actor_loop(
                                 .await;
                                 for message in messages {
                                     if message.target_mission_id == *mission_id {
-                                        runner.queue_message(Uuid::new_v4(), message.content, None);
+                                        runner.queue_message(Uuid::new_v4(), message.content, None, None);
                                         continue;
                                     }
 
@@ -10690,6 +13069,7 @@ async fn control_actor_loop(
                                         message.content,
                                         None,
                                         Some(message.target_mission_id),
+                                        Some("automation".to_string()),
                                     ));
                                 }
                             }
@@ -10733,7 +13113,19 @@ async fn control_actor_loop(
                                         result.terminal_reason,
                                         Some(completion_evidence.completion_confidence),
                                         true,
+                                        Some(result.output.as_str()),
                                         "parallel turn finished with no follow-up queued",
+                                    )
+                                    .await;
+                                    // Task-board settle hook: if this mission is a
+                                    // board worker, persist the outcome and notify
+                                    // the boss. No-op otherwise.
+                                    board::on_worker_settled(
+                                        &mission_store,
+                                        *mission_id,
+                                        &result.output,
+                                        result.terminal_reason,
+                                        result.success,
                                     )
                                     .await;
                                     completed_missions.push(*mission_id);
@@ -10753,6 +13145,180 @@ async fn control_actor_loop(
                     )
                     .await;
                     tracing::info!("Parallel mission {} removed from runners", mid);
+                }
+
+                // Task-board scheduler: spawn workers for ready tasks and
+                // sweep zombies. Throttled — store scans on every 100ms tick
+                // would hammer sqlite for nothing.
+                if last_board_pass.elapsed() >= BOARD_PASS_INTERVAL {
+                    last_board_pass = tokio::time::Instant::now();
+                    // Missions actively executing a turn (parallel runners +
+                    // the main session), so the scheduler won't wake a busy boss.
+                    let mut running_ids: std::collections::HashSet<Uuid> = parallel_runners
+                        .iter()
+                        .filter(|(_, r)| r.is_running())
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if running.is_some() {
+                        if let Some(mid) = running_mission_id {
+                            running_ids.insert(mid);
+                        }
+                    }
+                    let snapshot = board::RunnerSnapshot {
+                        present: parallel_runners.keys().copied().collect(),
+                        running_ids,
+                        running_count: parallel_runners
+                            .values()
+                            .filter(|r| r.is_running())
+                            .count(),
+                        main_running: running.is_some(),
+                    };
+                    let max_parallel = crate::settings::max_parallel_missions_cached_or(
+                        config.max_parallel_missions,
+                    );
+                    board::scheduler_pass(
+                        &mission_store,
+                        &self_cmd_tx,
+                        &snapshot,
+                        max_parallel,
+                        &mut board_wake_state,
+                    )
+                    .await;
+                }
+
+                // FLEET-001 scheduling dispatch: expire past-deadline scheduled
+                // missions, then start the highest-priority dispatchable one when
+                // the main session is idle. Throttled like the board pass.
+                if last_scheduler_pass.elapsed() >= SCHEDULER_PASS_INTERVAL {
+                    last_scheduler_pass = tokio::time::Instant::now();
+                    // Drop cooldown records that have aged out so a still-Pending
+                    // (dropped) mission becomes eligible for retry.
+                    scheduler_inflight
+                        .retain(|_, at| at.elapsed() < SCHEDULER_DISPATCH_COOLDOWN);
+                    match mission_store.get_scheduled_pending_missions().await {
+                        Ok(pending) => {
+                            let now = chrono::Utc::now();
+                            // 1. Expire any scheduled mission whose deadline elapsed
+                            //    before it ever dispatched. Missions still within the
+                            //    dispatch cooldown are skipped (not added to `live`) so
+                            //    a slow/lost start can't trigger a duplicate dispatch.
+                            let mut live: Vec<Mission> = Vec::with_capacity(pending.len());
+                            for m in pending {
+                                if m.is_past_deadline(now) {
+                                    tracing::info!(
+                                        mission_id = %m.id,
+                                        deadline = ?m.scheduling.deadline,
+                                        "Scheduler: expiring scheduled mission past deadline"
+                                    );
+                                    let _ = mission_store.set_deferred_goal(m.id, None).await;
+                                    if let Err(e) = mission_store
+                                        .update_mission_status_with_reason(
+                                            m.id,
+                                            MissionStatus::Failed,
+                                            Some("deadline_exceeded"),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            mission_id = %m.id,
+                                            "Scheduler: failed to expire mission: {e}"
+                                        );
+                                    } else {
+                                        maybe_schedule_mission_metadata_refresh_for_status(
+                                            &mission_store,
+                                            &events_tx,
+                                            m.id,
+                                            MissionStatus::Failed,
+                                        );
+                                        let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                            mission_id: m.id,
+                                            status: MissionStatus::Failed,
+                                            summary: Some(
+                                                "Scheduled mission expired: deadline passed before dispatch"
+                                                    .to_string(),
+                                            ),
+                                        });
+                                    }
+                                } else if scheduler_inflight.contains_key(&m.id) {
+                                    // A dispatch for this mission is still settling;
+                                    // skip until the cooldown record ages out.
+                                } else {
+                                    live.push(m);
+                                }
+                            }
+                            // 2. Dispatch the next runnable mission when there is spare
+                            //    concurrency. The targeted scheduler message starts a
+                            //    parallel runner (Case 2, explicit target => force
+                            //    parallel), which DROPS at capacity — so mirror its check
+                            //    (main + parallel < max_parallel) rather than requiring the
+                            //    main session to be idle, otherwise eligible scheduled
+                            //    missions stall behind a busy main runner.
+                            let parallel_running = parallel_runners
+                                .values()
+                                .filter(|r| r.is_running())
+                                .count();
+                            let total_running =
+                                parallel_running + if running.is_some() { 1 } else { 0 };
+                            let max_parallel = crate::settings::max_parallel_missions_cached_or(
+                                config.max_parallel_missions,
+                            );
+                            if total_running < max_parallel {
+                                if let Some(next) =
+                                    super::mission_store::select_next_runnable_mission(&live, now)
+                                {
+                                    let mission_id = next.id;
+                                    let priority = next.scheduling.priority;
+                                    if let Ok(Some(goal)) =
+                                        mission_store.get_deferred_goal(mission_id).await
+                                    {
+                                        // Deliberately do NOT clear the goal here. The
+                                        // Pending->Active transition that the dispatched
+                                        // message triggers is what removes the mission from
+                                        // `get_scheduled_pending_missions` (status filter),
+                                        // so it can't be re-dispatched. Leaving the goal in
+                                        // place means a rare dispatch drop (capacity race)
+                                        // simply retries on the next pass instead of losing
+                                        // the scheduled work.
+                                        let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+                                        match self_cmd_tx.try_send(ControlCommand::UserMessage {
+                                            id: Uuid::new_v4(),
+                                            content: goal,
+                                            agent: None,
+                                            target_mission_id: Some(mission_id),
+                                            strict: false,
+                                            source: Some("scheduler".to_string()),
+                                            respond: ack_tx,
+                                        }) {
+                                            Ok(()) => {
+                                                // Record the dispatch so the next passes
+                                                // skip this mission until it flips to
+                                                // Active (or the cooldown lets a dropped
+                                                // start retry).
+                                                scheduler_inflight.insert(
+                                                    mission_id,
+                                                    tokio::time::Instant::now(),
+                                                );
+                                                tracing::info!(
+                                                    mission_id = %mission_id,
+                                                    priority,
+                                                    "Scheduler: dispatching scheduled mission"
+                                                );
+                                            }
+                                            Err(e) => tracing::warn!(
+                                                mission_id = %mission_id,
+                                                "Scheduler: dispatch enqueue failed; will retry: {e}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Scheduler: failed to list scheduled pending missions: {e}"
+                            );
+                        }
+                    }
                 }
             }
             // Force-reap a runner whose cancel was fired but whose
@@ -10874,6 +13440,21 @@ async fn control_actor_loop(
                                     runner
                                         .active_tool_calls
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+
+                                // Background-task auto-resume: stash the command
+                                // for any `Bash` call so the matching ToolResult
+                                // can attach it to a captured background task.
+                                if background_autoresume_enabled
+                                    && name == "Bash"
+                                    && pending_bash_commands.len() < MAX_PENDING_BASH_COMMANDS
+                                {
+                                    if let Some(cmd) =
+                                        args.get("command").and_then(|v| v.as_str())
+                                    {
+                                        pending_bash_commands
+                                            .insert(tool_call_id.clone(), cmd.to_string());
+                                    }
                                 }
 
                                 // Emit activity event for real-time SSE
@@ -11059,6 +13640,63 @@ async fn control_actor_loop(
                             }
                         }
                         _ => {}
+                    }
+
+                    // Background-task auto-resume capture: when a `Bash` tool
+                    // result is the CLI's background-launch confirmation, record
+                    // the task so the watcher can wake the agent once it finishes.
+                    // (Must run before the desktop block below, which `continue`s
+                    // past non-desktop tool results.)
+                    if background_autoresume_enabled {
+                        if let AgentEvent::ToolResult {
+                            tool_call_id,
+                            name,
+                            result,
+                            mission_id,
+                        } = &event
+                        {
+                            // Always reclaim the correlated command, even if this
+                            // isn't a background start, so the map can't leak.
+                            let command = pending_bash_commands.remove(tool_call_id);
+                            if name == "Bash" {
+                                if let (Some(mid), Some(text)) =
+                                    (mission_id, tool_result_text(result))
+                                {
+                                    if let Some((task_id, output_path)) =
+                                        super::runners::claudecode::parse_background_task_start(
+                                            &text,
+                                        )
+                                    {
+                                        let task = super::mission_runner::BackgroundTask {
+                                            id: task_id.clone(),
+                                            output_path: output_path.clone(),
+                                            command: command.unwrap_or_default(),
+                                            started_at: std::time::Instant::now(),
+                                        };
+                                        tracing::info!(
+                                            mission_id = %mid,
+                                            background_task_id = %task_id,
+                                            output_path = %output_path,
+                                            "Captured Claude Code background task; \
+                                             scheduling auto-resume on completion"
+                                        );
+                                        // Mirror onto the runner (informational).
+                                        if let Some(runner) = parallel_runners.get_mut(mid) {
+                                            runner
+                                                .background_tasks
+                                                .insert(task_id.clone(), task.clone());
+                                        }
+                                        // Source of truth: the shared registry.
+                                        background_tasks
+                                            .write()
+                                            .await
+                                            .entry(*mid)
+                                            .or_default()
+                                            .insert(task_id, task);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Track desktop sessions for mission reconnect/resume.
@@ -11319,7 +13957,7 @@ async fn run_single_control_turn(
     }
     // Ensure a workspace directory for this mission (if applicable).
     let (working_dir_path, runtime_workspace) = if let Some(mid) = mission_id {
-        let ws = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
+        let mut ws = workspace::resolve_workspace(&workspaces, &config, workspace_id).await;
         if let Err(e) =
             workspace::sync_workspace_mcp_binaries_for_workspace(&config.working_dir, &ws).await
         {
@@ -11333,7 +13971,7 @@ async fn run_single_control_turn(
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
         let dir = match Box::pin(workspace::prepare_mission_workspace_with_skills_backend(
-            &ws,
+            &mut ws,
             &mcp,
             lib_ref,
             mid,
@@ -11341,6 +13979,7 @@ async fn run_single_control_turn(
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
             boss_user_id.as_deref(),
+            Some(&config.working_dir),
         ))
         .await
         {
@@ -11733,6 +14372,24 @@ pub async fn create_automation(
 ) -> Result<Json<mission_store::Automation>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
 
+    if control
+        .mission_store
+        .get_mission(mission_id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        tracing::warn!(
+            mission_id = %mission_id,
+            user_id = %user.id,
+            "Rejecting automation create for missing mission"
+        );
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Mission {} not found; cannot create automation", mission_id),
+        ));
+    }
+
     // Validate the command exists in the library if CommandSource::Library
     if let mission_store::CommandSource::Library { ref name } = req.command_source {
         validate_library_command(&state, name).await?;
@@ -11811,11 +14468,91 @@ pub async fn create_automation(
         driver: mission_store::AutomationDriver::Scheduler,
     };
 
+    let is_builtin_wakeup = automation
+        .variables
+        .get("__wakeup_source")
+        .map(String::as_str)
+        == Some("claude-builtin");
+
+    tracing::info!(
+        mission_id = %mission_id,
+        automation_id = %automation.id,
+        command_source = ?automation.command_source,
+        trigger = ?automation.trigger,
+        fresh_session = ?automation.fresh_session,
+        is_builtin_wakeup,
+        "Creating mission automation"
+    );
+
     let mut automation = control
         .mission_store
         .create_automation(automation)
         .await
         .map_err(internal_error)?;
+
+    // One pending built-in wakeup per mission: a new ScheduleWakeup
+    // supersedes any earlier un-fired one. Without this, a turn that starts
+    // before the previous wakeup fires (user message, other automation)
+    // schedules a second wakeup, and the leftovers pile up into overlapping
+    // re-triggers (observed: 5 concurrent pending wakeups on one mission,
+    // all firing within two minutes).
+    //
+    // Ordering: the new wakeup is created *first*, then older ones are
+    // deactivated — if creation fails the mission keeps its previous wakeup
+    // instead of losing all of them. Only automations strictly older than
+    // the new row are deactivated ((created_at, id) tie-break), so two
+    // overlapping creates converge on exactly the newest wakeup instead of
+    // deactivating each other.
+    let mut wakeup_iteration: u32 = 1;
+    if is_builtin_wakeup {
+        if let Ok(existing) = control
+            .mission_store
+            .get_mission_automations(mission_id)
+            .await
+        {
+            let new_key = (automation.created_at.clone(), automation.id.to_string());
+            let priors: Vec<_> = existing
+                .into_iter()
+                .filter(|a| {
+                    a.id != automation.id
+                        && a.variables.get("__wakeup_source").map(String::as_str)
+                            == Some("claude-builtin")
+                })
+                .collect();
+            wakeup_iteration = (priors.len() as u32).saturating_add(1);
+            for prior in priors
+                .into_iter()
+                .filter(|a| a.active && (a.created_at.clone(), a.id.to_string()) < new_key)
+            {
+                if let Err(e) = control
+                    .mission_store
+                    .update_automation_active(prior.id, false)
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to deactivate superseded wakeup automation {}: {}",
+                        prior.id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Persist a goal-iteration marker for self-paced loops so the dashboard
+    // and assistant can see loop progress after a reload — previously this
+    // state lived only in the (transient) wakeup automations.
+    if is_builtin_wakeup {
+        let _ = control.events_tx.send(AgentEvent::GoalIteration {
+            iteration: wakeup_iteration,
+            objective: automation
+                .variables
+                .get("__wakeup_reason")
+                .cloned()
+                .unwrap_or_default(),
+            mission_id: Some(mission_id),
+        });
+    }
 
     // If start_immediately is requested for agent_finished triggers, fire the
     // first execution right away by resolving the command and sending it as a
@@ -11898,6 +14635,8 @@ pub async fn create_automation(
                     content,
                     agent: None,
                     target_mission_id: Some(target_mission_id),
+                    strict: false,
+                    source: None,
                     respond: respond_tx,
                 })
                 .await;
@@ -13147,6 +15886,8 @@ pub async fn webhook_receiver(
             content: substituted_content,
             agent: None,
             target_mission_id: Some(mission.id),
+            strict: false,
+            source: None,
             respond: respond_tx,
         })
         .await;
@@ -14300,6 +17041,8 @@ pub async fn send_telegram_message_api(
                     content,
                     agent: None,
                     target_mission_id: Some(mapping.mission_id),
+                    strict: false,
+                    source: Some("telegram".to_string()),
                     respond: tx,
                 })
                 .await;
@@ -14505,6 +17248,55 @@ mod tests {
             stub.metadata["call_content_bytes"],
             serde_json::json!("{\"cmd\":\"old\"}".len())
         );
+    }
+
+    #[test]
+    fn conversation_projection_keeps_interactive_ui_tools_full() {
+        // An old, answered AskUserQuestion must NOT be stubbed: the dashboard
+        // needs its args to render the question, otherwise it shows the
+        // misleading empty "reply below" prompt for an already-answered item.
+        let mission_id = Uuid::new_v4();
+        let mut call = stored_test_event(
+            mission_id,
+            1,
+            "tool_call",
+            Some("q-1"),
+            "{\"questions\":[{\"question\":\"Pick one\",\"options\":[]}]}",
+        );
+        call.tool_name = Some("AskUserQuestion".to_string());
+        let mut result = stored_test_event(
+            mission_id,
+            2,
+            "tool_result",
+            Some("q-1"),
+            "{\"answers\":[[\"A\"]]}",
+        );
+        result.tool_name = Some("AskUserQuestion".to_string());
+        // A newer ordinary tool pair that SHOULD still be stubbed.
+        let newer_call =
+            stored_test_event(mission_id, 3, "tool_call", Some("b-1"), "{\"cmd\":\"x\"}");
+        let newer_result =
+            stored_test_event(mission_id, 4, "tool_result", Some("b-1"), "{\"ok\":true}");
+
+        let projected = project_conversation_events(
+            vec![call, result, newer_call, newer_result],
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+
+        // The question call + result survive intact.
+        let q_call = projected
+            .iter()
+            .find(|e| e.tool_call_id.as_deref() == Some("q-1") && e.event_type == "tool_call")
+            .expect("question tool_call kept full");
+        assert!(q_call.content.contains("Pick one"));
+        assert!(projected
+            .iter()
+            .any(|e| e.tool_call_id.as_deref() == Some("q-1") && e.event_type == "tool_result"));
+        // The ordinary newer pair is stubbed as usual.
+        assert!(projected
+            .iter()
+            .any(|e| e.tool_call_id.as_deref() == Some("b-1") && e.event_type == "tool_stub"));
     }
 
     #[test]
@@ -17271,6 +20063,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -17281,6 +20074,10 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
         let weak = Mission {
             id: Uuid::new_v4(),
@@ -17302,6 +20099,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -17312,6 +20110,10 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let strong_score = mission_search_relevance_score(
@@ -17348,6 +20150,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -17358,6 +20161,10 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let score = mission_search_relevance_score(
@@ -17391,6 +20198,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -17401,6 +20209,10 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let score = mission_search_relevance_score(
@@ -17434,6 +20246,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -17444,6 +20257,10 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let score = mission_search_relevance_score(
@@ -17477,6 +20294,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now,
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -17487,6 +20305,10 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
 
         let score = mission_search_relevance_score(
@@ -17604,6 +20426,7 @@ And the report:
             created_at: now.clone(),
             updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: None,
@@ -17614,6 +20437,10 @@ And the report:
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: Default::default(),
+            awaiting_kind: None,
         };
         let before = mission_search_freshness_key(
             &[MissionSearchCandidate {
@@ -17761,6 +20588,7 @@ Investigate <service/> failures.
             "queued user message".to_string(),
             None,
             Some(existing_target),
+            Some("api:test-user".to_string()),
         )]);
 
         enqueue_agent_finished_messages(
@@ -17779,7 +20607,7 @@ Investigate <service/> failures.
 
         let ordered: Vec<(String, Option<Uuid>)> = queue
             .into_iter()
-            .map(|(_, content, _, mission_id)| (content, mission_id))
+            .map(|(_, content, _, mission_id, _)| (content, mission_id))
             .collect();
         assert_eq!(
             ordered,
@@ -17801,12 +20629,14 @@ Investigate <service/> failures.
                 "other mission".to_string(),
                 None,
                 Some(other_mission_id),
+                None,
             ),
             (
                 Uuid::new_v4(),
                 "current mission".to_string(),
                 None,
                 Some(mission_id),
+                None,
             ),
         ]);
 
@@ -17821,6 +20651,50 @@ Investigate <service/> failures.
 
         assert!(accept_user_message_id(&mut accepted, message_id));
         assert!(!accept_user_message_id(&mut accepted, message_id));
+    }
+
+    fn assistant(content: &str) -> MissionHistoryEntry {
+        MissionHistoryEntry {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_awaiting_kind_detects_decisions_and_acks() {
+        // Trailing question → decision.
+        assert_eq!(
+            classify_awaiting_kind(&[assistant("I found two options. Which one do you prefer?")]),
+            AwaitingKind::Decision
+        );
+        // Approval-seeking phrasing without a literal trailing '?'.
+        assert_eq!(
+            classify_awaiting_kind(&[assistant(
+                "The migration is ready. Should I apply it now to prod?"
+            )]),
+            AwaitingKind::Decision
+        );
+        // Plain "done" statement → ack.
+        assert_eq!(
+            classify_awaiting_kind(&[assistant("Done. Opened PR #569 and merged it.")]),
+            AwaitingKind::Ack
+        );
+        // No assistant text at all → ack (don't fabricate an open question).
+        assert_eq!(
+            classify_awaiting_kind(&[MissionHistoryEntry {
+                role: "user".to_string(),
+                content: "go".to_string(),
+            }]),
+            AwaitingKind::Ack
+        );
+        // Only the *last* assistant message matters.
+        assert_eq!(
+            classify_awaiting_kind(&[
+                assistant("Should I start? "),
+                assistant("All set, deployed and verified."),
+            ]),
+            AwaitingKind::Ack
+        );
     }
 
     #[test]
@@ -17846,6 +20720,84 @@ Investigate <service/> failures.
         );
     }
 
+    #[test]
+    fn message_activates_mission_includes_waiting_background() {
+        // A resume delivered while background jobs are still live lands on a
+        // WaitingBackground mission; it must be activation-eligible so the flip
+        // to Active clears first_viewed_at and closes the ack race.
+        assert!(message_activates_mission(MissionStatus::WaitingBackground));
+        for status in [
+            MissionStatus::Pending,
+            MissionStatus::Interrupted,
+            MissionStatus::Blocked,
+            MissionStatus::Completed,
+            MissionStatus::Failed,
+            MissionStatus::AwaitingUser,
+            MissionStatus::Acknowledged,
+        ] {
+            assert!(
+                message_activates_mission(status),
+                "{status} should activate"
+            );
+        }
+        // Already-running and explicitly-paused missions are handled elsewhere
+        // (a running mission needs no activation; a paused one must stay parked
+        // until the user resumes it), so they are not activation-eligible here.
+        assert!(!message_activates_mission(MissionStatus::Active));
+        assert!(!message_activates_mission(MissionStatus::Paused));
+    }
+
+    #[tokio::test]
+    async fn activating_waiting_background_clears_first_viewed_at_and_blocks_ack() {
+        let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
+        let mission = store
+            .create_mission(Some("bg resume race"), None, None, None, None, None, None)
+            .await
+            .expect("mission should be created");
+        // The mission parked awaiting the user, was opened (first_viewed_at set),
+        // then a background job promoted it to WaitingBackground.
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        store
+            .set_mission_first_viewed_at_if_unset(mission.id, &long_ago)
+            .await
+            .expect("set first_viewed_at");
+        store
+            .update_mission_status(mission.id, MissionStatus::WaitingBackground)
+            .await
+            .expect("set waiting_background");
+
+        // The auto-resume dequeue path activates the mission to Active.
+        assert!(message_activates_mission(MissionStatus::WaitingBackground));
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("activate to Active");
+
+        // Activation cleared the stale first_viewed_at, so once the resumed turn
+        // re-parks in AwaitingUser the ack-promotion sweep must not archive it.
+        store
+            .update_mission_status(mission.id, MissionStatus::AwaitingUser)
+            .await
+            .expect("re-park in awaiting_user");
+        let after = store
+            .get_mission(mission.id)
+            .await
+            .expect("get mission")
+            .expect("mission exists");
+        assert_eq!(
+            after.first_viewed_at, None,
+            "activation must clear first_viewed_at"
+        );
+        let promoted = store
+            .acknowledge_stale_awaiting_user_missions(0)
+            .await
+            .expect("run ack sweep");
+        assert!(
+            !promoted.contains(&mission.id),
+            "a freshly-resumed mission must not be ack-promoted after demotion"
+        );
+    }
+
     #[tokio::test]
     async fn maybe_finalize_terminal_mission_preserves_interrupted_status() {
         let store: Arc<dyn MissionStore> = Arc::new(mission_store::InMemoryMissionStore::new());
@@ -17866,6 +20818,7 @@ Investigate <service/> failures.
             Some(TerminalReason::LlmError),
             None,
             false,
+            None,
             "shutdown race test",
         )
         .await;
@@ -17901,6 +20854,7 @@ Investigate <service/> failures.
             Some(TerminalReason::Completed),
             Some(crate::agents::CompletionConfidence::Low),
             true,
+            None,
             "low confidence completion test",
         )
         .await;
@@ -18571,7 +21525,7 @@ Investigate <service/> failures.
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        lagged = lagged.saturating_add(n as u64);
+                        lagged = lagged.saturating_add(n);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

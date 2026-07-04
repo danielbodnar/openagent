@@ -1,6 +1,7 @@
 package sh.sandboxed.dashboard.ui.fido
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -42,12 +43,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.AutoApprovalRule
 import sh.sandboxed.dashboard.data.AutoApprovalRuleType
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.theme.Palette
 import java.util.UUID
@@ -62,7 +66,7 @@ fun FidoRulesScreen(container: AppContainer, onBack: () -> Unit) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = Palette.TextPrimary) }
             Text("FIDO approvals", style = MaterialTheme.typography.titleLarge, color = Palette.TextPrimary, modifier = Modifier.weight(1f))
-            IconButton(onClick = { showAdd = true }) { Icon(Icons.Filled.Add, "Add rule", tint = Palette.Accent) }
+            IconButton(onClick = { showAdd = true }, modifier = Modifier.tag(TestTags.FIDO_ADD_RULE)) { Icon(Icons.Filled.Add, "Add rule", tint = Palette.Accent) }
         }
 
         LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -78,6 +82,7 @@ fun FidoRulesScreen(container: AppContainer, onBack: () -> Unit) {
                                 checked = settings.fidoRequireBiometricAll,
                                 onCheckedChange = { v -> scope.launch { container.settings.setFidoRequireBiometricAll(v) } },
                                 colors = SwitchDefaults.colors(checkedThumbColor = Palette.Accent),
+                                modifier = Modifier.tag(TestTags.FIDO_BIOMETRIC_TOGGLE),
                             )
                         }
                     }
@@ -193,22 +198,28 @@ private fun AddRuleDialog(
                 Text("Match", color = Palette.TextSecondary, style = MaterialTheme.typography.labelMedium)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     AutoApprovalRuleType.entries.forEach { t ->
-                        FilterChip(
-                            selected = type == t, onClick = { type = t },
-                            label = { Text(when (t) {
-                                AutoApprovalRuleType.ALL_SSH -> "All SSH"
-                                AutoApprovalRuleType.HOSTNAME -> "Host"
-                                AutoApprovalRuleType.KEY_FINGERPRINT -> "Fingerprint"
-                            }, style = MaterialTheme.typography.labelSmall) },
-                            colors = chipColors(),
-                        )
+                        Box(Modifier.tag(when (t) {
+                            AutoApprovalRuleType.ALL_SSH -> TestTags.FIDO_NEW_MATCH_ALL
+                            AutoApprovalRuleType.HOSTNAME -> TestTags.FIDO_NEW_MATCH_HOST
+                            AutoApprovalRuleType.KEY_FINGERPRINT -> TestTags.FIDO_NEW_MATCH_FINGERPRINT
+                        })) {
+                            FilterChip(
+                                selected = type == t, onClick = { type = t },
+                                label = { Text(when (t) {
+                                    AutoApprovalRuleType.ALL_SSH -> "All SSH"
+                                    AutoApprovalRuleType.HOSTNAME -> "Host"
+                                    AutoApprovalRuleType.KEY_FINGERPRINT -> "Fingerprint"
+                                }, style = MaterialTheme.typography.labelSmall) },
+                                colors = chipColors(),
+                            )
+                        }
                     }
                 }
                 if (type != AutoApprovalRuleType.ALL_SSH) {
                     OutlinedTextField(
                         value = value, onValueChange = { value = it }, singleLine = true,
                         label = { Text(if (type == AutoApprovalRuleType.HOSTNAME) "Hostname" else "Key fingerprint") },
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier.fillMaxWidth().tag(TestTags.FIDO_NEW_VALUE),
                         colors = ruleFieldColors(),
                     )
                 }
@@ -216,11 +227,18 @@ private fun AddRuleDialog(
                 Text("Expiry", color = Palette.TextSecondary, style = MaterialTheme.typography.labelMedium)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf(1 to "1h", 24 to "24h", 24 * 7 to "7d", null to "never").forEach { (h, label) ->
-                        FilterChip(
-                            selected = expiry == h, onClick = { expiry = h },
-                            label = { Text(label, style = MaterialTheme.typography.labelSmall) },
-                            colors = chipColors(),
-                        )
+                        Box(Modifier.tag(when (label) {
+                            "1h" -> TestTags.FIDO_NEW_EXPIRY_1H
+                            "24h" -> TestTags.FIDO_NEW_EXPIRY_24H
+                            "7d" -> TestTags.FIDO_NEW_EXPIRY_7D
+                            else -> TestTags.FIDO_NEW_EXPIRY_NEVER
+                        })) {
+                            FilterChip(
+                                selected = expiry == h, onClick = { expiry = h },
+                                label = { Text(label, style = MaterialTheme.typography.labelSmall) },
+                                colors = chipColors(),
+                            )
+                        }
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -231,6 +249,7 @@ private fun AddRuleDialog(
                     Switch(
                         checked = requireBio, onCheckedChange = { requireBio = it },
                         colors = SwitchDefaults.colors(checkedThumbColor = Palette.Accent),
+                        modifier = Modifier.tag(TestTags.FIDO_NEW_BIOMETRIC),
                     )
                 }
             }
@@ -240,9 +259,10 @@ private fun AddRuleDialog(
                 onClick = { onAdd(type, value, requireBio, expiry) },
                 enabled = type == AutoApprovalRuleType.ALL_SSH || value.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent),
+                modifier = Modifier.tag(TestTags.FIDO_NEW_ADD),
             ) { Text("Add") }
         },
-        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = onCancel, modifier = Modifier.tag(TestTags.FIDO_NEW_CANCEL)) { Text("Cancel") } },
         containerColor = Palette.Card,
     )
 }

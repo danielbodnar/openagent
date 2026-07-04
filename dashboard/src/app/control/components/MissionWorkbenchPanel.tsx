@@ -24,7 +24,9 @@ import { RelativeTime } from "@/components/ui/relative-time";
 import { getMissionShortName } from "@/lib/mission-display";
 import type { inferMissionRole } from "@/lib/mission-role";
 import type { Mission, MissionStatus } from "@/lib/api";
+import type { MissionStateSummary } from "../events-reducer";
 import { missionStatusDotClass, missionStatusLabel } from "./common";
+import { MissionTaskBoard } from "./MissionTaskBoard";
 
 export function MissionWorkbenchPanel({
   mission,
@@ -33,6 +35,7 @@ export function MissionWorkbenchPanel({
   isRunning,
   childMissions,
   queueLen,
+  missionState,
   onClose,
   onResume,
   onCancel,
@@ -51,6 +54,8 @@ export function MissionWorkbenchPanel({
   childMissions: Mission[];
   /** Pending message count, surfaced inline alongside status. */
   queueLen?: number;
+  /** Agent task board + next-wakeup marker derived from chat items. */
+  missionState?: MissionStateSummary;
   onClose: () => void;
   onResume: () => void;
   onCancel: (missionId: string) => void;
@@ -72,7 +77,9 @@ export function MissionWorkbenchPanel({
   const title =
     mission?.title?.trim() ||
     (mission ? getMissionShortName(mission.id) : "No mission selected");
-  const status = mission ? missionStatusLabel(mission.status, isRunning) : null;
+  const status = mission
+    ? missionStatusLabel(mission.status, isRunning, mission.awaiting_kind)
+    : null;
   const canResume =
     mission &&
     !isRunning &&
@@ -239,7 +246,51 @@ export function MissionWorkbenchPanel({
                   className="font-mono text-white/70"
                 />
               </Row>
+              {mission.project && (
+                <Row label="Project">
+                  <span
+                    className="truncate font-mono text-white/70 max-w-[160px]"
+                    title={[mission.project, mission.track, mission.intent]
+                      .filter(Boolean)
+                      .join(" / ")}
+                  >
+                    {[mission.project, mission.track, mission.intent]
+                      .filter(Boolean)
+                      .join(" / ")}
+                  </span>
+                </Row>
+              )}
+              {mission.github_pr && (
+                <Row label="PR">
+                  <span
+                    className="truncate font-mono text-white/70 max-w-[160px]"
+                    title={mission.github_pr}
+                  >
+                    {mission.github_pr}
+                  </span>
+                </Row>
+              )}
+              {mission.desired_state && (
+                <Row label="State">
+                  <span className="font-mono text-sky-300/80">
+                    {mission.desired_state}
+                  </span>
+                </Row>
+              )}
             </dl>
+
+            {mission.tags && mission.tags.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {mission.tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="rounded-full border border-white/[0.08] bg-white/[0.04] px-1.5 py-0.5 text-[10px] font-medium text-white/55"
+                  >
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            )}
 
             {mission.short_description && (
               <p className="workbench-mission-description mt-2 rounded-md border border-white/[0.05] bg-white/[0.02] px-2 py-1.5 text-[11px] leading-relaxed text-white/50">
@@ -335,6 +386,72 @@ export function MissionWorkbenchPanel({
                 </div>
               )}
             </div>
+
+            {missionState?.upNext && (
+              <div className="mt-3 border-t border-white/[0.06] pt-2.5">
+                <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-white/40">
+                  <Clock className="h-3 w-3" />
+                  Up next
+                </div>
+                <div className="text-[11px] leading-snug text-white/70">
+                  {missionState.upNext.reason.length > 160
+                    ? missionState.upNext.reason.slice(0, 160) + "…"
+                    : missionState.upNext.reason}
+                </div>
+                <div className="mt-0.5 text-[10px] text-white/35">
+                  scheduled{" "}
+                  <RelativeTime date={new Date(missionState.upNext.timestamp)} />
+                  {missionState.upNext.delaySeconds != null &&
+                    ` · fires ~${Math.round(missionState.upNext.delaySeconds / 60)}min later`}
+                </div>
+              </div>
+            )}
+
+            {missionState?.plan && missionState.plan.items.length > 0 && (
+              <div className="mt-3 border-t border-white/[0.06] pt-2.5">
+                <div className="mb-1.5 flex items-center justify-between">
+                  <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-white/40">
+                    <Flag className="h-3 w-3" />
+                    Plan
+                  </div>
+                  <span className="text-[10px] text-white/35">
+                    {missionState.plan.items.filter((t) => t.status === "completed").length}
+                    /{missionState.plan.items.length} done
+                  </span>
+                </div>
+                <ul className="space-y-1">
+                  {missionState.plan.items.map((task, i) => (
+                    <li
+                      key={i}
+                      className={cn(
+                        "flex items-start gap-1.5 text-[11px] leading-snug",
+                        task.status === "completed"
+                          ? "text-white/30 line-through"
+                          : task.status === "in_progress"
+                            ? "text-amber-200/90"
+                            : "text-white/60",
+                      )}
+                    >
+                      <span className="mt-px shrink-0">
+                        {task.status === "completed"
+                          ? "✓"
+                          : task.status === "in_progress"
+                            ? "●"
+                            : "○"}
+                      </span>
+                      <span>{task.content}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {mission && (
+              <MissionTaskBoard
+                missionId={mission.id}
+                onViewMission={onViewMission}
+              />
+            )}
 
             {childMissions.length > 0 && (
               <div className="mt-3 border-t border-white/[0.06] pt-2.5">

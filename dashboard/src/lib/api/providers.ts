@@ -26,6 +26,7 @@ export type AIProviderType =
   | "zai"
   | "minimax"
   | "github-copilot"
+  | "kimi"
   | "custom";
 
 export interface AIProviderTypeInfo {
@@ -136,6 +137,28 @@ export interface Provider {
 
 export interface ProvidersResponse {
   providers: Provider[];
+  /** Provider ids with working credentials. When `includeAll` is set, the
+   * `providers` list also includes unconfigured catalog providers; use this to
+   * tell which are actually connected. */
+  configured_ids?: string[];
+}
+
+/** A model in the full supported-models catalog (`/api/providers/catalog`). */
+export interface CatalogModel {
+  provider_id: string;
+  provider_name: string;
+  id: string;
+  /** The `provider/model` id to pass to the router (e.g. "zai/glm-5.2"). */
+  value: string;
+  name: string;
+  description?: string;
+  /** True when a credential for this provider is configured. */
+  configured: boolean;
+}
+
+export interface ModelCatalogResponse {
+  count: number;
+  models: CatalogModel[];
 }
 
 export interface BackendModelOption {
@@ -314,8 +337,26 @@ export interface ProviderUsage {
   tokens_reset_minute?: string;
   // Minimax coding plan
   coding_plan?: Record<string, unknown>;
-  // Z.AI last call usage
-  last_call_usage?: Record<string, unknown>;
+  // MiniMax coding plan — per-category remaining percentages (0..100) and reset
+  // times (unix epoch seconds). Representative-window fields feed `optimize`.
+  model_usage?: Array<{
+    model: string;
+    interval_remaining_percent: number;
+    weekly_remaining_percent: number;
+    interval_reset: number;
+    weekly_reset: number;
+  }>;
+  minimax_interval_remaining_percent?: number;
+  minimax_weekly_remaining_percent?: number;
+  minimax_interval_reset?: number;
+  minimax_weekly_reset?: number;
+  // Z.AI GLM coding plan — `percentage` is percent USED; reset is unix epoch
+  // seconds (absent for an untouched window). `zai_plan` is the tier (max/pro/…).
+  zai_plan?: string;
+  zai_5h_used_percent?: number;
+  zai_5h_reset?: number;
+  zai_weekly_used_percent?: number;
+  zai_weekly_reset?: number;
   // Codex (OpenAI ChatGPT subscription) limits — primary = 5h window,
   // secondary = weekly (7d) window. Reset fields are unix epoch seconds.
   codex_plan_type?: string;
@@ -329,8 +370,48 @@ export interface ProviderUsage {
   codex_credits_balance?: number;
   codex_credits_unlimited?: boolean;
   codex_source?: "probe" | "passive";
+  // Provider-faithful normalized view for token-spend optimization. Each window
+  // only carries the fields its provider actually reports (so shapes differ by
+  // vendor); `burn` is null unless a pace/rate could be derived. One call gives
+  // pct_remaining, reset_at, and burn rate together.
+  optimize?: UsageOptimize;
   // Any additional fields
   [key: string]: unknown;
+}
+
+export interface UsageOptimizeBurn {
+  /** %-window providers: projected utilization at reset (>=100 ⇒ will exhaust). */
+  projected_pct_at_reset?: number | null;
+  on_track_to_exhaust?: boolean | null;
+  /** Absolute-token windows: observed consumption rate from the snapshot delta. */
+  tokens_per_min?: number | null;
+  sample_seconds?: number | null;
+  projected_exhaustion_at?: string | null;
+  basis?: "window_pace" | "observed_delta" | "window_pace+observed_delta";
+}
+
+export interface UsageOptimizeWindow {
+  key: string;
+  label: string;
+  metric: "tokens" | "requests" | "mixed";
+  source: string;
+  pct_used: number | null;
+  pct_remaining: number | null;
+  limit: number | null;
+  remaining: number | null;
+  used: number | null;
+  window_seconds: number | null;
+  reset_at: string | null;
+  reset_in_seconds: number | null;
+  burn: UsageOptimizeBurn | null;
+  [key: string]: unknown;
+}
+
+export interface UsageOptimize {
+  as_of: string;
+  /** Key of the most binding window (lowest pct_remaining), or null. */
+  primary_window: string | null;
+  windows: UsageOptimizeWindow[];
 }
 
 export async function getProviderUsage(id: string): Promise<ProviderUsage> {
@@ -430,6 +511,13 @@ export async function listProviders(options?: {
   const query = params.toString();
   const res = await apiFetch(`/api/providers${query ? `?${query}` : ""}`);
   if (!res.ok) throw new Error("Failed to fetch providers");
+  return res.json();
+}
+
+/** The full catalog of supported `provider/model` ids the router accepts. */
+export async function getModelCatalog(): Promise<ModelCatalogResponse> {
+  const res = await apiFetch("/api/providers/catalog");
+  if (!res.ok) throw new Error("Failed to fetch model catalog");
   return res.json();
 }
 

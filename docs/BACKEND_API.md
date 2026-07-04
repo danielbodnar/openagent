@@ -91,6 +91,6 @@ vault. Grok accepts `cli_path` to override the CLI binary path.
 ```json
 {
   "ok": true,
-  "message": "Backend configuration updated. Restart Sandboxed.sh to apply runtime changes."
+  "message": "Backend configuration updated."
 }
 ```

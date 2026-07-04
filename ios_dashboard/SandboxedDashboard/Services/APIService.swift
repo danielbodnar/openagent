@@ -230,6 +230,40 @@ final class APIService {
     func getMission(id: String) async throws -> Mission {
         try await get("/api/control/missions/\(id)")
     }
+
+    // MARK: - Mission task board
+
+    /// Server-owned task board for a boss mission. Returns an empty board
+    /// (not an error) for missions that never registered tasks.
+    func getMissionBoard(missionId: String) async throws -> MissionBoard {
+        try await get("/api/control/missions/\(missionId)/board")
+    }
+
+    struct BoardVerdictBody: Encodable {
+        let action: String
+        let feedback: String?
+    }
+
+    @discardableResult
+    func boardTaskVerdict(
+        taskId: String,
+        action: String,
+        feedback: String? = nil
+    ) async throws -> BoardTask {
+        try await post(
+            "/api/control/board/tasks/\(taskId)/verdict",
+            body: BoardVerdictBody(action: action, feedback: feedback)
+        )
+    }
+
+    @discardableResult
+    func cancelBoardTask(taskId: String) async throws -> BoardTask {
+        struct Empty: Encodable {}
+        return try await post(
+            "/api/control/board/tasks/\(taskId)/cancel",
+            body: Empty()
+        )
+    }
     
     func getCurrentMission() async throws -> Mission? {
         try await get("/api/control/missions/current")
@@ -838,6 +872,14 @@ final class APIService {
 
     // MARK: - Control Streaming
 
+    /// After this many consecutive WebSocket open failures, stop trying WS
+    /// for the rest of the process lifetime and go straight to SSE. Some
+    /// deployments (reverse proxies without upgrade support) close every WS
+    /// attempt with 1011; retrying on each reconnect just adds latency and
+    /// noise before the inevitable SSE fallback.
+    nonisolated static let webSocketMaxOpenFailures = 3
+    private var webSocketOpenFailureStreak = 0
+
     func streamControl(
         missionId: String?,
         sinceSeq: Int64? = nil,
@@ -850,7 +892,7 @@ final class APIService {
 
         return Task { [weak self] in
             guard let self else { return }
-            if preferWebSocket, token != nil {
+            if preferWebSocket, token != nil, self.webSocketOpenFailureStreak < Self.webSocketMaxOpenFailures {
                 let opened = await self.runControlWebSocket(
                     missionId: missionId,
                     sinceSeq: sinceSeq,
@@ -859,9 +901,13 @@ final class APIService {
                     onDiagnostic: onDiagnostic,
                     onEvent: onEvent
                 )
+                if opened {
+                    self.webSocketOpenFailureStreak = 0
+                }
                 if opened || Task.isCancelled {
                     return
                 }
+                self.webSocketOpenFailureStreak += 1
                 self.emitDiagnostic(
                     transport: .webSocket,
                     phase: .fallback,
@@ -1221,7 +1267,13 @@ final class APIService {
 
     private func makeURL(_ path: String, queryItems: [URLQueryItem]) -> URL? {
         guard var components = makeURLComponents(path) else { return nil }
-        components.queryItems = queryItems.isEmpty ? nil : queryItems
+        // Only override the query when the caller passes explicit items —
+        // assigning nil here used to wipe query strings already embedded in
+        // `path` (e.g. "/api/fs/list?path=/root"), which the server rejected
+        // with 400 "missing field" errors.
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
+        }
         return components.url
     }
 

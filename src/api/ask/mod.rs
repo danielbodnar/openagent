@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::api::mission_store::MissionStore;
 use crate::api::proxy_keys::SharedProxyApiKeyStore;
+use crate::api::runners::{effective_mid_turn_kind, MidTurnKind};
 use crate::workspace::SharedWorkspaceStore;
 use crate::workspace_exec::WorkspaceExec;
 
@@ -47,6 +48,34 @@ const SEED_EVENT_COUNT: usize = 40;
 /// fetch serves both this scan and the [`SEED_EVENT_COUNT`] seed.
 const GOAL_SCAN_EVENT_COUNT: usize = 200;
 
+/// Nudge appended before the forced, tools-disabled synthesis pass. MiniMax-M3
+/// tends to free-style another tool call here (emitting raw `<invoke>`/`<tool_call>`
+/// markup wrapped in its interleave sentinels); this pushes it to answer in prose
+/// instead. `finalize_answer` strips any markup that leaks through regardless.
+const FINAL_SYNTHESIS_NUDGE: &str = "You have no tools available for this reply. Do NOT emit any tool call, function call, or XML markup such as <invoke> or <tool_call>. Answer the operator directly in prose, using only what you already gathered from the tool results above.";
+
+/// Shown when the turn produced no usable prose (tool-call limit hit, or the
+/// model emitted only tool-call markup that was stripped away).
+const TOOL_LIMIT_FALLBACK: &str =
+    "(The assistant reached the tool-call limit without a final answer.)";
+
+/// Clean a final answer before it is shown/persisted: strip reasoning blocks
+/// (`<think>`/`<mm:think>`) like the mission path does, then strip any tool-call
+/// markup the model leaked into prose. The text tool-call parser only runs when
+/// tools are offered, so the tools-disabled synthesis pass can otherwise leak
+/// raw `]<]minimax[>[<invoke …>` markup verbatim into the chat (observed in prod
+/// on mission cd6cfe3f). Falls back to a canned notice when nothing but markup
+/// remains.
+fn finalize_answer(raw: &str) -> String {
+    let stripped = crate::api::mission_runner::strip_think_tags(raw);
+    let cleaned = client::strip_leaked_tool_markup(&stripped);
+    if cleaned.is_empty() {
+        TOOL_LIMIT_FALLBACK.to_string()
+    } else {
+        cleaned
+    }
+}
+
 static ASK_STORE: OnceCell<Arc<AskStore>> = OnceCell::const_new();
 
 /// Get (lazily initializing) the global Ask store, placed next to the mission
@@ -62,6 +91,13 @@ pub async fn ask_store(config: &crate::config::Config) -> Result<Arc<AskStore>, 
         })
         .await
         .map(Arc::clone)
+}
+
+/// Non-initializing accessor for runners: returns the store only if some Ask
+/// interaction already opened it this process lifetime. Runners use this for
+/// best-effort mid-turn note injection without needing a `Config`.
+pub fn ask_store_if_initialized() -> Option<Arc<AskStore>> {
+    ASK_STORE.get().cloned()
 }
 
 /// Everything the Ask loop needs for one turn.
@@ -187,6 +223,7 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
         // final answer. Give it one more pass with tools disabled so it must
         // synthesize from the results it already gathered, rather than bailing
         // with a canned "tool-call limit" message.
+        messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_NUDGE }));
         match turn.llm.complete(&messages, &[]).await {
             Ok(c) => {
                 total_tokens += c.total_tokens.unwrap_or(0);
@@ -194,11 +231,9 @@ pub async fn run_ask_turn(turn: &AskTurn, user_content: &str) -> Result<String, 
             }
             Err(e) => tracing::warn!("[Ask] forced final-answer pass failed: {e}"),
         }
-        if final_answer.is_empty() {
-            final_answer =
-                "(The assistant reached the tool-call limit without a final answer.)".to_string();
-        }
     }
+
+    final_answer = finalize_answer(&final_answer);
 
     turn.ask_store
         .append_message(
@@ -357,29 +392,32 @@ async fn run_ask_turn_streaming_inner(
         }
     }
 
+    let mut synthesized = false;
     if final_answer.is_empty() {
         // Same forced synthesis as the non-streaming path: one more pass with
-        // tools disabled, streamed so the operator sees the answer arrive.
-        let txc = tx.clone();
-        match turn
-            .llm
-            .complete_stream(&messages, &[], |frag| {
-                let _ = txc.send(AskStreamEvent::Delta {
-                    content: frag.to_string(),
-                });
-            })
-            .await
-        {
+        // tools disabled. Unlike the in-loop turns, this pass is NOT streamed
+        // live — a tools-disabled MiniMax pass may free-style raw tool-call
+        // markup, which would flash into the UI before the post-stream
+        // reconcile. We collect it, clean it, and emit the result as one delta.
+        messages.push(json!({ "role": "user", "content": FINAL_SYNTHESIS_NUDGE }));
+        synthesized = true;
+        match turn.llm.complete_stream(&messages, &[], |_| {}).await {
             Ok(c) => {
                 total_tokens += c.total_tokens.unwrap_or(0);
                 final_answer = c.content.unwrap_or_default();
             }
             Err(e) => tracing::warn!("[Ask] forced final-answer pass (stream) failed: {e}"),
         }
-        if final_answer.is_empty() {
-            final_answer =
-                "(The assistant reached the tool-call limit without a final answer.)".to_string();
-        }
+    }
+
+    final_answer = finalize_answer(&final_answer);
+
+    // The synthesis pass was suppressed above; surface its cleaned text so the
+    // operator sees an answer before `onDone` reconciles against the store.
+    if synthesized {
+        let _ = tx.send(AskStreamEvent::Delta {
+            content: final_answer.clone(),
+        });
     }
 
     turn.ask_store
@@ -435,6 +473,35 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
                 truncate(&goal.content, 600)
             ));
         }
+        // Latest plan snapshot (Claude Code TodoWrite / Codex update_plan /
+        // OpenCode todowrite): the working agent's own task board is the
+        // single best "where are we" signal — surface the newest one.
+        if let Some(plan) = events.iter().rev().find(|ev| {
+            ev.event_type == "tool_call"
+                && matches!(
+                    ev.tool_name.as_deref(),
+                    Some("TodoWrite") | Some("update_plan") | Some("todowrite")
+                )
+        }) {
+            seed.push_str(&format!(
+                "\nWorking agent's latest task board [{} {}]:\n{}\n",
+                plan.sequence,
+                plan.timestamp,
+                truncate(&plan.content, 1500)
+            ));
+        }
+        if let Some(iter_ev) = events
+            .iter()
+            .rev()
+            .find(|ev| ev.event_type == "goal_iteration")
+        {
+            seed.push_str(&format!(
+                "\nLatest loop/wakeup marker [{} {}]: {}\n",
+                iter_ev.sequence,
+                iter_ev.timestamp,
+                truncate(&iter_ev.content, 400)
+            ));
+        }
         let start = events.len().saturating_sub(SEED_EVENT_COUNT);
         seed.push_str("\nRecent mission events (newest last):\n");
         for ev in &events[start..] {
@@ -450,6 +517,37 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
                 ev.event_type,
                 tool,
                 truncate(&ev.content, 300)
+            ));
+        }
+    }
+
+    // Worker fleet: for orchestrator missions, list child missions so the
+    // co-pilot can answer "what is running right now" without grepping.
+    if let Ok(children) = turn.mission_store.get_child_missions(turn.mission_id).await {
+        if !children.is_empty() {
+            seed.push_str("\nWorker missions (children):\n");
+            for c in children.iter().rev().take(12) {
+                seed.push_str(&format!(
+                    "- {} [{} {}] {:?} {}\n",
+                    c.id,
+                    c.backend,
+                    c.model_override.as_deref().unwrap_or("-"),
+                    c.status,
+                    truncate(c.title.as_deref().unwrap_or("untitled"), 80)
+                ));
+            }
+        }
+    }
+    // Pending wakeups: when the next scheduled turn fires and why.
+    if let Ok(autos) = turn
+        .mission_store
+        .get_mission_automations(turn.mission_id)
+        .await
+    {
+        for a in autos.iter().filter(|a| a.active) {
+            seed.push_str(&format!(
+                "\nPending automation: trigger={:?} last_triggered={:?}\n",
+                a.trigger, a.last_triggered_at
             ));
         }
     }
@@ -499,12 +597,26 @@ async fn build_system_prompt(turn: &AskTurn, user_content: &str) -> String {
          facts instead of guesses.\n\n\
          Steering authority: you can stop the working agent (stop_agent) and send \
          it steering messages (send_to_agent) — the same controls the operator has. \
-         These are interventions, not observations: use them when the operator asks \
-         you to stop/steer/redirect the agent, or when it is burning resources in a \
-         clearly harmful loop. Otherwise, propose the steering message and let the \
-         operator decide. When you do steer, make the message self-contained and \
-         bounded (what to stop, what to do instead, when to stop doing it) — the \
-         working agent has no access to this conversation.\n\n\
+         send_to_agent has three modes: default queues for the next turn boundary; \
+         immediate=true injects the message INTO the agent's current turn (received \
+         within ~5s, no turn-end, no cancel) — prefer this for a quick mid-flight \
+         course-correction; interrupt=true cancels the current turn so it restarts \
+         on the message. These are interventions, not observations: use them when \
+         the operator asks you to stop/steer/redirect the agent, or when it is \
+         burning resources in a clearly harmful loop. Otherwise, propose the \
+         steering message and let the operator decide. When you do steer, make the \
+         message self-contained and bounded (what to stop, what to do instead, when \
+         to stop doing it) — the working agent has no access to this conversation.\n\n\
+         Starting new work: you can spin up an independent mission with \
+         start_mission (pass agent='orchestrator' for a boss mission that manages \
+         its own workers) — give the operator the returned link so they can open \
+         it. Use it when the operator asks you to kick off a new piece of work as \
+         its own mission, not to fix the current one.\n\n\
+         You are strictly reactive: you run only when the operator sends a \
+         message, and you cannot watch, poll, or follow up on your own. Never \
+         promise to \"keep an eye on\" or \"let you know when\" something \
+         happens — instead tell the operator what to ask about next time, or \
+         queue a steering note for the working agent.\n\n\
          Be concise and concrete. Cite event sequence numbers or file paths when \
          relevant. When you identify a blocker the operator could fix through \
          configuration (missing env var, unused key), propose the concrete fix — \
@@ -607,14 +719,33 @@ fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "send_to_agent",
-                "description": "Send a steering message to the working agent, exactly as if the operator typed it in the mission composer. If the agent is mid-turn the message is queued and picked up at the next turn boundary — set interrupt=true to cancel the current turn first so it takes effect immediately. If the agent is idle this STARTS a new turn. Use only when the operator asked you to steer/redirect the agent.",
+                "description": "Send a steering message to the working agent. By default, when a turn is actually running, Claude Code with stream input injects it mid-turn within ~5s without cancelling; other harnesses queue it for the next turn boundary (in-flight work preserved). If the agent is idle, a new turn starts on the message now. Set interrupt=true only to cancel the current turn first and restart on the message, losing in-flight work. Use only when the operator asked you to steer/redirect the agent.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "message": { "type": "string", "description": "The steering instructions for the working agent. Be specific: what to stop doing, what to do instead, and any bounds." },
-                        "interrupt": { "type": "boolean", "description": "Cancel the agent's current turn before delivering, so the steer applies now instead of after the turn ends. Default false." }
+                        "immediate": { "type": "boolean", "description": "Legacy hint for mid-turn delivery. Non-interrupt sends already use the best available tier: mid-turn for capable active harnesses, next-turn otherwise, or start a turn if idle." },
+                        "interrupt": { "type": "boolean", "description": "Cancel the agent's current turn before delivering, so the steer applies now instead of after the turn ends. Default false. Takes precedence over immediate." }
                     },
                     "required": ["message"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "start_mission",
+                "description": "Create and START a brand-new mission, then return its dashboard link for the operator. The new mission runs independently of this one. Use when the operator asks you to kick off a new piece of work as its own mission — including a BOSS/orchestrator mission (pass agent='orchestrator') that will plan tasks and spawn its own worker missions. Always give the link back to the operator so they can open it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Short, specific mission title." },
+                        "prompt": { "type": "string", "description": "The full initial instruction/goal for the new mission's agent: scope, success criteria, verification, and any bounds. This is the first message the agent receives and what kicks off its first turn." },
+                        "agent": { "type": "string", "description": "Optional library agent name. Pass 'orchestrator' to make this a boss mission that manages a worker fleet; omit for a plain single agent." },
+                        "backend": { "type": "string", "description": "Optional backend: 'claudecode' (default), 'codex', or 'opencode'." },
+                        "workspace_id": { "type": "string", "description": "Optional workspace UUID. Defaults to THIS mission's workspace." }
+                    },
+                    "required": ["title", "prompt"]
                 }
             }
         }),
@@ -793,6 +924,7 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                 return "Error: message is empty".to_string();
             }
             let interrupt = args["interrupt"].as_bool().unwrap_or(false);
+            let _immediate = args["immediate"].as_bool().unwrap_or(false);
             // Track whether the requested interrupt actually landed — a failed
             // cancel (timeout, control error) must not be reported as "delivered
             // after interrupting" when the agent may still be mid-turn.
@@ -807,6 +939,53 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                 } else {
                     record_copilot_stop(turn, &format!("steering: {message}")).await;
                 }
+            } else {
+                let mission = match turn.mission_store.get_mission(turn.mission_id).await {
+                    Ok(Some(mission)) => mission,
+                    Ok(None) => return "Error: mission not found".to_string(),
+                    Err(error) => return format!("Error loading mission: {error}"),
+                };
+                // Mid-turn injection is only correct when BOTH hold:
+                //   (a) a turn is genuinely in flight for this mission — confirmed
+                //       with the control session, not the DB status, which can lag
+                //       a restart (Active row, no runner) and would otherwise leave
+                //       the note queued with nothing to deliver it; and
+                //   (b) the harness can accept mid-turn input.
+                // The operator-note bridge does not start a turn, so anything else
+                // (idle mission, or a running mission on a harness that can't take
+                // mid-turn input) falls through to the authoritative UserMessage
+                // path below — which starts a turn when idle and queues for the
+                // next boundary when running, and reports honestly either way.
+                let stream_input_enabled =
+                    crate::util::env_var_bool("SANDBOXED_SH_CLAUDE_STREAM_INPUT", false);
+                let capable = matches!(
+                    effective_mid_turn_kind(
+                        &mission.backend,
+                        stream_input_enabled,
+                        mission.goal_mode,
+                    ),
+                    MidTurnKind::StreamJsonStdin | MidTurnKind::CodexAppServer
+                );
+                if capable && !turn.sandbox && mission_has_live_turn(turn).await {
+                    let content = format_steer_message(&message);
+                    if let Err(error) = turn
+                        .ask_store
+                        .enqueue_operator_note(turn.mission_id, &content, Some(turn.thread_id))
+                        .await
+                    {
+                        return format!("Error queuing steer: {error}");
+                    }
+                    // Capability is the best case; the runner still makes the
+                    // final per-turn call (a /goal loop or a Claude argv-fallback
+                    // turn disables mid-turn polling), so name the next-turn
+                    // fallback rather than guaranteeing ~5s. No work is lost.
+                    return "Steering message queued for the active mission. If the current turn \
+                            can accept mid-turn input it is injected within ~5s without cancelling \
+                            or losing in-flight work; otherwise (e.g. a /goal loop or a fallback \
+                            turn) it is delivered at the next turn boundary. No work is lost \
+                            either way."
+                        .to_string();
+                }
             }
             let content = format_steer_message(&message);
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -817,6 +996,8 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     content,
                     agent: None,
                     target_mission_id: Some(turn.mission_id),
+                    strict: false,
+                    source: None,
                     respond: tx,
                 })
                 .await;
@@ -885,6 +1066,99 @@ async fn execute_tool(turn: &AskTurn, name: &str, arguments: &str) -> String {
                     .join("\n")
             }
         }
+        "start_mission" => {
+            let title = args["title"].as_str().unwrap_or("").trim().to_string();
+            let prompt = args["prompt"].as_str().unwrap_or("").trim().to_string();
+            if title.is_empty() || prompt.is_empty() {
+                return "Error: start_mission requires non-empty 'title' and 'prompt'".to_string();
+            }
+            let agent = args["agent"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let backend = args["backend"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            // Default to THIS mission's workspace unless the operator names another.
+            let workspace_id = args["workspace_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s.trim()).ok())
+                .unwrap_or(turn.workspace_id);
+
+            // 1) Create the mission record.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if turn
+                .control_cmd_tx
+                .send(crate::api::control::ControlCommand::CreateMission {
+                    title: Some(title.clone()),
+                    workspace_id: Some(workspace_id),
+                    agent,
+                    model_override: None,
+                    model_effort: None,
+                    backend,
+                    config_profile: None,
+                    parent_mission_id: None,
+                    working_directory: None,
+                    scheduling: Default::default(),
+                    respond: tx,
+                })
+                .await
+                .is_err()
+            {
+                return "Error: the control session is unavailable".to_string();
+            }
+            let mission = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                Ok(Ok(Ok(m))) => m,
+                Ok(Ok(Err(e))) => return format!("Error creating mission: {e}"),
+                Ok(Err(_)) => return "Error: mission creation did not respond".to_string(),
+                Err(_) => return "Error: mission creation timed out".to_string(),
+            };
+
+            // 2) Start it by delivering the initial prompt — a UserMessage to a
+            // brand-new mission auto-starts its first turn.
+            let (tx2, rx2) = tokio::sync::oneshot::channel();
+            let _ = turn
+                .control_cmd_tx
+                .send(crate::api::control::ControlCommand::UserMessage {
+                    id: Uuid::new_v4(),
+                    content: prompt,
+                    agent: None,
+                    target_mission_id: Some(mission.id),
+                    strict: false,
+                    source: None,
+                    respond: tx2,
+                })
+                .await;
+            let started = matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(15), rx2).await,
+                Ok(Ok(_))
+            );
+
+            // 3) Build the operator-facing link.
+            let base = std::env::var("SANDBOXED_PUBLIC_URL")
+                .ok()
+                .map(|s| s.trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty());
+            let link = match &base {
+                Some(b) => format!("{b}/control?mission={}", mission.id),
+                None => format!("/control?mission={}", mission.id),
+            };
+            format!(
+                "{verb} mission '{title}' (id {id}){caveat}. Give the operator this link: {link}",
+                verb = if started { "Started" } else { "Created" },
+                title = title,
+                id = mission.id,
+                caveat = if started {
+                    ""
+                } else {
+                    " — created, but the start signal wasn't confirmed; it may need a nudge"
+                },
+                link = link,
+            )
+        }
         other => format!("Error: unknown tool '{other}'"),
     }
 }
@@ -905,6 +1179,30 @@ async fn cancel_working_agent(turn: &AskTurn) -> Result<(), String> {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err("the control session dropped the request".to_string()),
         Err(_) => Err("timed out waiting for the cancellation to be acknowledged".to_string()),
+    }
+}
+
+/// Ask the control session whether this mission has a turn **actually in
+/// flight** right now (main or a parallel runner). This is the authoritative
+/// signal: the DB `MissionStatus::Active` can lag reality — a restart leaves the
+/// row `Active` with no runner attached until autoresume re-attaches — so it must
+/// not be used as a proxy for "a turn is executing" when choosing between
+/// mid-turn injection (needs a live turn to drain the note) and starting a turn.
+/// On any failure we return `false`, degrading to the authoritative UserMessage
+/// path (which starts a turn when idle and queues when running).
+async fn mission_has_live_turn(turn: &AskTurn) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if turn
+        .control_cmd_tx
+        .send(crate::api::control::ControlCommand::ListRunning { respond: tx })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        Ok(Ok(list)) => list.iter().any(|m| m.mission_id == turn.mission_id),
+        _ => false,
     }
 }
 

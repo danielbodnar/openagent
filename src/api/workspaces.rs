@@ -510,6 +510,7 @@ async fn create_workspace(
             mcps: mcps.clone(),
             mcps_replace_defaults,
             config_profile: config_profile.clone(),
+            resolved_git_credentials: None,
         },
         WorkspaceType::Container => {
             let mut ws = Workspace::new_container(req.name, path);
@@ -793,6 +794,32 @@ async fn delete_workspace(
     // If it's a container workspace, destroy the container first
     if let Some(ws) = state.workspaces.get(id).await {
         if ws.workspace_type == WorkspaceType::Container {
+            // Stop any live mission/exec scopes for this workspace first.
+            // Surviving scope processes (Tailscale daemons, leftover exec
+            // shells) keep the rootfs busy and make removal fail with EBUSY
+            // — this is how `dna` resisted deletion.
+            match list_workspace_scope_units(&ws).await {
+                Ok(units) => {
+                    for unit in units {
+                        let stopped = tokio::process::Command::new("systemctl")
+                            .args(["stop", &unit])
+                            .output()
+                            .await
+                            .map(|out| out.status.success())
+                            .unwrap_or(false);
+                        if !stopped {
+                            tracing::warn!(unit = %unit, "Failed to stop workspace scope before deletion");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not list scopes for workspace {} before deletion: {}",
+                        ws.name,
+                        e
+                    );
+                }
+            }
             if let Err(e) = crate::workspace::destroy_container_workspace(&ws).await {
                 tracing::error!("Failed to destroy container for workspace {}: {}", id, e);
                 return Err((
@@ -1813,6 +1840,12 @@ pub struct UpdateWorkspaceResourcesRequest {
     pub memory_max: Option<String>,
     pub memory_high: Option<String>,
     pub memory_swap_max: Option<String>,
+    /// `CPUWeight` (1..=10000, or "idle"). Relative CPU share of this mission's
+    /// scopes under contention. `Some("")` clears the override.
+    pub cpu_weight: Option<String>,
+    /// `CPUQuota` (e.g. "400%" = 4 cores, or "infinity"). Hard per-mission CPU
+    /// ceiling so one mission can't saturate the host. `Some("")` clears it.
+    pub cpu_quota: Option<String>,
     /// Persist into the workspace env-var overrides (default true). When
     /// false the change is runtime-only: it survives until the scopes die.
     #[serde(default = "default_true")]
@@ -1839,6 +1872,8 @@ pub struct UpdateWorkspaceResourcesResponse {
     pub memory_max: Option<String>,
     pub memory_high: Option<String>,
     pub memory_swap_max: Option<String>,
+    pub cpu_weight: Option<String>,
+    pub cpu_quota: Option<String>,
 }
 
 /// Validate a systemd memory size: bytes, suffixed (K/M/G/T), percentage,
@@ -1864,6 +1899,30 @@ fn valid_memory_size(value: &str) -> bool {
     seen_digit
 }
 
+/// Validate a systemd `CPUWeight`: integer 1..=10000, or "idle".
+fn valid_cpu_weight(value: &str) -> bool {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("idle") {
+        return true;
+    }
+    matches!(v.parse::<u32>(), Ok(n) if (1..=10000).contains(&n))
+}
+
+/// Validate a systemd `CPUQuota`: "infinity", or a percentage like "400%"
+/// (>= 1%, optional decimals). "100%" == one core.
+fn valid_cpu_quota(value: &str) -> bool {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("infinity") {
+        return true;
+    }
+    let Some(num) = v.strip_suffix('%') else {
+        return false;
+    };
+    // Rust's f64 parser accepts "inf"/"nan"; require a finite percentage so
+    // "infinity%" and friends don't slip through.
+    matches!(num.trim().parse::<f64>(), Ok(pct) if pct.is_finite() && pct >= 1.0)
+}
+
 /// POST /api/workspaces/:id/resources — adjust a workspace's memory caps.
 ///
 /// This is the "boost" path: raise (or clear) one workspace's memory limits
@@ -1877,20 +1936,34 @@ async fn update_workspace_resources(
 ) -> Result<Json<UpdateWorkspaceResourcesResponse>, (StatusCode, String)> {
     let mut workspace = require_workspace(&state.workspaces, id).await?;
 
-    let updates: [(&str, &Option<String>); 3] = [
+    let updates: [(&str, &Option<String>); 5] = [
         ("MISSION_MEMORY_MAX", &req.memory_max),
         ("MISSION_MEMORY_HIGH", &req.memory_high),
         ("MISSION_MEMORY_SWAP_MAX", &req.memory_swap_max),
+        ("MISSION_CPU_WEIGHT", &req.cpu_weight),
+        ("MISSION_CPU_QUOTA", &req.cpu_quota),
     ];
 
     for (key, value) in &updates {
         if let Some(v) = value {
-            if !v.trim().is_empty() && !valid_memory_size(v) {
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            let ok = match *key {
+                "MISSION_CPU_WEIGHT" => valid_cpu_weight(v),
+                "MISSION_CPU_QUOTA" => valid_cpu_quota(v),
+                _ => valid_memory_size(v),
+            };
+            if !ok {
+                let hint = match *key {
+                    "MISSION_CPU_WEIGHT" => "expected an integer 1..=10000 or 'idle'",
+                    "MISSION_CPU_QUOTA" => "expected a percentage like '400%' or 'infinity'",
+                    _ => "expected bytes, K/M/G/T suffix, %, or 'infinity'",
+                };
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!(
-                        "Invalid {key} value '{v}': expected bytes, K/M/G/T suffix, %, or 'infinity'"
-                    ),
+                    format!("Invalid {key} value '{v}': {hint}"),
                 ));
             }
         }
@@ -1910,7 +1983,7 @@ async fn update_workspace_resources(
     }
 
     let exec = crate::workspace_exec::WorkspaceExec::new(workspace.clone());
-    let caps = exec.mission_memory_caps();
+    let caps = exec.mission_resource_caps();
 
     let mut applied_units = Vec::new();
     let mut failed_units = Vec::new();
@@ -1943,6 +2016,17 @@ async fn update_workspace_resources(
                 "MemorySwapMax={}",
                 caps.swap_max.as_deref().unwrap_or("infinity")
             ));
+            // CPUWeight defaults back to systemd's 100 when cleared; CPUQuota
+            // is reset with an empty value ("infinity" is not a valid
+            // set-property argument for it).
+            cmd.arg(format!(
+                "CPUWeight={}",
+                caps.cpu_weight.as_deref().unwrap_or("100")
+            ));
+            cmd.arg(format!(
+                "CPUQuota={}",
+                caps.cpu_quota.as_deref().unwrap_or("")
+            ));
             match cmd.output().await {
                 Ok(out) if out.status.success() => applied_units.push(unit),
                 Ok(out) => {
@@ -1963,11 +2047,13 @@ async fn update_workspace_resources(
     }
 
     tracing::info!(
-        "Workspace {} memory caps updated: max={:?} high={:?} swap_max={:?} (live: {} unit(s), persisted: {})",
+        "Workspace {} resource caps updated: max={:?} high={:?} swap_max={:?} cpu_weight={:?} cpu_quota={:?} (live: {} unit(s), persisted: {})",
         workspace.name,
         caps.max,
         caps.high,
         caps.swap_max,
+        caps.cpu_weight,
+        caps.cpu_quota,
         applied_units.len(),
         req.persist
     );
@@ -1979,6 +2065,8 @@ async fn update_workspace_resources(
         memory_max: caps.max,
         memory_high: caps.high,
         memory_swap_max: caps.swap_max,
+        cpu_weight: caps.cpu_weight,
+        cpu_quota: caps.cpu_quota,
     }))
 }
 
@@ -2088,6 +2176,26 @@ mod tests {
             "1e10", "inf", "nan", "+5", "-5", "1.2.3", "", ".", "0x10", " ",
         ] {
             assert!(!valid_memory_size(v), "should reject {v:?}");
+        }
+    }
+
+    #[test]
+    fn valid_cpu_weight_matches_systemd_range() {
+        for v in ["1", "100", "10000", "idle", "IDLE"] {
+            assert!(valid_cpu_weight(v), "should accept {v}");
+        }
+        for v in ["0", "10001", "", "100%", "-1", "1.5", "abc"] {
+            assert!(!valid_cpu_weight(v), "should reject {v:?}");
+        }
+    }
+
+    #[test]
+    fn valid_cpu_quota_matches_systemd_forms() {
+        for v in ["400%", "100%", "1%", "12.5%", "infinity"] {
+            assert!(valid_cpu_quota(v), "should accept {v}");
+        }
+        for v in ["400", "0%", "0.5%", "", "%", "-100%", "infinity%"] {
+            assert!(!valid_cpu_quota(v), "should reject {v:?}");
         }
     }
 

@@ -184,6 +184,10 @@ export interface UpdateWorkspaceResourcesRequest {
   memory_max?: string;
   memory_high?: string;
   memory_swap_max?: string;
+  /** CPUWeight 1..=10000 or "idle"; "" clears the override. */
+  cpu_weight?: string;
+  /** CPUQuota e.g. "400%" (4 cores) or "infinity"; "" clears the override. */
+  cpu_quota?: string;
   /** Persist as a workspace env override (default true). */
   persist?: boolean;
   /** Retune currently-running scopes live (default true). */
@@ -197,6 +201,8 @@ export interface UpdateWorkspaceResourcesResponse {
   memory_max: string | null;
   memory_high: string | null;
   memory_swap_max: string | null;
+  cpu_weight: string | null;
+  cpu_quota: string | null;
 }
 
 export async function updateWorkspaceResources(

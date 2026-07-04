@@ -1,8 +1,8 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import Script from "next/script";
 import "./globals.css";
-import { Sidebar } from "@/components/sidebar";
+import { AppShell } from "@/components/app-shell";
 import { AuthGate } from "@/components/auth-gate";
 import { LibraryProvider } from "@/contexts/library-context";
 import { MissionSwitcherProvider } from "@/contexts/mission-switcher-context";
@@ -26,6 +26,11 @@ export const metadata: Metadata = {
   icons: {
     icon: "/favicon.svg",
   },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
 };
 
 export default function RootLayout({
@@ -68,8 +73,7 @@ export default function RootLayout({
           <ToastProvider>
             <LibraryProvider>
               <MissionSwitcherProvider>
-                <Sidebar />
-                <main className="ml-56 min-h-screen">{children}</main>
+                <AppShell>{children}</AppShell>
               </MissionSwitcherProvider>
             </LibraryProvider>
           </ToastProvider>

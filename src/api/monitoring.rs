@@ -22,7 +22,7 @@ use axum::{
 };
 use futures::{FutureExt, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use sysinfo::{Networks, System};
+use sysinfo::{Disks, Networks, System};
 use tokio::sync::{broadcast, RwLock};
 
 use super::auth;
@@ -56,6 +56,12 @@ pub struct SystemMetrics {
     pub network_rx_bytes_per_sec: u64,
     /// Network bytes transmitted per second
     pub network_tx_bytes_per_sec: u64,
+    /// Disk space used in bytes (root filesystem)
+    pub disk_used: u64,
+    /// Total disk space in bytes (root filesystem)
+    pub disk_total: u64,
+    /// Disk usage percentage (0-100)
+    pub disk_percent: f32,
     /// Timestamp in milliseconds since epoch
     pub timestamp_ms: u64,
 }
@@ -132,6 +138,33 @@ fn pct(used: u64, total: u64) -> f32 {
         (used as f64 / total as f64 * 100.0) as f32
     } else {
         0.0
+    }
+}
+
+/// Used and total bytes for the filesystem backing `/`, as `(used, total)`.
+///
+/// Falls back to the largest reported filesystem when no `/` mount is exposed
+/// (some container runtimes don't surface it) and to zeros when no disks are
+/// visible.
+fn root_disk_usage(disks: &Disks) -> (u64, u64) {
+    let mut largest: Option<(u64, u64)> = None;
+    for disk in disks.list() {
+        let total = disk.total_space();
+        let available = disk.available_space();
+        if disk.mount_point() == std::path::Path::new("/") {
+            return (total.saturating_sub(available), total);
+        }
+        let is_larger = match largest {
+            Some((t, _)) => total > t,
+            None => true,
+        };
+        if is_larger {
+            largest = Some((total, available));
+        }
+    }
+    match largest {
+        Some((total, available)) => (total.saturating_sub(available), total),
+        None => (0, 0),
     }
 }
 
@@ -329,6 +362,12 @@ impl MonitoringState {
             prev_tx_bytes = current_tx_bytes;
             prev_time = now;
 
+            // Disk usage for the root filesystem (point-in-time gauge, no delta
+            // needed, so a fresh read each tick is fine).
+            let disks = Disks::new_with_refreshed_list();
+            let (disk_used, disk_total) = root_disk_usage(&disks);
+            let disk_percent = pct(disk_used, disk_total);
+
             let metrics = SystemMetrics {
                 cpu_percent,
                 cpu_cores,
@@ -337,6 +376,9 @@ impl MonitoringState {
                 memory_percent,
                 network_rx_bytes_per_sec,
                 network_tx_bytes_per_sec,
+                disk_used,
+                disk_total,
+                disk_percent,
                 timestamp_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

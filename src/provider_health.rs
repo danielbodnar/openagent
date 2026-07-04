@@ -21,8 +21,14 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CooldownReason {
-    /// HTTP 429 rate limit
+    /// HTTP 429 rate limit (transient — short exponential cooldown)
     RateLimit,
+    /// Hard usage/quota exhaustion (e.g. a subscription's daily/period limit is
+    /// reached). Distinguished from a transient `RateLimit` so the account is
+    /// parked for a long fixed cooldown instead of being re-tried as a primary
+    /// chain entry every few seconds. Detected from upstream error bodies
+    /// ("usage limit reached", "insufficient_quota", …).
+    QuotaExhausted,
     /// HTTP 529 overloaded
     Overloaded,
     /// Connection timeout or network error
@@ -41,6 +47,7 @@ impl std::fmt::Display for CooldownReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RateLimit => write!(f, "rate_limit"),
+            Self::QuotaExhausted => write!(f, "quota_exhausted"),
             Self::Overloaded => write!(f, "overloaded"),
             Self::Timeout => write!(f, "timeout"),
             Self::ServerError => write!(f, "server_error"),
@@ -48,6 +55,19 @@ impl std::fmt::Display for CooldownReason {
             Self::ClientError => write!(f, "client_error"),
         }
     }
+}
+
+/// Fixed cooldown (seconds) applied when an account/subscription reports a hard
+/// usage/quota exhaustion. Defaults to 1 hour; override with
+/// `PROVIDER_QUOTA_COOLDOWN_SECS`. A hard quota won't recover within a caller's
+/// retry budget, so parking it long keeps the chain on healthy providers
+/// instead of flapping back to the exhausted one every few seconds.
+fn quota_cooldown_secs() -> u64 {
+    std::env::var("PROVIDER_QUOTA_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3600)
 }
 
 /// Snapshot of rate-limit quota state from provider response headers.
@@ -403,7 +423,9 @@ impl ProviderHealthTracker {
 
         health.total_requests += 1;
         match &reason {
-            CooldownReason::RateLimit | CooldownReason::Overloaded => health.total_rate_limits += 1,
+            CooldownReason::RateLimit
+            | CooldownReason::QuotaExhausted
+            | CooldownReason::Overloaded => health.total_rate_limits += 1,
             _ => health.total_errors += 1,
         }
 
@@ -416,14 +438,23 @@ impl ProviderHealthTracker {
         // Auth errors (401/403) are almost always permanent (bad API key,
         // revoked credentials), so use a long fixed cooldown instead of
         // short exponential backoff that implies eventual recovery.
-        let cooldown = retry_after.unwrap_or_else(|| {
-            if is_auth_error {
-                std::time::Duration::from_secs(3600) // 1 hour
-            } else {
+        // QuotaExhausted (a subscription's hard usage limit) won't recover for
+        // hours/days, so park it for a long fixed window so the chain stops
+        // re-trying an exhausted subscription as a primary entry; honor a
+        // longer upstream retry_after when one is supplied.
+        let cooldown = match reason {
+            CooldownReason::QuotaExhausted => {
+                let base = std::time::Duration::from_secs(quota_cooldown_secs());
+                retry_after.map(|r| r.max(base)).unwrap_or(base)
+            }
+            CooldownReason::AuthError => {
+                retry_after.unwrap_or(std::time::Duration::from_secs(3600))
+            }
+            _ => retry_after.unwrap_or_else(|| {
                 self.backoff_config
                     .cooldown_for(health.consecutive_failures.saturating_sub(1))
-            }
-        });
+            }),
+        };
 
         health.cooldown_until = Some(std::time::Instant::now() + cooldown);
 
@@ -854,7 +885,7 @@ impl ModelChainStore {
                     },
                     ChainEntry {
                         provider_id: "zai".to_string(),
-                        model_id: "glm-5.1".to_string(),
+                        model_id: "glm-5.2".to_string(),
                     },
                 ],
                 is_default: true,
@@ -869,8 +900,10 @@ impl ModelChainStore {
             if let Some(chain) = chains.iter_mut().find(|c| c.id == "builtin/smart") {
                 let mut migrated = false;
                 for entry in &mut chain.entries {
-                    if entry.provider_id == "zai" && entry.model_id == "glm-5" {
-                        entry.model_id = "glm-5.1".to_string();
+                    if entry.provider_id == "zai"
+                        && matches!(entry.model_id.as_str(), "glm-5" | "glm-5.1")
+                    {
+                        entry.model_id = "glm-5.2".to_string();
                         migrated = true;
                     }
                     if entry.provider_id == "minimax"
@@ -1204,13 +1237,13 @@ impl ModelChainStore {
             let provider_type = match crate::ai_providers::ProviderType::from_id(&entry.provider_id)
             {
                 Some(pt) => pt,
-                None => {
-                    tracing::warn!(
-                        provider_id = %entry.provider_id,
-                        "Unknown provider type in chain, skipping"
-                    );
-                    continue;
-                }
+                // A non-builtin prefix is a custom provider referenced by its
+                // sanitized name (e.g. "spark") — the id the catalog/UI exposes.
+                // All custom providers share `ProviderType::Custom`; the account
+                // loop below filters to the specific account whose sanitized name
+                // matches `entry.provider_id`, so a bogus prefix simply resolves
+                // to no accounts rather than mis-routing.
+                None => crate::ai_providers::ProviderType::Custom,
             };
 
             // Collect account IDs we've already added to avoid duplicates
@@ -1235,6 +1268,32 @@ impl ModelChainStore {
                 if !account.has_credentials() {
                     continue;
                 }
+                // Custom providers are a shared type, so an entry must be tied to
+                // the right account. Entries reference a custom provider two ways:
+                //   - the generic "custom" type id, which matches any custom
+                //     account that declares the model (the model id disambiguates
+                //     which endpoint serves it), or
+                //   - the provider's sanitized name (e.g. "spark/<model>"), which
+                //     targets that specific account — the id the catalog exposes.
+                // A name-qualified entry already identifies the account, so the
+                // model need not appear in the stored `custom_models` list (it may
+                // be a model discovered live via the router's `/v1/models`).
+                if matches!(provider_type, crate::ai_providers::ProviderType::Custom) {
+                    if entry.provider_id == "custom" {
+                        let model_known = account
+                            .custom_models
+                            .as_ref()
+                            .map(|ms| ms.iter().any(|m| m.id == entry.model_id))
+                            .unwrap_or(false);
+                        if !model_known {
+                            continue;
+                        }
+                    } else if crate::api::providers::sanitize_custom_provider_id(&account.name)
+                        != entry.provider_id
+                    {
+                        continue;
+                    }
+                }
                 let oauth_is_fresh = account
                     .oauth
                     .as_ref()
@@ -1247,6 +1306,8 @@ impl ModelChainStore {
                 //     `oauth-2025-04-20` beta header), and
                 //   - xAI/Grok: `api.x.ai/v1/chat/completions` accepts the
                 //     Grok-Build OAuth token as a Bearer (scope `api:access`).
+                //   - Kimi: `api.kimi.com/coding/v1/chat/completions` accepts the
+                //     Kimi Code subscription OAuth access token as a Bearer.
                 // OpenAI (Codex) JWTs do NOT work at
                 // `api.openai.com/v1/chat/completions`; those accounts keep
                 // `api_key = None, has_oauth = true` and route through the
@@ -1256,6 +1317,7 @@ impl ModelChainStore {
                         provider_type,
                         crate::ai_providers::ProviderType::Anthropic
                             | crate::ai_providers::ProviderType::Xai
+                            | crate::ai_providers::ProviderType::Kimi
                     ) {
                         return None;
                     }
@@ -1543,7 +1605,8 @@ mod tests {
             models,
             vec![
                 ("minimax".to_string(), "MiniMax-M3".to_string()),
-                ("zai".to_string(), "glm-5.1".to_string()),
+                // glm-5.1 is migrated to glm-5.2 by ensure_default_chain.
+                ("zai".to_string(), "glm-5.2".to_string()),
                 ("cerebras".to_string(), "zai-glm-4.7".to_string()),
             ]
         );
@@ -1676,6 +1739,107 @@ mod tests {
             "expired standard OAuth token should not be routed, got {:?}",
             resolved
         );
+    }
+
+    fn custom_account(name: &str, base_url: &str, models: &[&str]) -> AIProvider {
+        let mut p = AIProvider::new(ProviderType::Custom, name.to_string());
+        p.api_key = Some(format!("sk-{name}"));
+        p.base_url = Some(base_url.to_string());
+        p.custom_models = Some(
+            models
+                .iter()
+                .map(|m| crate::ai_providers::CustomModel {
+                    id: m.to_string(),
+                    name: None,
+                    context_limit: None,
+                    output_limit: None,
+                })
+                .collect(),
+        );
+        p.status = ProviderStatus::Connected;
+        p
+    }
+
+    #[tokio::test]
+    async fn resolve_entries_routes_custom_provider_by_sanitized_name() {
+        // "spark/<model>" — the id the catalog exposes — must resolve to the
+        // Spark custom account even though "spark" is not a built-in provider
+        // type. A non-matching name must resolve to nothing.
+        let store = store_with(vec![
+            custom_account("Spark", "https://spark.example/v1", &["step3p7-flash-148b"]),
+            custom_account("Other", "https://other.example/v1", &["other-model"]),
+        ])
+        .await;
+        let chains = store_with_chain("noop", vec![]).await;
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_entries(
+                &[ChainEntry {
+                    provider_id: "spark".to_string(),
+                    model_id: "step3p7-flash-148b".to_string(),
+                }],
+                &store,
+                &[],
+                &tracker,
+            )
+            .await;
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "should resolve exactly the Spark account"
+        );
+        assert_eq!(resolved[0].provider_id, "spark");
+        assert_eq!(resolved[0].model_id, "step3p7-flash-148b");
+        assert_eq!(
+            resolved[0].base_url.as_deref(),
+            Some("https://spark.example/v1")
+        );
+
+        // A name that matches no custom provider resolves to nothing.
+        let none = chains
+            .resolve_entries(
+                &[ChainEntry {
+                    provider_id: "ghost".to_string(),
+                    model_id: "step3p7-flash-148b".to_string(),
+                }],
+                &store,
+                &[],
+                &tracker,
+            )
+            .await;
+        assert!(none.is_empty(), "unknown custom name must not route");
+    }
+
+    #[tokio::test]
+    async fn resolve_entries_name_qualified_custom_allows_live_only_model() {
+        // A name-qualified entry identifies the account, so a model that is NOT
+        // in the stored custom_models (e.g. discovered live via /v1/models) must
+        // still route to that account.
+        let store = store_with(vec![custom_account(
+            "Spark",
+            "https://spark.example/v1",
+            &["already-known"],
+        )])
+        .await;
+        let chains = store_with_chain("noop", vec![]).await;
+        let tracker = ProviderHealthTracker::new();
+
+        let resolved = chains
+            .resolve_entries(
+                &[ChainEntry {
+                    provider_id: "spark".to_string(),
+                    model_id: "freshly-discovered".to_string(),
+                }],
+                &store,
+                &[],
+                &tracker,
+            )
+            .await;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].model_id, "freshly-discovered");
     }
 
     #[tokio::test]

@@ -86,7 +86,12 @@ fn random_state() -> String {
     hex::encode(bytes)
 }
 
-fn server_base_url(state: &AppState, headers: &HeaderMap) -> String {
+/// Build the server's own public base URL (no trailing slash). Prefers the
+/// configured `SANDBOXED_PUBLIC_URL`, else derives it from the request's
+/// `Host` / `X-Forwarded-Proto` headers. Shared with the GitHub *integration*
+/// flow ([`crate::api::github_integration`]) so both build identical
+/// `redirect_uri`s.
+pub(crate) fn server_base_url(state: &AppState, headers: &HeaderMap) -> String {
     if let Some(configured) = state.config.auth.public_base_url.as_deref() {
         return configured.trim_end_matches('/').to_string();
     }

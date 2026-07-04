@@ -454,7 +454,7 @@ export default function WorkspacesPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
+      <div className="flex items-center justify-center min-h-[calc(100vh-3rem)] lg:min-h-screen">
         <Loader className="h-8 w-8 animate-spin text-white/40" />
       </div>
     );
@@ -462,7 +462,7 @@ export default function WorkspacesPage() {
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-white">Workspaces</h1>
           <p className="text-sm text-white/60 mt-1">
@@ -471,7 +471,7 @@ export default function WorkspacesPage() {
         </div>
         <button
           onClick={() => setShowNewWorkspaceDialog(true)}
-          className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg transition-colors"
+          className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg transition-colors max-lg:self-start"
         >
           <Plus className="h-4 w-4" />
           New Workspace
@@ -1036,7 +1036,7 @@ export default function WorkspacesPage() {
                       <p className="text-xs text-white/50 font-medium">Save as Template</p>
                     </div>
                     <div className="p-4 space-y-4">
-                      <div className="grid grid-cols-2 gap-3">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                         <div>
                           <label className="text-xs text-white/40 block mb-2">Template Name</label>
                           <input

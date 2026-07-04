@@ -84,6 +84,10 @@ struct ListMissionsParams {
     status: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,12 +138,41 @@ struct StartMissionParams {
     config_profile: Option<String>,
     #[serde(default)]
     agent: Option<String>,
+    // Project tagging — forwarded so missions are created WITH structured
+    // metadata instead of null (watchdogs then don't have to parse titles).
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    track: Option<String>,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    github_pr: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    desired_state: Option<String>,
+    #[serde(default)]
+    next_check_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SendMessageParams {
     mission_id: String,
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskMissionParams {
+    mission_id: String,
+    content: String,
+    /// Continue an existing Ask thread. Omit to start a new one.
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// Run the Ask bash tool in an isolated copy of the workspace (writes never
+    /// touch the live tree). Opt-in.
+    #[serde(default)]
+    sandbox: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -423,24 +456,37 @@ impl AssistantMcp {
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "limit": {"type": "integer", "description": "Maximum missions to return, default 50."}
+                        "limit": {"type": "integer", "description": "Maximum missions to return, default 50."},
+                        "project": {"type": "string", "description": "Optional filter: only missions with this project."},
+                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."}
                     }
                 }),
             },
             ToolDefinition {
                 name: "list_missions".to_string(),
-                description: "List recent missions, optionally filtered by status.".to_string(),
+                description: "List recent missions, optionally filtered by status, project, or tag.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "status": {"type": "string", "description": "Optional mission status filter."},
-                        "limit": {"type": "integer", "description": "Maximum missions to return, default 50."}
+                        "limit": {"type": "integer", "description": "Maximum missions to return, default 50."},
+                        "project": {"type": "string", "description": "Optional filter: only missions with this project."},
+                        "tag": {"type": "string", "description": "Optional filter: only missions carrying this tag."}
                     }
                 }),
             },
             ToolDefinition {
                 name: "get_mission".to_string(),
-                description: "Get one mission by UUID.".to_string(),
+                description: "Get one mission by UUID (full record incl. history — heavy; prefer get_mission_digest for status checks).".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id"],
+                    "properties": {"mission_id": {"type": "string"}}
+                }),
+            },
+            ToolDefinition {
+                name: "get_mission_digest".to_string(),
+                description: "Compact ~2KB mission status: state, awaiting_kind, last user/assistant messages (truncated), GitHub PR links, project metadata. Use this instead of get_mission/get_mission_events for recaps and 'where is it?' checks — it avoids pulling whole transcripts into context.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -490,7 +536,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "start_mission".to_string(),
-                description: "Create a new sandboxed.sh mission and send its initial prompt.".to_string(),
+                description: "Create a new sandboxed.sh mission and send its initial prompt. Pass project/track/intent/github_pr/tags so the mission carries structured metadata (so watchdogs/dashboards don't have to parse the title).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -502,7 +548,14 @@ impl AssistantMcp {
                         "model_override": {"type": "string"},
                         "model_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
                         "config_profile": {"type": "string"},
-                        "agent": {"type": "string"}
+                        "agent": {"type": "string"},
+                        "project": {"type": "string", "description": "Stable project id (e.g. \"verity\")."},
+                        "track": {"type": "string", "description": "Track/workstream (e.g. \"core-c3\")."},
+                        "intent": {"type": "string", "description": "Intent (e.g. \"review_merge_pr\")."},
+                        "github_pr": {"type": "string", "description": "Associated PR ref (e.g. \"owner/repo#123\")."},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "desired_state": {"type": "string", "description": "Track state, e.g. waiting_ci / waiting_review / blocked_external."},
+                        "next_check_at": {"type": "string", "description": "When the track should next be checked (RFC3339)."}
                     }
                 }),
             },
@@ -515,6 +568,20 @@ impl AssistantMcp {
                     "properties": {
                         "mission_id": {"type": "string"},
                         "content": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "ask_mission".to_string(),
+                description: "Ask a read-only question to a mission's Ask copilot (a sidecar with bash + workspace access) WITHOUT disturbing the mission or waking its main agent. Use this to inspect a mission's workspace/state or get analysis. Returns the copilot's answer and a thread_id; pass thread_id back to continue the same conversation. This does NOT send a message to the mission agent — use send_message_to_mission for that.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["mission_id", "content"],
+                    "properties": {
+                        "mission_id": {"type": "string"},
+                        "content": {"type": "string", "description": "The question for the copilot."},
+                        "thread_id": {"type": "string", "description": "Optional: continue an existing Ask thread."},
+                        "sandbox": {"type": "boolean", "description": "Optional: isolate bash writes in a throwaway copy of the workspace (default false)."}
                     }
                 }),
             },
@@ -534,7 +601,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "workspace_bash".to_string(),
-                description: "Run a bash command inside a sandboxed.sh workspace with the workspace's configured environment variables (GH_TOKEN, SSH keys, ...) — the same context missions run in. Prefer this over local bash for git/gh operations and anything needing workspace secrets.".to_string(),
+                description: "Run a bash command inside a sandboxed.sh workspace — the same context missions run in, with the workspace's configured environment variables and (when a GitHub account is connected in the dashboard) GitHub git credentials wired in for `git push`. Prefer this over local bash for git operations and anything needing workspace secrets.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["command"],
@@ -569,7 +636,7 @@ impl AssistantMcp {
             },
             ToolDefinition {
                 name: "update_mission_settings".to_string(),
-                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok), model, reasoning effort, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. Note: model_effort only applies to claudecode (low/medium/high/xhigh/max) and codex (low/medium/high).".to_string(),
+                description: "Change a mission's run settings for its NEXT turn: switch backend (claudecode/codex/opencode/gemini/grok), model, reasoning effort, or agent. Applies between turns — the mission must be idle (awaiting_user/acknowledged/interrupted), not actively running. If it is running, cancel_mission first (or wait), then update, then send_message_to_mission or resume_mission to kick the next turn. Note: model_effort only applies to claudecode (low/medium/high/xhigh/max) and codex (low/medium/high/xhigh).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -601,19 +668,27 @@ impl AssistantMcp {
 
     async fn list_missions(&self, params: ListMissionsParams) -> Result<Value, String> {
         let limit = params.limit.clamp(1, 100);
-        let response = self
-            .api_get(&format!("/api/control/missions?limit={limit}&offset=0"))
-            .await?;
+        // Forward filters to the API so it does the (paginated, scan-bounded)
+        // matching server-side — filtering only the fetched page here would miss
+        // matches outside the window on a larger fleet.
+        let mut path = format!("/api/control/missions?limit={limit}&offset=0");
+        if let Some(status) = params.status.as_deref() {
+            path.push_str(&format!("&status={}", urlencoding::encode(status)));
+        }
+        if let Some(project) = params.project.as_deref() {
+            path.push_str(&format!("&project={}", urlencoding::encode(project)));
+        }
+        if let Some(tag) = params.tag.as_deref() {
+            path.push_str(&format!("&tag={}", urlencoding::encode(tag)));
+        }
+        let response = self.api_get(&path).await?;
         if !response.status().is_success() {
             return Err(format!("Failed to list missions: {}", response.status()));
         }
-        let mut missions: Vec<Value> = response
+        let missions: Vec<Value> = response
             .json()
             .await
             .map_err(|error| format!("Failed to parse missions: {error}"))?;
-        if let Some(status) = params.status {
-            missions.retain(|mission| mission["status"].as_str() == Some(status.as_str()));
-        }
         let missions = missions
             .into_iter()
             .map(compact_mission_summary)
@@ -621,7 +696,12 @@ impl AssistantMcp {
         Ok(json!({ "missions": missions }))
     }
 
-    async fn list_active_missions(&self, limit: usize) -> Result<Value, String> {
+    async fn list_active_missions(
+        &self,
+        limit: usize,
+        project: Option<String>,
+        tag: Option<String>,
+    ) -> Result<Value, String> {
         let requested = limit.clamp(1, 100);
         // The API returns the most recent missions regardless of status, so a
         // narrow fetch limit can be fully consumed by recent completed missions
@@ -632,6 +712,8 @@ impl AssistantMcp {
             .list_missions(ListMissionsParams {
                 status: None,
                 limit: fetch_limit,
+                project,
+                tag,
             })
             .await?;
         if let Some(missions) = result["missions"].as_array_mut() {
@@ -656,6 +738,20 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse mission: {error}"))
+    }
+
+    async fn get_mission_digest(&self, params: MissionIdParams) -> Result<Value, String> {
+        let id = parse_uuid(&params.mission_id)?;
+        let response = self
+            .api_get(&format!("/api/control/missions/{id}/digest"))
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!("Mission not found: {}", response.status()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse mission digest: {error}"))
     }
 
     async fn get_mission_events(&self, params: MissionEventsParams) -> Result<Value, String> {
@@ -777,6 +873,20 @@ impl AssistantMcp {
             "model_effort": params.model_effort,
             "config_profile": params.config_profile,
             "agent": params.agent,
+            // Atomic create+start: the API stores the prompt as the mission's
+            // deferred goal and the scheduler dispatches it as soon as
+            // capacity allows. The old create-then-send_message pattern could
+            // be dropped at capacity, leaving zombie Pending missions.
+            "prompt": params.prompt,
+            // Project tagging at creation so the mission isn't born with null
+            // metadata (Paloma watchdogs then route by these, not titles).
+            "project": params.project,
+            "track": params.track,
+            "intent": params.intent,
+            "github_pr": params.github_pr,
+            "tags": params.tags,
+            "desired_state": params.desired_state,
+            "next_check_at": params.next_check_at,
         });
         let response = self.api_post("/api/control/missions", body).await?;
         if !response.status().is_success() {
@@ -787,14 +897,9 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse created mission: {error}"))?;
-        let Some(mission_id) = mission["id"].as_str() else {
+        if mission["id"].as_str().is_none() {
             return Err("Created mission response did not include an id".to_string());
-        };
-        self.send_message(SendMessageParams {
-            mission_id: mission_id.to_string(),
-            content: params.prompt,
-        })
-        .await?;
+        }
         Ok(json!({ "mission": mission }))
     }
 
@@ -853,6 +958,36 @@ impl AssistantMcp {
             .json()
             .await
             .map_err(|error| format!("Failed to parse send result: {error}"))
+    }
+
+    async fn ask_mission(&self, params: AskMissionParams) -> Result<Value, String> {
+        let id = parse_uuid(&params.mission_id)?;
+        let mut body = json!({
+            "content": params.content,
+            "sandbox": params.sandbox,
+        });
+        if let Some(tid) = params.thread_id.as_deref() {
+            let tid = parse_uuid(tid)?;
+            body["thread_id"] = json!(tid.to_string());
+        }
+        let response = self
+            .api_post(&format!("/api/control/missions/{id}/ask"), body)
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to ask mission ({status}): {text}"));
+        }
+        let result: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to parse ask result: {error}"))?;
+        // Return just the answer + thread_id (drop the full message history to
+        // keep the tool result compact).
+        Ok(json!({
+            "thread_id": result.get("thread_id").cloned().unwrap_or(Value::Null),
+            "answer": result.get("answer").cloned().unwrap_or(Value::Null),
+        }))
     }
 
     async fn cancel_mission(&self, params: MissionIdParams) -> Result<Value, String> {
@@ -1201,7 +1336,8 @@ impl AssistantMcp {
             "list_active_missions" => {
                 let params: ListMissionsParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
-                self.list_active_missions(params.limit).await
+                self.list_active_missions(params.limit, params.project, params.tag)
+                    .await
             }
             "list_missions" => {
                 let params: ListMissionsParams = serde_json::from_value(arguments)
@@ -1212,6 +1348,11 @@ impl AssistantMcp {
                 let params: MissionIdParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.get_mission(params).await
+            }
+            "get_mission_digest" => {
+                let params: MissionIdParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.get_mission_digest(params).await
             }
             "get_mission_events" => {
                 let params: MissionEventsParams = serde_json::from_value(arguments)
@@ -1237,6 +1378,11 @@ impl AssistantMcp {
                 let params: SendMessageParams = serde_json::from_value(arguments)
                     .map_err(|error| format!("Invalid params: {error}"))?;
                 self.send_message(params).await
+            }
+            "ask_mission" => {
+                let params: AskMissionParams = serde_json::from_value(arguments)
+                    .map_err(|error| format!("Invalid params: {error}"))?;
+                self.ask_mission(params).await
             }
             "cancel_mission" => {
                 let params: MissionIdParams = serde_json::from_value(arguments)
@@ -1339,6 +1485,19 @@ fn compact_mission_summary(mission: Value) -> Value {
         "workspace_name": mission.get("workspace_name").cloned().unwrap_or(Value::Null),
         "short_description": mission.get("short_description").cloned().unwrap_or(Value::Null),
         "updated_at": mission.get("updated_at").cloned().unwrap_or(Value::Null),
+        // Project tagging + awaiting classification + staleness anchors so
+        // consumers can group/route/triage missions without parsing titles or
+        // replaying events.
+        "project": mission.get("project").cloned().unwrap_or(Value::Null),
+        "track": mission.get("track").cloned().unwrap_or(Value::Null),
+        "intent": mission.get("intent").cloned().unwrap_or(Value::Null),
+        "github_pr": mission.get("github_pr").cloned().unwrap_or(Value::Null),
+        "tags": mission.get("tags").cloned().unwrap_or_else(|| json!([])),
+        "desired_state": mission.get("desired_state").cloned().unwrap_or(Value::Null),
+        "next_check_at": mission.get("next_check_at").cloned().unwrap_or(Value::Null),
+        "awaiting_kind": mission.get("awaiting_kind").cloned().unwrap_or(Value::Null),
+        "last_activity_at": mission.get("last_activity_at").cloned().unwrap_or(Value::Null),
+        "last_status_change_at": mission.get("last_status_change_at").cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -1665,6 +1824,54 @@ fn scrub_sensitive_json(value: &mut Value) {
     }
 }
 
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("assistant-mcp {SERVER_VERSION}");
+        return;
+    }
+
+    let server = AssistantMcp::new();
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    for line in BufReader::new(stdin.lock()).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let request = match serde_json::from_str::<JsonRpcRequest>(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                let response =
+                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {error}"));
+                if let Ok(serialized) = serde_json::to_string(&response) {
+                    let _ = writeln!(stdout, "{serialized}");
+                    let _ = stdout.flush();
+                }
+                continue;
+            }
+        };
+
+        // Notifications (no id), e.g. the `notifications/initialized` the MCP
+        // client sends after `initialize`, expect no reply per JSON-RPC.
+        // Returning a "-32601 Method not found" error here breaks the handshake
+        // with stricter clients.
+        if request.id.is_null() && request.method.starts_with("notifications/") {
+            continue;
+        }
+
+        let response = server.handle_request(request).await;
+        if let Ok(serialized) = serde_json::to_string(&response) {
+            let _ = writeln!(stdout, "{serialized}");
+            let _ = stdout.flush();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1703,12 +1910,27 @@ mod tests {
             "workspace_name": "assistant",
             "short_description": "Build fix",
             "updated_at": "2026-05-28T12:00:00Z",
+            "project": "verity-core",
+            "track": "C3-bridge-collapse",
+            "github_pr": "lfglabs-dev/verity#2070",
+            "tags": ["c3", "sprint-2"],
+            "desired_state": "waiting_ci",
+            "awaiting_kind": "decision",
             "prompt": "secret prompt",
             "api_token": "sk-test",
         }));
 
         assert_eq!(summary["id"], "mission-1");
         assert_eq!(summary["workspace_name"], "assistant");
+        assert_eq!(summary["project"], "verity-core");
+        assert_eq!(summary["track"], "C3-bridge-collapse");
+        assert_eq!(summary["github_pr"], "lfglabs-dev/verity#2070");
+        assert_eq!(summary["desired_state"], "waiting_ci");
+        assert_eq!(summary["tags"][1], "sprint-2");
+        assert_eq!(summary["awaiting_kind"], "decision");
+        // Missions without tags get an empty array, not null.
+        let bare = compact_mission_summary(json!({"id": "m2"}));
+        assert_eq!(bare["tags"], json!([]));
         assert!(summary.get("prompt").is_none());
         assert!(summary.get("api_token").is_none());
     }
@@ -1949,53 +2171,5 @@ mod tests {
         assert!(output_dir_for_shared_file(&mission_id, Some("/var/tmp".to_string())).is_err());
         // Relative paths are rejected.
         assert!(output_dir_for_shared_file(&mission_id, Some("tmp/x".to_string())).is_err());
-    }
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
-        println!("assistant-mcp {SERVER_VERSION}");
-        return;
-    }
-
-    let server = AssistantMcp::new();
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-
-    for line in BufReader::new(stdin.lock()).lines() {
-        let Ok(line) = line else {
-            break;
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let request = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                let response =
-                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {error}"));
-                if let Ok(serialized) = serde_json::to_string(&response) {
-                    let _ = writeln!(stdout, "{serialized}");
-                    let _ = stdout.flush();
-                }
-                continue;
-            }
-        };
-
-        // Notifications (no id), e.g. the `notifications/initialized` the MCP
-        // client sends after `initialize`, expect no reply per JSON-RPC.
-        // Returning a "-32601 Method not found" error here breaks the handshake
-        // with stricter clients.
-        if request.id.is_null() && request.method.starts_with("notifications/") {
-            continue;
-        }
-
-        let response = server.handle_request(request).await;
-        if let Ok(serialized) = serde_json::to_string(&response) {
-            let _ = writeln!(stdout, "{serialized}");
-            let _ = stdout.flush();
-        }
     }
 }

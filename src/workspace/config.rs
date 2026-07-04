@@ -191,15 +191,7 @@ pub(crate) async fn write_opencode_config(
         || workspace_desktop_flag
         || workspace_has_display
         || has_desktop_mcp;
-    let container_fallback = workspace_env
-        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false);
+    let container_fallback = super::container_fallback_from_env(workspace_env);
     let per_workspace_runner = env_var_bool("SANDBOXED_SH_PER_WORKSPACE_RUNNER", true);
     let mut tools = serde_json::Map::new();
     match workspace_type {
@@ -269,17 +261,70 @@ pub(crate) async fn write_opencode_config(
         );
         base_obj.insert("tools".to_string(), serde_json::Value::Object(tools));
 
-        // Add custom providers if any
+        // Add custom providers if any. Kimi is handled here too: like Custom
+        // providers it is not an OpenCode built-in, so it needs an explicit
+        // provider block (OpenAI-compatible npm package + base URL + creds).
         if let Some(providers) = custom_providers {
-            let custom_only: Vec<_> = providers
+            let provider_blocks: Vec<_> = providers
                 .iter()
-                .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+                .filter(|p| {
+                    matches!(p.provider_type, ProviderType::Custom | ProviderType::Kimi)
+                        && p.enabled
+                })
                 .collect();
 
-            if !custom_only.is_empty() {
+            if !provider_blocks.is_empty() {
                 let mut provider_map = serde_json::Map::new();
 
-                for provider in custom_only {
+                for provider in provider_blocks {
+                    // Kimi: OpenAI-compatible block with the OAuth access token as
+                    // the bearer key and the Kimi CLI User-Agent (the coding
+                    // endpoint 403s without a known coding-agent UA).
+                    if provider.provider_type == ProviderType::Kimi {
+                        let mut provider_config = serde_json::Map::new();
+                        provider_config
+                            .insert("npm".to_string(), json!("@ai-sdk/openai-compatible"));
+                        provider_config.insert("name".to_string(), json!("Kimi"));
+
+                        let mut options = serde_json::Map::new();
+                        options.insert(
+                            "baseURL".to_string(),
+                            json!(crate::api::ai_providers::KIMI_API_BASE_URL),
+                        );
+                        if let Some(oauth) = &provider.oauth {
+                            if !oauth.access_token.trim().is_empty() {
+                                options.insert("apiKey".to_string(), json!(oauth.access_token));
+                            }
+                        }
+                        let mut headers = serde_json::Map::new();
+                        headers.insert("User-Agent".to_string(), json!("KimiCLI/1.5"));
+                        options.insert("headers".to_string(), serde_json::Value::Object(headers));
+                        provider_config
+                            .insert("options".to_string(), serde_json::Value::Object(options));
+
+                        let mut models_map = serde_json::Map::new();
+                        for (model_id, model_name) in [
+                            ("kimi-for-coding", "Kimi for Coding"),
+                            ("kimi-k2.6", "Kimi K2.6"),
+                            ("kimi-k2-thinking", "Kimi K2 Thinking"),
+                        ] {
+                            let mut model_config = serde_json::Map::new();
+                            model_config.insert("name".to_string(), json!(model_name));
+                            models_map.insert(
+                                model_id.to_string(),
+                                serde_json::Value::Object(model_config),
+                            );
+                        }
+                        provider_config
+                            .insert("models".to_string(), serde_json::Value::Object(models_map));
+
+                        provider_map.insert(
+                            "kimi".to_string(),
+                            serde_json::Value::Object(provider_config),
+                        );
+                        continue;
+                    }
+
                     let provider_id = sanitize_key(&provider.name);
                     let mut provider_config = serde_json::Map::new();
 
@@ -948,21 +993,7 @@ fn resolve_codex_dir(
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
 ) -> PathBuf {
-    let container_fallback = workspace_env
-        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false);
-
-    if workspace_type == WorkspaceType::Container && !container_fallback {
-        return workspace_root.join("root").join(".codex");
-    }
-
-    PathBuf::from(home_dir()).join(".codex")
+    super::resolve_workspace_home_root(workspace_root, workspace_type, workspace_env).join(".codex")
 }
 
 fn resolve_claudecode_dir(
@@ -970,21 +1001,8 @@ fn resolve_claudecode_dir(
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
 ) -> PathBuf {
-    let container_fallback = workspace_env
-        .get("SANDBOXED_SH_CONTAINER_FALLBACK")
-        .map(|v| {
-            matches!(
-                v.trim().to_lowercase().as_str(),
-                "1" | "true" | "yes" | "y" | "on"
-            )
-        })
-        .unwrap_or(false);
-
-    if workspace_type == WorkspaceType::Container && !container_fallback {
-        return workspace_root.join("root").join(".claude");
-    }
-
-    PathBuf::from(home_dir()).join(".claude")
+    super::resolve_workspace_home_root(workspace_root, workspace_type, workspace_env)
+        .join(".claude")
 }
 
 fn codex_entry_from_mcp(

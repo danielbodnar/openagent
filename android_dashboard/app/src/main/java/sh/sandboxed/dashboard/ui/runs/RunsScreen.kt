@@ -25,6 +25,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -35,6 +36,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.Run
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.components.GlassCard
 import sh.sandboxed.dashboard.ui.tasks.EmptyState
@@ -66,7 +69,7 @@ fun RunsScreen(container: AppContainer) {
             Text("Runs", style = MaterialTheme.typography.headlineSmall, color = Palette.TextPrimary, modifier = Modifier.weight(1f))
             val total = state.items.sumOf { it.totalCostCents } / 100.0
             if (total > 0) Text("$" + "%.2f".format(total), color = Palette.AccentLight, style = MaterialTheme.typography.titleSmall)
-            IconButton(onClick = vm::refresh) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
+            IconButton(onClick = vm::refresh, modifier = Modifier.tag(TestTags.RUNS_REFRESH)) { Icon(Icons.Filled.Refresh, "Refresh", tint = Palette.TextSecondary) }
         }
         state.error?.let { Box(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) { ErrorBanner(it) } }
         if (state.loading && state.items.isEmpty()) {

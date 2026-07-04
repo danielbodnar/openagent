@@ -32,6 +32,7 @@ import {
 } from "@/lib/stream-continuation";
 import {
   eventsToItemsImpl,
+  extractMissionState,
   isRecord,
   parseCostMetadata,
   type ChatItem,
@@ -70,6 +71,7 @@ import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
 import { stripRichFileTagsByName } from "@/lib/rich-tags";
 import { readCachedEvents, writeCachedEvents } from "@/lib/event-cache";
+import { createClientMessageId } from "@/lib/client-message-id";
 import {
   cancelControl,
   postControlMessage,
@@ -198,6 +200,18 @@ const MAX_MISSION_DRAFT_CACHE_BYTES = 64 * 1024;
 const MAX_MISSION_DRAFT_CACHE_ENTRIES = 50;
 const DEFAULT_DOCUMENT_TITLE = "Sandboxed.sh";
 const MAX_DOCUMENT_MISSION_TITLE_LENGTH = 80;
+const CONTROL_MISSION_SCOPED_EVENT_TYPES = new Set([
+  "user_message",
+  "assistant_message",
+  "thinking",
+  "text_delta",
+  "text_op",
+  "tool_call",
+  "tool_result",
+  "phase",
+  "goal_iteration",
+  "goal_status",
+]);
 
 type EventsWorkerRequest = {
   id: number;
@@ -236,14 +250,21 @@ function isRetriableSendError(error: unknown): boolean {
   );
 }
 
+function chatItemMatchesMission(item: ChatItem, missionId?: string): boolean {
+  if (!missionId) return true;
+  if (!("missionId" in item)) return true;
+  return item.missionId == null || item.missionId === missionId;
+}
+
 export function appendUnpersistedLiveTail(
   historyItems: ChatItem[],
   liveItems: ChatItem[],
+  missionId?: string,
 ): ChatItem[] {
   if (liveItems.length === 0) return historyItems;
 
   const lastLiveUserIdx = liveItems.findLastIndex(
-    (item) => item.kind === "user",
+    (item) => item.kind === "user" && chatItemMatchesMission(item, missionId),
   );
   if (lastLiveUserIdx === -1) return historyItems;
 
@@ -268,6 +289,7 @@ export function appendUnpersistedLiveTail(
   const unpersistedTail = liveItems
     .slice(lastLiveUserIdx + 1)
     .filter((item) => {
+      if (!chatItemMatchesMission(item, missionId)) return false;
       if (existingIds.has(item.id)) return false;
       if (item.kind === "assistant") {
         const content = item.content.trim();
@@ -287,6 +309,7 @@ export function appendUnpersistedLiveTail(
   const lastLiveUser = liveItems[lastLiveUserIdx];
   const carryUnpersistedUser =
     lastLiveUser.kind === "user" &&
+    chatItemMatchesMission(lastLiveUser, missionId) &&
     !existingIds.has(lastLiveUser.id) &&
     (lastLiveUser.sendStatus === "failed" ||
       lastLiveUser.sendStatus === "sending");
@@ -373,15 +396,21 @@ function removeOutboxEntry(missionId: string, id: string): void {
   writeOutbox(map);
 }
 
-function formatMissionDocumentTitle(mission: Mission | null | undefined) {
-  if (!mission) return DEFAULT_DOCUMENT_TITLE;
+function formatMissionDocumentTitle(
+  mission: Mission | null | undefined,
+  awaitingUser = false,
+) {
+  // Prefix mirrors the favicon's "needs answer" badge so a backgrounded tab
+  // reads as needing input from the tab list alone.
+  const prefix = awaitingUser ? "● " : "";
+  if (!mission) return `${prefix}${DEFAULT_DOCUMENT_TITLE}`;
   const title = getMissionTitle(mission, {
     maxLength: MAX_DOCUMENT_MISSION_TITLE_LENGTH,
     fallback: getMissionShortName(mission.id),
   }).trim();
   return title
-    ? `${title} | ${DEFAULT_DOCUMENT_TITLE}`
-    : DEFAULT_DOCUMENT_TITLE;
+    ? `${prefix}${title} | ${DEFAULT_DOCUMENT_TITLE}`
+    : `${prefix}${DEFAULT_DOCUMENT_TITLE}`;
 }
 
 function readLegacyControlDraft(): string {
@@ -1174,13 +1203,55 @@ function QuestionToolItem({
     }
   };
 
+  // An already-answered question that came back as a lazy history stub carries
+  // no args (the question text wasn't loaded), so `parseQuestionArgs` is empty.
+  // Without this guard it would render the misleading "reply below to continue"
+  // input for a question the user already answered. Show a compact answered
+  // state instead — the live, unanswered empty-args case still falls through to
+  // the input fallback below.
+  const answeredStub = isFallback && (hasResult || item.hasResult === true);
+  if (answeredStub) {
+    const answerText = (() => {
+      const r = item.result;
+      if (isRecord(r) && Array.isArray(r["answers"])) {
+        const flat = (r["answers"] as unknown[])
+          .flat()
+          .filter((a): a is string => typeof a === "string");
+        if (flat.length > 0) return flat.join(", ");
+      }
+      return null;
+    })();
+    return (
+      <div
+        id={`chat-item-${item.id}`}
+        data-chat-item-id={item.id}
+        className="flex justify-start gap-3"
+      >
+        <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+          <Bot className="h-4 w-4 text-indigo-400" />
+        </div>
+        <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
+          <div className="text-xs text-white/40">
+            Tool: <span className="font-mono text-indigo-400">question</span>
+            <span className="ml-2 text-emerald-400/80">answered</span>
+          </div>
+          {answerText && (
+            <div className="mt-1 text-sm text-white/70">
+              Your answer: <span className="text-white/90">{answerText}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       id={`chat-item-${item.id}`}
       data-chat-item-id={item.id}
       className="flex justify-start gap-3"
     >
-      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+      <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
         <Bot className="h-4 w-4 text-indigo-400" />
       </div>
       <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
@@ -2080,14 +2151,19 @@ const ToolCallItem = memo(function ToolCallItem({
   workspaceId,
   missionId,
   onLoadDetails,
+  defaultExpanded = false,
 }: {
   item: Extract<ChatItem, { kind: "tool" }>;
   highlighted?: boolean;
   workspaceId?: string;
   missionId?: string;
   onLoadDetails?: (toolCallId: string) => Promise<void>;
+  /** Last transcript row opens by default; collapses again once superseded. */
+  defaultExpanded?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  // `null` follows `defaultExpanded`; a click pins the user's explicit choice.
+  const [manualExpanded, setManualExpanded] = useState<boolean | null>(null);
+  const expanded = manualExpanded ?? defaultExpanded;
   const isLazy = item.lazy === true;
   const isDone = !isLazy && item.result !== undefined;
 
@@ -2113,7 +2189,7 @@ const ToolCallItem = memo(function ToolCallItem({
   const [resultExpanded, setResultExpanded] = useState(false);
   const handleToggleExpanded = useCallback(() => {
     const nextExpanded = !expanded;
-    setExpanded(nextExpanded);
+    setManualExpanded(nextExpanded);
     if (nextExpanded && isLazy && !item.loading) {
       void onLoadDetails?.(item.toolCallId);
     }
@@ -2390,6 +2466,7 @@ function CollapsedToolGroup({
   workspaceId,
   missionId,
   onLoadToolDetails,
+  isLast = false,
 }: {
   tools: Extract<ChatItem, { kind: "tool" }>[];
   isExpanded: boolean;
@@ -2401,6 +2478,10 @@ function CollapsedToolGroup({
   workspaceId?: string;
   missionId?: string;
   onLoadToolDetails?: (toolCallId: string) => Promise<void>;
+  /** True when this group is the last transcript row: its newest (always
+      shown) tool then opens by default. The hidden "previous" tools stay
+      collapsed regardless. */
+  isLast?: boolean;
 }) {
   const hiddenCount = tools.length - 1;
   const lastTool = tools[tools.length - 1];
@@ -2445,8 +2526,12 @@ function CollapsedToolGroup({
     return () => cancelAnimationFrame(raf);
   }, [isExpanded, measureRow]);
 
-  // Helper to render appropriate tool component
-  const renderTool = (tool: Extract<ChatItem, { kind: "tool" }>) => {
+  // Helper to render appropriate tool component. `isLastTool` only applies to
+  // the newest tool of the group when the group itself is the transcript tail.
+  const renderTool = (
+    tool: Extract<ChatItem, { kind: "tool" }>,
+    isLastTool = false,
+  ) => {
     if (isSubagentTool(tool.name)) {
       return <SubagentToolItem key={tool.id} item={tool} />;
     }
@@ -2457,6 +2542,7 @@ function CollapsedToolGroup({
         workspaceId={workspaceId}
         missionId={missionId}
         onLoadDetails={onLoadToolDetails}
+        defaultExpanded={isLastTool}
       />
     );
   };
@@ -2486,7 +2572,7 @@ function CollapsedToolGroup({
             Hide {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
           </span>
         </button>
-        {renderTool(lastTool)}
+        {renderTool(lastTool, isLast)}
       </div>
     );
   }
@@ -2509,7 +2595,7 @@ function CollapsedToolGroup({
           Show {hiddenCount} previous tool{hiddenCount > 1 ? "s" : ""}
         </span>
       </button>
-      {renderTool(lastTool)}
+      {renderTool(lastTool, isLast)}
     </div>
   );
 }
@@ -2520,6 +2606,8 @@ type ChatItemRowProps = {
   workspaceId: string | undefined;
   missionId: string | undefined;
   basePath: string | undefined;
+  /** This row is the transcript tail: its collapsible content opens by default. */
+  isLast: boolean;
   isToolGroupExpanded: boolean;
   onToggleToolGroup: (groupId: string) => void;
   measureRow?: (el: HTMLElement) => void;
@@ -2551,6 +2639,7 @@ const ChatItemRow = memo(function ChatItemRow({
   workspaceId,
   missionId,
   basePath,
+  isLast,
   isToolGroupExpanded,
   onToggleToolGroup,
   measureRow,
@@ -2588,6 +2677,7 @@ const ChatItemRow = memo(function ChatItemRow({
           workspaceId={workspaceId}
           missionId={missionId}
           onLoadToolDetails={onLoadToolDetails}
+          isLast={isLast}
         />
       </div>
     );
@@ -2660,7 +2750,7 @@ const ChatItemRow = memo(function ChatItemRow({
             </span>
           </div>
         </div>
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
+        <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/[0.08]">
           <User className="h-4 w-4 text-white/60" />
         </div>
       </div>
@@ -2689,7 +2779,7 @@ const ChatItemRow = memo(function ChatItemRow({
           highlighted && "ring-1 ring-amber-400/70 bg-amber-500/10",
         )}
       >
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+        <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
           <Bot className="h-4 w-4 text-indigo-400" />
         </div>
         <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
@@ -2794,6 +2884,7 @@ const ChatItemRow = memo(function ChatItemRow({
         basePath={basePath}
         workspaceId={workspaceId}
         missionId={missionId}
+        defaultExpanded={isLast}
       />
     );
   }
@@ -2805,6 +2896,7 @@ const ChatItemRow = memo(function ChatItemRow({
         basePath={basePath}
         workspaceId={workspaceId}
         missionId={missionId}
+        defaultExpanded={isLast}
       />
     );
   }
@@ -2852,7 +2944,7 @@ const ChatItemRow = memo(function ChatItemRow({
             data-chat-item-id={item.id}
             className="flex justify-start gap-3"
           >
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+            <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
             <div className="max-w-[80%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
@@ -2899,7 +2991,7 @@ const ChatItemRow = memo(function ChatItemRow({
             data-chat-item-id={item.id}
             className="flex justify-start gap-3"
           >
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
+            <div className="@max-[30rem]:hidden flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500/20">
               <Bot className="h-4 w-4 text-indigo-400" />
             </div>
             <div className="max-w-[90%] rounded-2xl rounded-tl-md bg-white/[0.03] border border-white/[0.06] px-4 py-3">
@@ -2931,6 +3023,7 @@ const ChatItemRow = memo(function ChatItemRow({
           workspaceId={workspaceId}
           missionId={missionId}
           onLoadDetails={onLoadToolDetails}
+          defaultExpanded={isLast}
         />
       );
     }
@@ -2946,6 +3039,7 @@ const ChatItemRow = memo(function ChatItemRow({
         workspaceId={workspaceId}
         missionId={missionId}
         onLoadDetails={onLoadToolDetails}
+        defaultExpanded={isLast}
       />
     );
   }
@@ -3014,6 +3108,12 @@ export default function ControlClient() {
   const showPerfOverlay = searchParams.get("debug") === "perf";
 
   const [items, setItems] = useControlItemsStore();
+  // Agent task board + next-wakeup marker for the Workbench panel, derived
+  // from the same chat items the transcript renders (single source of truth).
+  const workbenchMissionState = useMemo(
+    () => extractMissionState(items),
+    [items],
+  );
   const itemsRef = useRef<ChatItem[]>([]);
   const [input, setInput] = useState(() => loadControlDraftForMission(null));
   const [canSubmitInput, setCanSubmitInput] = useState(false);
@@ -3232,6 +3332,16 @@ export default function ControlClient() {
   // Mission state lives in `controlViewingMissionStore`; these local states
   // cover lower-churn loading/list UI around it.
   const [missionLoading, setMissionLoading] = useState(false);
+  // Mission id whose conversation-history fetch *failed* (network/5xx), as
+  // opposed to a mission that genuinely has no history yet. Both used to
+  // collapse to "no events" because the load swallowed errors with
+  // `.catch(() => null)`, so an active mission with a failed history fetch
+  // rendered the misleading "Agent is working…" placeholder forever (until a
+  // live SSE event happened to arrive). We track the failure separately so the
+  // empty-state can offer a Retry instead of pretending the agent is busy.
+  const [historyLoadFailedMissionId, setHistoryLoadFailedMissionId] = useState<
+    string | null
+  >(null);
   const [recentMissions, setRecentMissions] = useState<Mission[]>([]);
   const [dismissedResumeUI, setDismissedResumeUI] = useState(false);
 
@@ -3836,7 +3946,11 @@ export default function ControlClient() {
         .join("|"),
     [groupedItems],
   );
-  const { isAtBottom, scrollToBottom } = useVirtualTimelineAnchor({
+  const {
+    isAtBottom,
+    scrollToBottom,
+    registerContent: registerChatContent,
+  } = useVirtualTimelineAnchor({
     scrollElementRef: containerRef,
     virtualizer: chatVirtualizer,
     itemCount: groupedItems.length,
@@ -5095,9 +5209,15 @@ export default function ControlClient() {
       try {
         // Load mission, events, and queue in parallel for faster load
         const queueGenAtFetch = queueMutationGenRef.current;
+        // Distinguish a *failed* history fetch from a genuinely empty one: the
+        // former should surface a Retry, the latter is a normal empty mission.
+        let historyFetchFailed = false;
         const [mission, events, queuedMessages] = await Promise.all([
           loadMission(id),
-          loadHistoryEvents(id).catch(() => null), // Don't fail if events unavailable
+          loadHistoryEvents(id).catch(() => {
+            historyFetchFailed = true;
+            return null;
+          }), // Don't fail the whole load if events are unavailable
           getQueue().catch(() => []), // Don't fail if queue unavailable
         ]);
         if (cancelled || fetchingMissionIdRef.current !== id) return;
@@ -5188,6 +5308,11 @@ export default function ControlClient() {
           queueGenAtFetch === queueMutationGenRef.current,
         );
         setItems(historyItems);
+        // Only flag a load failure when the fetch threw *and* we ended up with
+        // nothing to show — a partial/cached fallback is still a usable view.
+        setHistoryLoadFailedMissionId(
+          historyFetchFailed && historyItems.length === 0 ? id : null,
+        );
         adjustVisibleItemsLimit(historyItems);
         seedPaginationStateAfterInitialLoad(id, historicEventsLen);
         applyDesktopSessionState(mission);
@@ -5746,9 +5871,13 @@ export default function ControlClient() {
       try {
         // Load mission, events, and queue in parallel for faster load
         const queueGenAtFetch = queueMutationGenRef.current;
+        let historyFetchFailed = false;
         const [mission, events, queuedMessages] = await Promise.all([
           getMission(missionId),
-          loadHistoryEvents(missionId).catch(() => null), // Don't fail if events unavailable
+          loadHistoryEvents(missionId).catch(() => {
+            historyFetchFailed = true;
+            return null;
+          }), // Don't fail the whole load if events are unavailable
           getQueue().catch(() => []), // Don't fail if queue unavailable
         ]);
 
@@ -5777,6 +5906,9 @@ export default function ControlClient() {
         );
 
         setItems(historyItems);
+        setHistoryLoadFailedMissionId(
+          historyFetchFailed && historyItems.length === 0 ? missionId : null,
+        );
         adjustVisibleItemsLimit(historyItems);
         seedPaginationStateAfterInitialLoad(missionId, historicEventsLen);
         // Check if mission has an active desktop session (stored metadata or fallback to history)
@@ -6454,11 +6586,70 @@ export default function ControlClient() {
     ],
   );
 
+  // Rename any mission by id from the Cmd+K switcher. Optimistic across the
+  // three places a mission title is mirrored (recent list, current, viewing);
+  // reverts on failure.
+  const handleRenameMissionById = useCallback(
+    async (missionId: string, nextTitle: string) => {
+      const trimmed = nextTitle.trim();
+      if (!trimmed) return;
+      // Capture the pre-rename title from whichever source currently holds the
+      // mission. It may be open in current/viewing but absent from the recent
+      // list, in which case restoring from `recentMissions` alone would wipe the
+      // title to null on a failed API call.
+      const previousTitle =
+        recentMissions.find((m) => m.id === missionId)?.title ??
+        (currentMissionRef.current?.id === missionId
+          ? currentMissionRef.current.title
+          : undefined) ??
+        (viewingMissionRef.current?.id === missionId
+          ? viewingMissionRef.current.title
+          : undefined) ??
+        null;
+      const previousById = new Map<string, string | null | undefined>();
+      previousById.set(missionId, previousTitle);
+
+      const applyTitle = (mission: Mission | null) =>
+        mission?.id === missionId ? { ...mission, title: trimmed } : mission;
+
+      setRecentMissions((prev) =>
+        prev.map((mission) =>
+          mission.id === missionId ? { ...mission, title: trimmed } : mission,
+        ),
+      );
+      setCurrentMission(applyTitle);
+      setViewingMission(applyTitle);
+
+      try {
+        await updateMissionTitle(missionId, trimmed);
+      } catch (error) {
+        console.error("Failed to rename mission:", error);
+        toast.error("Failed to rename mission");
+        const restore = (mission: Mission | null) =>
+          mission?.id === missionId
+            ? { ...mission, title: previousById.get(missionId) ?? null }
+            : mission;
+        setRecentMissions((prev) =>
+          prev.map((mission) =>
+            mission.id === missionId
+              ? { ...mission, title: previousById.get(missionId) ?? null }
+              : mission,
+          ),
+        );
+        setCurrentMission(restore);
+        setViewingMission(restore);
+        throw error;
+      }
+    },
+    [recentMissions],
+  );
+
   // Debouncing for thinking updates to reduce re-renders during streaming
   const pendingThinkingRef = useRef<{
     content: string;
     done: boolean;
     id: string;
+    missionId?: string;
     startTime: number;
   } | null>(null);
   const thinkingFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -6469,6 +6660,7 @@ export default function ControlClient() {
 
   const pendingStreamRef = useRef<{
     content: string;
+    missionId?: string;
     startTime: number;
   } | null>(null);
   const streamFlushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
@@ -6539,7 +6731,9 @@ export default function ControlClient() {
           // CLOSED and drop it — history catch-up backfills it on the next
           // sync — rather than risk rendering a main-session message inside an
           // unrelated parallel mission's view (cross-mission leak).
-          if (viewingId !== currentMissionId) {
+          if (CONTROL_MISSION_SCOPED_EVENT_TYPES.has(event.type)) {
+            filterReason = "mission-scoped event has no mission_id";
+          } else if (viewingId !== currentMissionId) {
             if (event.type !== "status") {
               filterReason = currentMissionId
                 ? "event has no mission_id for parallel mission"
@@ -6894,6 +7088,7 @@ export default function ControlClient() {
         const content = String(data["content"] ?? "");
         const done = Boolean(data["done"]);
         const now = Date.now();
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         // Debounced thinking updates to reduce re-renders during streaming
         const flushThinking = () => {
@@ -6904,12 +7099,20 @@ export default function ControlClient() {
             // Remove phase items when thinking starts
             const filtered = prev.filter((it) => it.kind !== "phase");
             let existingIdx = filtered.findIndex(
-              (it) => it.kind === "thinking" && !it.done,
+              (it) =>
+                it.kind === "thinking" &&
+                !it.done &&
+                (pending.missionId == null ||
+                  it.missionId == null ||
+                  it.missionId === pending.missionId),
             );
             if (existingIdx < 0) {
               existingIdx = filtered.findLastIndex(
                 (it) =>
                   it.kind === "thinking" &&
+                  (pending.missionId == null ||
+                    it.missionId == null ||
+                    it.missionId === pending.missionId) &&
                   isStreamContinuation(pending.content, it.content),
               );
             }
@@ -6934,6 +7137,7 @@ export default function ControlClient() {
                   ),
                   done: pending.done,
                   endTime: pending.done ? now : existing.endTime,
+                  missionId: pending.missionId ?? existing.missionId,
                 };
                 if (pending.done) {
                   pendingThinkingRef.current = null;
@@ -6957,6 +7161,7 @@ export default function ControlClient() {
                   id: pending.id,
                   content: pending.content,
                   done: pending.done,
+                  missionId: pending.missionId,
                   startTime: pending.startTime,
                   endTime: pending.done ? now : undefined,
                 },
@@ -6972,6 +7177,7 @@ export default function ControlClient() {
                   id: pending.id,
                   content: pending.content,
                   done: pending.done,
+                  missionId: pending.missionId,
                   startTime: pending.startTime,
                   endTime: pending.done ? now : undefined,
                 },
@@ -6981,7 +7187,20 @@ export default function ControlClient() {
         };
 
         // Get or create stable ID for current thinking session
-        const existingPending = pendingThinkingRef.current;
+        let existingPending = pendingThinkingRef.current;
+        const pendingMissionChanged = Boolean(
+          existingPending?.missionId &&
+          acceptedMissionId &&
+          existingPending.missionId !== acceptedMissionId,
+        );
+        if (pendingMissionChanged) {
+          pendingThinkingRef.current = {
+            ...existingPending!,
+            done: true,
+          };
+          flushThinking();
+          existingPending = null;
+        }
         const existingContent = existingPending?.content ?? "";
         // P1-#8: tolerant continuation check (see stream-continuation.ts).
         const isContinuation = isStreamContinuation(content, existingContent);
@@ -6997,6 +7216,7 @@ export default function ControlClient() {
             id:
               existingPending?.id ??
               `thinking-${thinkingIdCounterRef.current++}`,
+            missionId: existingPending?.missionId ?? acceptedMissionId,
             startTime: existingPending?.startTime ?? now,
           };
           flushThinking();
@@ -7015,6 +7235,7 @@ export default function ControlClient() {
           content: content || existingPending?.content || "",
           done,
           id: thinkingId,
+          missionId: acceptedMissionId,
           startTime,
         };
 
@@ -7055,6 +7276,7 @@ export default function ControlClient() {
         const content = String(data["content"] ?? "");
         const now = Date.now();
         if (!content.trim()) return;
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         // Debounced stream updates to reduce re-renders during rapid delta streaming.
         const flushStream = () => {
@@ -7066,7 +7288,12 @@ export default function ControlClient() {
             const filtered = prev.filter((it) => it.kind !== "phase");
             const streamId = "text_delta_latest";
             const existingIdx = filtered.findIndex(
-              (it) => it.kind === "stream" && it.id === streamId,
+              (it) =>
+                it.kind === "stream" &&
+                it.id === streamId &&
+                (pending.missionId == null ||
+                  it.missionId == null ||
+                  it.missionId === pending.missionId),
             );
             if (existingIdx >= 0) {
               const updated = [...filtered];
@@ -7084,6 +7311,7 @@ export default function ControlClient() {
                 ...existing,
                 content: pending.content || existing.content,
                 done: false,
+                missionId: pending.missionId ?? existing.missionId,
                 startTime:
                   isContinuation && !existing.done
                     ? existing.startTime
@@ -7101,6 +7329,7 @@ export default function ControlClient() {
                 id: "text_delta_latest",
                 content: pending.content,
                 done: false,
+                missionId: pending.missionId,
                 startTime: pending.startTime,
                 endTime: undefined,
               },
@@ -7108,13 +7337,24 @@ export default function ControlClient() {
           });
         };
 
-        const existingPending = pendingStreamRef.current;
+        let existingPending = pendingStreamRef.current;
+        const pendingMissionChanged = Boolean(
+          existingPending?.missionId &&
+          acceptedMissionId &&
+          existingPending.missionId !== acceptedMissionId,
+        );
+        if (pendingMissionChanged) {
+          flushStream();
+          pendingStreamRef.current = null;
+          existingPending = null;
+        }
         const existingContent = existingPending?.content ?? "";
         // P1-#8: tolerant continuation check (see stream-continuation.ts).
         const isContinuation = isStreamContinuation(content, existingContent);
 
         pendingStreamRef.current = {
           content: mergeStreamFragment(existingContent, content),
+          missionId: acceptedMissionId,
           startTime: isContinuation ? (existingPending?.startTime ?? now) : now,
         };
 
@@ -7141,11 +7381,21 @@ export default function ControlClient() {
         const bubbleId = String(data["bubble_id"] ?? "text-op-latest");
         const rawOps = Array.isArray(data["ops"]) ? data["ops"] : [];
         const now = Date.now();
+        const acceptedMissionId = eventMissionId ?? viewingId ?? undefined;
 
         setItems((prev) => {
           const filtered = prev.filter((it) => it.kind !== "phase");
+          // Match the live row by id AND mission scope, mirroring the
+          // text_delta flush. Without the mission guard a shared bubble id
+          // (e.g. the "text-op-latest" default) could merge a text_op into
+          // another mission's stream bubble.
           const existingIdx = filtered.findIndex(
-            (it) => it.kind === "stream" && it.id === bubbleId,
+            (it) =>
+              it.kind === "stream" &&
+              it.id === bubbleId &&
+              (acceptedMissionId == null ||
+                it.missionId == null ||
+                it.missionId === acceptedMissionId),
           );
           const existing =
             existingIdx >= 0 && filtered[existingIdx]?.kind === "stream"
@@ -7186,6 +7436,7 @@ export default function ControlClient() {
               ...existing,
               content,
               done: finalized,
+              missionId: acceptedMissionId ?? existing.missionId,
               endTime: finalized ? now : undefined,
             };
             return updated;
@@ -7198,6 +7449,7 @@ export default function ControlClient() {
               id: bubbleId,
               content,
               done: finalized,
+              missionId: acceptedMissionId,
               startTime: now,
               endTime: finalized ? now : undefined,
             },
@@ -7977,7 +8229,7 @@ export default function ControlClient() {
       submittingRef.current = true;
 
       const targetMissionId = viewingMissionIdRef.current;
-      const tempId = crypto.randomUUID();
+      const tempId = createClientMessageId();
       const timestamp = Date.now();
       const hasExistingUserMessages = items.some(
         (item) => item.kind === "user",
@@ -8564,6 +8816,7 @@ export default function ControlClient() {
         historyItems = appendUnpersistedLiveTail(
           historyItems,
           itemsRef.current,
+          missionId,
         );
 
         // Pre-queue length: pagination uses this to find the live tail
@@ -8788,7 +9041,11 @@ export default function ControlClient() {
   const missionIsRunningOrActive =
     viewingMissionIsRunning || activeMission?.status === "active";
   const missionStatus = activeMission
-    ? missionStatusLabel(activeMission.status, viewingMissionIsRunning)
+    ? missionStatusLabel(
+        activeMission.status,
+        viewingMissionIsRunning,
+        activeMission.awaiting_kind,
+      )
     : null;
   const faviconStatus = useMemo<MissionStatus | null>(() => {
     if (!activeMission) return null;
@@ -8925,15 +9182,18 @@ export default function ControlClient() {
     };
   }, [showMissionMenu]);
 
-  // Update favicon with mission status dot
-  useFaviconStatus(faviconStatus, viewingMissionIsRunning);
+  // Update favicon with mission status dot + a "needs answer" attention badge.
+  useFaviconStatus(faviconStatus, viewingMissionIsRunning, hasPendingUserInput);
 
   useEffect(() => {
-    document.title = formatMissionDocumentTitle(activeMission);
+    document.title = formatMissionDocumentTitle(
+      activeMission,
+      hasPendingUserInput,
+    );
     return () => {
       document.title = DEFAULT_DOCUMENT_TITLE;
     };
-  }, [activeMission]);
+  }, [activeMission, hasPendingUserInput]);
 
   // Derive the last resolved model from assistant messages (for the debug dropdown)
   const lastResolvedModel = useMemo(() => {
@@ -9033,7 +9293,7 @@ export default function ControlClient() {
 
   return (
     <NowTickProvider>
-      <div className="flex h-screen flex-col p-6">
+      <div className="flex h-[calc(100vh-3rem)] flex-col p-6 lg:h-screen">
         {/* Always-on debug overlay so any OOM-style crash leaves a trail
           we can reconstruct from sessionStorage after reload. Cheap:
           a polling tick every 2s that reads performance.memory and
@@ -9067,6 +9327,7 @@ export default function ControlClient() {
           onResumeMission={handleResumeMissionById}
           onOpenFailingToolCall={handleOpenFailingToolCallById}
           onFollowUpMission={handleFollowUpMissionById}
+          onRenameMission={handleRenameMissionById}
           onRefresh={refreshRecentMissions}
         />
 
@@ -9669,7 +9930,7 @@ export default function ControlClient() {
         </div>
 
         {/* Main content area - Chat and Desktop stream side by side */}
-        <div className="flex-1 min-h-0 flex gap-4">
+        <div className="flex-1 min-h-0 flex flex-col gap-4 lg:flex-row max-lg:overflow-y-auto">
           {/* Chat container. We intentionally do NOT animate flex-grow when
           side panels (Workers / Workbench / Thinking) open: animating layout
           properties like `flex-grow` re-flows the entire (potentially huge)
@@ -9679,7 +9940,7 @@ export default function ControlClient() {
           snap to its new width in a single layout pass. */}
           <div
             className={cn(
-              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative",
+              "flex-1 min-h-0 flex flex-col rounded-2xl glass-panel border border-white/[0.06] overflow-hidden relative max-lg:min-h-[60vh]",
               showDesktopStream && "flex-[2]",
             )}
           >
@@ -9739,9 +10000,18 @@ export default function ControlClient() {
               ) : items.length === 0 ? (
                 <div className="flex h-full items-center justify-center">
                   <div className="text-center">
-                    <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-500/10">
-                      {viewingMissionIsRunning &&
-                      activeMission?.status === "active" ? (
+                    <div
+                      className={cn(
+                        "mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl",
+                        historyLoadFailedMissionId === viewingMissionId
+                          ? "bg-amber-500/10"
+                          : "bg-indigo-500/10",
+                      )}
+                    >
+                      {historyLoadFailedMissionId === viewingMissionId ? (
+                        <AlertTriangle className="h-8 w-8 text-amber-400" />
+                      ) : viewingMissionIsRunning &&
+                        activeMission?.status === "active" ? (
                         <Loader className="h-8 w-8 text-indigo-400 animate-spin" />
                       ) : (
                         <Bot className="h-8 w-8 text-indigo-400" />
@@ -9749,6 +10019,28 @@ export default function ControlClient() {
                     </div>
                     {missionLoading ? (
                       <Shimmer className="max-w-xs mx-auto" />
+                    ) : historyLoadFailedMissionId === viewingMissionId ? (
+                      <>
+                        <h2 className="text-lg font-medium text-white">
+                          Couldn’t load conversation
+                        </h2>
+                        <p className="mt-2 text-sm text-white/40 max-w-sm">
+                          The mission history failed to load (network or server
+                          error). The agent may still be running — retry to
+                          reconnect.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (viewingMissionId)
+                              void handleViewMission(viewingMissionId);
+                          }}
+                          className="mt-4 inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-1.5 text-xs text-white/70 transition-colors hover:bg-white/[0.06] hover:text-white"
+                        >
+                          <RefreshCw className="h-3.5 w-3.5" />
+                          Retry
+                        </button>
+                      </>
                     ) : viewingMissionIsRunning &&
                       activeMission?.status === "active" ? (
                       <>
@@ -9837,8 +10129,9 @@ export default function ControlClient() {
                   </div>
                 </div>
               ) : (
-                <div className="mx-auto max-w-3xl space-y-6">
+                <div className="@container mx-auto max-w-3xl space-y-6">
                   <div
+                    ref={registerChatContent}
                     className="relative w-full"
                     style={{ height: `${chatVirtualizer.getTotalSize()}px` }}
                   >
@@ -9846,6 +10139,8 @@ export default function ControlClient() {
                       const item = groupedItems[virtualRow.index];
                       if (!item) return null;
                       const key = getGroupedItemKey(item);
+                      const isLast =
+                        virtualRow.index === groupedItems.length - 1;
                       const isToolGroupExpanded =
                         item.kind === "tool_group"
                           ? expandedToolGroups.has(item.groupId)
@@ -9866,6 +10161,7 @@ export default function ControlClient() {
                             workspaceId={missionForDownloads?.workspace_id}
                             missionId={missionForDownloads?.id}
                             basePath={missionWorkingDirectory}
+                            isLast={isLast}
                             isToolGroupExpanded={isToolGroupExpanded}
                             onToggleToolGroup={handleToggleToolGroup}
                             measureRow={measureRowSync}
@@ -10218,10 +10514,12 @@ export default function ControlClient() {
                 // `transition-all duration-300` that was animating width on
                 // mount (the width change is what caused the chat-side reflow
                 // freeze when toggling the Workers panel).
-                "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0",
+                // Below lg the side panel stacks under the chat at full width
+                // with a capped height instead of competing for horizontal room.
+                "min-h-0 flex flex-col gap-4 animate-fade-in shrink-0 max-lg:w-full max-lg:min-w-0 max-lg:max-w-none max-lg:max-h-none max-lg:h-[60vh] max-lg:resize-none",
                 showDesktopStream
-                  ? "basis-auto w-[clamp(400px,44vw,820px)] h-[min(720px,calc(100vh-7rem))] min-h-[420px] min-w-[360px] max-h-[calc(100vh-7rem)] max-w-[820px] resize overflow-hidden"
-                  : "w-80",
+                  ? "lg:basis-auto lg:w-[clamp(400px,44vw,820px)] lg:h-[min(720px,calc(100vh-7rem))] lg:min-h-[420px] lg:min-w-[360px] lg:max-h-[calc(100vh-7rem)] lg:max-w-[820px] lg:resize overflow-hidden"
+                  : "lg:w-80",
               )}
             >
               {showWorkbenchPanel && (
@@ -10232,6 +10530,7 @@ export default function ControlClient() {
                   isRunning={viewingMissionIsRunning}
                   childMissions={childMissions}
                   queueLen={viewingQueueLen}
+                  missionState={workbenchMissionState}
                   onClose={() => setShowWorkbenchPanel(false)}
                   onResume={handleResumeMission}
                   onCancel={handleCancelMission}

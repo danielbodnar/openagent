@@ -23,7 +23,6 @@ POST /api/workspaces
   "workspace_type": "host",
   "path": "/path/to/workspace",
   "skills": ["skill-name"],
-  "tools": ["tool-name"],
   "plugins": ["plugin-id"],
   "template": "template-name",
   "distro": "ubuntu-noble",
@@ -38,7 +37,6 @@ POST /api/workspaces
 | `workspace_type` | string | No | `host` or `container` (default: `host`) |
 | `path` | string | No | Custom working directory path |
 | `skills` | string[] | No | Library skill names to sync |
-| `tools` | string[] | No | Library tool names to sync |
 | `plugins` | string[] | No | Plugin identifiers for hooks |
 | `template` | string | No | Template name (forces `container` type) |
 | `distro` | string | No | Linux distro for containers |
@@ -68,7 +66,6 @@ PUT /api/workspaces/:id
 {
   "name": "new-name",
   "skills": ["skill-1", "skill-2"],
-  "tools": ["tool-1"],
   "plugins": ["plugin-id"],
   "template": "template-name",
   "distro": "ubuntu-noble",
@@ -146,8 +143,7 @@ Execute a shell command in the workspace. For container workspaces, runs inside 
   "command": "ls -la",
   "cwd": "subdirectory",
   "timeout_secs": 60,
-  "env": {"MY_VAR": "value"},
-  "stdin": "input data"
+  "env": {"MY_VAR": "value"}
 }
 ```
 
@@ -157,7 +153,6 @@ Execute a shell command in the workspace. For container workspaces, runs inside 
 | `cwd` | string | No | Working directory (relative or absolute) |
 | `timeout_secs` | number | No | Timeout in seconds (default: 300, max: 600) |
 | `env` | object | No | Additional environment variables |
-| `stdin` | string | No | Input to pass to stdin |
 
 **Response**:
 ```json
@@ -259,7 +254,7 @@ Returns detailed information about the container state, useful for understanding
 GET /api/workspaces/:id/init-log
 ```
 
-Reads the init script log from `/var/log/sandboxed.sh-init.log` inside the container.
+Reads the init script log from `/var/log/sandboxed-init.log` inside the container.
 
 **Response**:
 ```json
@@ -267,7 +262,7 @@ Reads the init script log from `/var/log/sandboxed.sh-init.log` inside the conta
   "exists": true,
   "content": "Starting init script\nRunning apt-get update...\n...",
   "total_lines": 1234,
-  "log_path": "/var/log/sandboxed.sh-init.log"
+  "log_path": "/var/log/sandboxed-init.log"
 }
 ```
 
@@ -416,7 +411,6 @@ DELETE /api/library/workspace-template/:name
   "error_message": null,
   "created_at": "2025-01-13T10:00:00Z",
   "skills": ["skill-1"],
-  "tools": ["tool-1"],
   "plugins": ["plugin-id"],
   "template": "nodejs-dev",
   "distro": "ubuntu-noble",

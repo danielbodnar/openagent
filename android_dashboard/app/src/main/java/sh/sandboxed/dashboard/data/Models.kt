@@ -9,6 +9,8 @@ import kotlinx.serialization.json.JsonObject
 enum class MissionStatus {
     @SerialName("pending") PENDING,
     @SerialName("active") ACTIVE,
+    @SerialName("awaiting_user") AWAITING_USER,
+    @SerialName("acknowledged") ACKNOWLEDGED,
     @SerialName("completed") COMPLETED,
     @SerialName("failed") FAILED,
     @SerialName("interrupted") INTERRUPTED,
@@ -16,7 +18,9 @@ enum class MissionStatus {
     @SerialName("not_feasible") NOT_FEASIBLE,
     @SerialName("unknown") UNKNOWN;
 
-    val canResume: Boolean get() = this == INTERRUPTED || this == BLOCKED
+    val canResume: Boolean get() = this == INTERRUPTED || this == BLOCKED || this == AWAITING_USER
+    val isOpen: Boolean get() = this == ACTIVE || this == PENDING || this == AWAITING_USER
+    val isDone: Boolean get() = this == COMPLETED || this == ACKNOWLEDGED
 }
 
 @Serializable
@@ -74,6 +78,8 @@ data class Workspace(
     val plugins: List<String> = emptyList(),
     val template: String? = null,
     val distro: String? = null,
+    @SerialName("env_vars") val envVars: Map<String, String> = emptyMap(),
+    val mcps: List<String> = emptyList(),
 ) {
     val isDefault: Boolean get() = id == "00000000-0000-0000-0000-000000000000"
 }
@@ -118,7 +124,14 @@ data class CreateMissionRequest(
 data class StatusUpdate(val status: String)
 
 @Serializable
-data class ControlMessageRequest(val content: String)
+data class ControlMessageRequest(
+    val content: String,
+    // Pins the send to the mission the user is looking at; without it the
+    // backend routes to its own "current" mission, which drifts when
+    // parallel missions are running.
+    @SerialName("mission_id") val missionId: String? = null,
+    @SerialName("client_message_id") val clientMessageId: String? = null,
+)
 
 @Serializable
 data class ControlMessageResponse(val id: String, val queued: Boolean = false)

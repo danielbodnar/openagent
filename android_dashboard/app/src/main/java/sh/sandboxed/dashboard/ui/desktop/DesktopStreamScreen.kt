@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.TouchApp
@@ -40,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,6 +55,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -66,6 +69,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import sh.sandboxed.dashboard.data.AppContainer
 import sh.sandboxed.dashboard.data.api.DesktopStreamEvent
+import sh.sandboxed.dashboard.ui.PipHost
+import sh.sandboxed.dashboard.ui.TestTags
+import sh.sandboxed.dashboard.ui.tag
 import sh.sandboxed.dashboard.ui.components.ErrorBanner
 import sh.sandboxed.dashboard.ui.theme.Palette
 import kotlin.math.roundToInt
@@ -174,18 +180,57 @@ private class DesktopStreamViewModel(
 }
 
 @Composable
-fun DesktopStreamScreen(container: AppContainer, initialDisplay: String) {
+fun DesktopStreamScreen(container: AppContainer, initialDisplay: String, pipHost: PipHost? = null) {
     val vm = remember(initialDisplay) { DesktopStreamViewModel(container, initialDisplay) }
     val state by vm.state.collectAsState()
     var typedText by remember { mutableStateOf("") }
     var frameSize by remember { mutableStateOf(IntSize.Zero) }
+    val inPip by (pipHost?.isInPipMode ?: remember { MutableStateFlow(false) }).collectAsState()
 
     DisposableEffect(vm) {
         onDispose { vm.disconnect() }
     }
 
+    // While a frame is streaming, register its aspect ratio and enable
+    // auto-enter so leaving the app keeps the desktop visible in a PiP window.
+    // Keyed on the frame dimensions (not the Bitmap object) so it doesn't fire
+    // every frame. Cleared on dispose so PiP only auto-enters from this screen.
+    val frameWidth = state.bitmap?.width
+    val frameHeight = state.bitmap?.height
+    LaunchedEffect(frameWidth, frameHeight, state.connected) {
+        if (frameWidth != null && frameHeight != null && state.connected) {
+            pipHost?.setPipActive(true, frameWidth, frameHeight)
+        } else {
+            pipHost?.setPipActive(false, 0, 0)
+        }
+    }
+    DisposableEffect(pipHost) {
+        onDispose { pipHost?.setPipActive(false, 0, 0) }
+    }
+
+    if (inPip) {
+        // PiP window: just the frame, full-bleed, no chrome or input.
+        Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+            state.bitmap?.let {
+                Image(
+                    bitmap = it.asImageBitmap(),
+                    contentDescription = "Desktop frame",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+        return
+    }
+
     Column(Modifier.fillMaxSize().background(Palette.BackgroundPrimary)) {
-        DesktopHeader(state = state, onPause = vm::togglePause, onReconnect = { vm.connect() })
+        DesktopHeader(
+            state = state,
+            pipSupported = pipHost?.isPipSupported == true,
+            onPause = vm::togglePause,
+            onReconnect = { vm.connect() },
+            onPip = { pipHost?.enterPip() },
+        )
         DisplayPicker(current = state.display, onSelect = { vm.connect(it) })
         Box(
             modifier = Modifier
@@ -216,7 +261,7 @@ fun DesktopStreamScreen(container: AppContainer, initialDisplay: String) {
                 error != null -> {
                     Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         ErrorBanner(error)
-                        Button(onClick = { vm.connect() }, colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent)) {
+                        Button(onClick = { vm.connect() }, colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent), modifier = Modifier.tag(TestTags.DESKTOP_RETRY)) {
                             Text("Retry")
                         }
                     }
@@ -248,8 +293,10 @@ fun DesktopStreamScreen(container: AppContainer, initialDisplay: String) {
 @Composable
 private fun DesktopHeader(
     state: DesktopStreamState,
+    pipSupported: Boolean,
     onPause: () -> Unit,
     onReconnect: () -> Unit,
+    onPip: () -> Unit,
 ) {
     Row(
         Modifier.fillMaxWidth().background(Palette.BackgroundSecondary).padding(horizontal = 16.dp, vertical = 12.dp),
@@ -263,7 +310,12 @@ private fun DesktopHeader(
                 style = MaterialTheme.typography.bodySmall,
             )
         }
-        IconButton(onClick = onPause, enabled = state.connected) {
+        if (pipSupported) {
+            IconButton(onClick = onPip, enabled = state.connected && state.bitmap != null, modifier = Modifier.tag(TestTags.DESKTOP_PIP)) {
+                Icon(Icons.Filled.PictureInPictureAlt, "Picture in picture", tint = Palette.Accent)
+            }
+        }
+        IconButton(onClick = onPause, enabled = state.connected, modifier = Modifier.tag(TestTags.DESKTOP_PAUSE)) {
             Icon(if (state.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause, "Pause stream", tint = Palette.Accent)
         }
         IconButton(onClick = onReconnect) {
@@ -285,6 +337,7 @@ private fun DisplayPicker(current: String, onSelect: (String) -> Unit) {
                 selected = current == display,
                 onClick = { onSelect(display) },
                 label = { Text(display, style = MaterialTheme.typography.labelMedium) },
+                modifier = Modifier.tag(TestTags.desktopDisplay(display)),
                 colors = FilterChipDefaults.filterChipColors(
                     containerColor = Palette.Card,
                     selectedContainerColor = Palette.Accent.copy(alpha = 0.18f),
@@ -343,18 +396,18 @@ private fun DesktopControls(
                 onValueChange = onTypedText,
                 singleLine = true,
                 placeholder = { Text("Type text", color = Palette.TextMuted) },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).tag(TestTags.DESKTOP_TYPE_TEXT),
                 colors = controlFieldColors(),
             )
-            Button(onClick = onType, enabled = typedText.isNotBlank(), colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent)) {
+            Button(onClick = onType, enabled = typedText.isNotBlank(), colors = ButtonDefaults.buttonColors(containerColor = Palette.Accent), modifier = Modifier.tag(TestTags.DESKTOP_TYPE_SUBMIT)) {
                 Text("Type")
             }
         }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            item { QuickKey("Return") { onKey("Return") } }
-            item { QuickKey("Esc") { onKey("Escape") } }
-            item { QuickKey("Ctrl+L") { onKey("ctrl+l") } }
-            item { QuickKey("Tab") { onKey("Tab") } }
+            item { QuickKey("Return", TestTags.DESKTOP_KEY_RETURN) { onKey("Return") } }
+            item { QuickKey("Esc", TestTags.DESKTOP_KEY_ESC) { onKey("Escape") } }
+            item { QuickKey("Ctrl+L", TestTags.DESKTOP_KEY_CTRL_L) { onKey("ctrl+l") } }
+            item { QuickKey("Tab", TestTags.DESKTOP_KEY_TAB) { onKey("Tab") } }
             item {
                 IconButton(onClick = { onScroll(-360) }) {
                     Icon(Icons.Filled.KeyboardArrowUp, "Scroll up", tint = Palette.TextSecondary)
@@ -384,8 +437,8 @@ private fun SliderRow(label: String, value: Int, minLabel: String, maxLabel: Str
 }
 
 @Composable
-private fun QuickKey(label: String, onClick: () -> Unit) {
-    Button(onClick = onClick, colors = ButtonDefaults.buttonColors(containerColor = Palette.Card)) {
+private fun QuickKey(label: String, tag: String, onClick: () -> Unit) {
+    Button(onClick = onClick, colors = ButtonDefaults.buttonColors(containerColor = Palette.Card), modifier = Modifier.testTag(tag)) {
         Text(label, color = Palette.TextPrimary, style = MaterialTheme.typography.labelMedium)
     }
 }

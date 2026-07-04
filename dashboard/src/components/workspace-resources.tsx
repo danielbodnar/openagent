@@ -6,7 +6,10 @@
  * Shows the aggregated memory consumption of the workspace's transient
  * mission scopes (boot + exec) and lets the operator retune the caps:
  * applied live to running scopes via `systemctl set-property --runtime`
- * and persisted as workspace env overrides (MISSION_MEMORY_*).
+ * and persisted as workspace env overrides (MISSION_MEMORY_* / MISSION_CPU_*).
+ *
+ * CPU caps keep one mission's runaway build (e.g. a Lean/proof fan-out) from
+ * saturating every core and starving the harness's own response streaming.
  */
 
 import { useState } from 'react';
@@ -26,6 +29,8 @@ function formatBytes(bytes: number | null): string {
 }
 
 const MEM_VALUE_RE = /^(\d+(\.\d+)?[KMGTkmgt]?|\d+(\.\d+)?%|infinity)?$/;
+const CPU_WEIGHT_RE = /^(\d{1,5}|idle)?$/;
+const CPU_QUOTA_RE = /^(\d+(\.\d+)?%|infinity)?$/;
 
 export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
   const { data: stats, mutate } = useSWR(
@@ -36,6 +41,8 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
 
   const [memoryHigh, setMemoryHigh] = useState('');
   const [memoryMax, setMemoryMax] = useState('');
+  const [cpuWeight, setCpuWeight] = useState('');
+  const [cpuQuota, setCpuQuota] = useState('');
   const [applying, setApplying] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -48,8 +55,15 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
       : null;
 
   const inputsValid =
-    MEM_VALUE_RE.test(memoryHigh.trim()) && MEM_VALUE_RE.test(memoryMax.trim());
-  const hasInput = memoryHigh.trim() !== '' || memoryMax.trim() !== '';
+    MEM_VALUE_RE.test(memoryHigh.trim()) &&
+    MEM_VALUE_RE.test(memoryMax.trim()) &&
+    CPU_WEIGHT_RE.test(cpuWeight.trim()) &&
+    CPU_QUOTA_RE.test(cpuQuota.trim());
+  const hasInput =
+    memoryHigh.trim() !== '' ||
+    memoryMax.trim() !== '' ||
+    cpuWeight.trim() !== '' ||
+    cpuQuota.trim() !== '';
 
   const apply = async () => {
     if (!hasInput || !inputsValid) return;
@@ -60,6 +74,8 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
       const res = await updateWorkspaceResources(workspaceId, {
         ...(memoryHigh.trim() !== '' ? { memory_high: memoryHigh.trim() } : {}),
         ...(memoryMax.trim() !== '' ? { memory_max: memoryMax.trim() } : {}),
+        ...(cpuWeight.trim() !== '' ? { cpu_weight: cpuWeight.trim() } : {}),
+        ...(cpuQuota.trim() !== '' ? { cpu_quota: cpuQuota.trim() } : {}),
         persist: true,
         apply_live: true,
       });
@@ -80,6 +96,8 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
       }
       setMemoryHigh('');
       setMemoryMax('');
+      setCpuWeight('');
+      setCpuQuota('');
       mutate();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to update resources');
@@ -99,6 +117,8 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
       const res = await updateWorkspaceResources(workspaceId, {
         memory_high: '',
         memory_max: '',
+        cpu_weight: '',
+        cpu_quota: '',
         persist: true,
         apply_live: true,
       });
@@ -119,6 +139,8 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
       }
       setMemoryHigh('');
       setMemoryMax('');
+      setCpuWeight('');
+      setCpuQuota('');
       mutate();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to reset resources');
@@ -136,8 +158,8 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
             Resources
           </p>
           <p className="text-[10px] text-white/30 mt-0.5">
-            Memory caps for this workspace&apos;s mission scopes. Changes apply live —
-            no restart needed.
+            Memory + CPU caps for this workspace&apos;s mission scopes. Changes
+            apply live — no restart needed.
           </p>
         </div>
         <span className="text-xs font-mono text-white/70">
@@ -210,6 +232,33 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
         </button>
       </div>
 
+      <div className="mt-2 flex items-end gap-2">
+        <div className="flex-1">
+          <label className="text-[10px] text-white/40 block mb-1">
+            CPUWeight (1–10000)
+          </label>
+          <input
+            type="text"
+            value={cpuWeight}
+            onChange={(e) => setCpuWeight(e.target.value)}
+            placeholder="e.g. 30 (lower = yields)"
+            className="w-full rounded-lg border border-white/[0.06] bg-black/20 px-2.5 py-1.5 text-xs text-white font-mono placeholder:text-white/20 focus:border-indigo-500/50 focus:outline-none"
+          />
+        </div>
+        <div className="flex-1">
+          <label className="text-[10px] text-white/40 block mb-1">
+            CPUQuota (ceiling)
+          </label>
+          <input
+            type="text"
+            value={cpuQuota}
+            onChange={(e) => setCpuQuota(e.target.value)}
+            placeholder="e.g. 400% (= 4 cores)"
+            className="w-full rounded-lg border border-white/[0.06] bg-black/20 px-2.5 py-1.5 text-xs text-white font-mono placeholder:text-white/20 focus:border-indigo-500/50 focus:outline-none"
+          />
+        </div>
+      </div>
+
       <button
         onClick={resetDefaults}
         disabled={applying}
@@ -220,7 +269,8 @@ export function WorkspaceResources({ workspaceId }: { workspaceId: string }) {
 
       {!inputsValid && hasInput && (
         <p className="text-[10px] text-red-300/80 mt-1.5">
-          Values: bytes with K/M/G/T suffix, %, or &quot;infinity&quot;.
+          Memory: bytes with K/M/G/T suffix, %, or &quot;infinity&quot;. CPUWeight:
+          1–10000 or &quot;idle&quot;. CPUQuota: a percentage like &quot;400%&quot;.
         </p>
       )}
       {result && <p className="text-[10px] text-emerald-300/80 mt-1.5">{result}</p>}

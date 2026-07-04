@@ -8,7 +8,7 @@ The Android app is published on Zapstore:
 
 https://zapstore.dev/apps/sh.sandboxed.dashboard
 
-## What's in v0.2.0
+## What's in the app
 
 ### Bottom-tab screens
 
@@ -43,7 +43,7 @@ https://zapstore.dev/apps/sh.sandboxed.dashboard
 | --- | --- |
 | Language | Kotlin 2.0.21 |
 | Build | AGP 8.9.1, Gradle 8.11.1 |
-| SDK | `compileSdk` 36, `targetSdk` 36, `minSdk` 26 (Android 8.0) |
+| SDK | `compileSdk` 36, `targetSdk` 36, `minSdk` 33 (Android 13) |
 | UI | Jetpack Compose (BOM 2024.12.01), Material 3 with `material-icons-extended` |
 | Navigation | `androidx.navigation:navigation-compose` 2.9.8 |
 | State | ViewModel + StateFlow, Compose `collectAsState` |
@@ -264,75 +264,12 @@ The release `signingConfig` only kicks in if `RELEASE_KEYSTORE` is set; without 
 
 ## Release to Zapstore
 
-Zapstore metadata lives in `zapstore.yaml`. The published app page is:
+See **[PUBLISHING.md](PUBLISHING.md)** for the full runbook: GitHub release via
+the `android-vX.Y.Z` tag, then `zsp publish` with NIP-46 bunker signing —
+including every known failure mode. Zapstore metadata lives in `zapstore.yaml`.
+The published app page is:
 
 https://zapstore.dev/apps/sh.sandboxed.dashboard
-
-### Prerequisites
-
-- `~/go/bin/zsp` is installed.
-- The release APK exists at `app/build/outputs/apk/release/app-release.apk`.
-- The zsp bunker pairing from Oubli is present locally. The paired bunker pubkey is:
-  `7ebbce1843a17cd778a5e169e3d2f679f5ac7b5125d1c43d265e190f7b27538c`
-
-zsp stores the local client key for that bunker under the user config directory
-(`~/Library/Application Support/zsp/bunker-keys/` on macOS). Do not commit bunker
-URLs that include a `secret=` parameter or any Nostr private key.
-
-### Publish
-
-Build the signed release APK first, or download the APK from the GitHub release
-you want to publish.
-
-```bash
-cd android_dashboard
-source keys/release-secrets.env
-./gradlew :app:assembleRelease
-```
-
-To publish an APK that was already built by GitHub Actions:
-
-```bash
-TAG=v1.3.0
-rm -rf "/tmp/sandboxed-zapstore-${TAG}"
-mkdir -p "/tmp/sandboxed-zapstore-${TAG}"
-gh release download "${TAG}" \
-  --repo adrienlacombe/sandboxed.sh \
-  --pattern "sandboxed-dashboard-${TAG}.apk" \
-  --dir "/tmp/sandboxed-zapstore-${TAG}"
-
-mkdir -p app/build/outputs/apk/release
-cp "/tmp/sandboxed-zapstore-${TAG}/sandboxed-dashboard-${TAG}.apk" \
-  app/build/outputs/apk/release/app-release.apk
-shasum -a 256 app/build/outputs/apk/release/app-release.apk
-```
-
-Validate that zsp can read the APK and config:
-
-```bash
-GITHUB_TOKEN="$(gh auth token)" ~/go/bin/zsp publish --check zapstore.yaml
-```
-
-Publish with the same bunker signer used by Oubli:
-
-```bash
-SIGN_WITH="bunker://7ebbce1843a17cd778a5e169e3d2f679f5ac7b5125d1c43d265e190f7b27538c?relay=wss://relay.nsec.app" \
-GITHUB_TOKEN="$(gh auth token)" \
-  ~/go/bin/zsp publish -q --skip-preview --skip-certificate-linking zapstore.yaml
-```
-
-Approve the signing requests in the remote signer if prompted. A successful run
-ends with:
-
-```text
-Published sh.sandboxed.dashboard <version> to wss://relay.zapstore.dev
-```
-
-If you need to republish the same version after changing metadata or assets, add
-`--overwrite-release`.
-
-Record the published APK SHA-256 in release notes or deployment notes after
-publishing.
 
 ### Lint
 

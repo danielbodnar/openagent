@@ -249,6 +249,107 @@ struct RemoveWorktreeParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct PlanWorktreeSpec {
+    /// Absolute path where the worktree will be created
+    path: String,
+    /// Branch name (created from `base` if it doesn't exist)
+    branch: String,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    repo_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanTaskSpec {
+    /// Stable key unique on this board; used in depends_on and digests
+    task_key: String,
+    title: String,
+    /// Full worker prompt: scope, absolute paths, success condition,
+    /// verification command. The done/BLOCKED turn contract is appended
+    /// automatically by the scheduler.
+    prompt: String,
+    /// Worker backend (codex, opencode, grok, ...). Never claudecode.
+    backend: String,
+    #[serde(default)]
+    model_override: Option<String>,
+    #[serde(default)]
+    model_effort: Option<String>,
+    /// Working directory for the worker. Overridden by `worktree.path` when a
+    /// worktree spec is given.
+    #[serde(default)]
+    working_directory: Option<String>,
+    /// Task keys (this board) that must settle successfully or be accepted first
+    #[serde(default)]
+    depends_on: Vec<String>,
+    /// Create an isolated git worktree for the worker before registering
+    #[serde(default)]
+    worktree: Option<PlanWorktreeSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanTasksParams {
+    tasks: Vec<PlanTaskSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskRefParams {
+    /// Task key on this board (preferred)
+    #[serde(default)]
+    task_key: Option<String>,
+    /// Task UUID (alternative to task_key)
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RejectTaskParams {
+    #[serde(default)]
+    task_key: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    /// Feedback delivered to the worker (what's wrong, what to change)
+    feedback: String,
+}
+
+fn default_review_history() -> usize {
+    6
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewTaskParams {
+    #[serde(default)]
+    task_key: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    /// How many history entries from the worker mission to include
+    #[serde(default = "default_review_history")]
+    history_limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeBranchParams {
+    /// Branch to merge from (a worker's worktree branch)
+    source_branch: String,
+    /// Branch to merge into (e.g. the PR branch)
+    target_branch: String,
+    #[serde(default)]
+    repo_path: Option<String>,
+    /// Push the target branch to origin after a clean merge
+    #[serde(default)]
+    push: bool,
+    /// Delete the source branch after a clean merge
+    #[serde(default)]
+    delete_source: bool,
+    /// Backend for the auto-registered conflict-resolver task (default codex)
+    #[serde(default)]
+    resolver_backend: Option<String>,
+    /// Model for the resolver task (default gpt-5.5)
+    #[serde(default)]
+    resolver_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct WaitForWorkerParams {
     /// UUID of the worker mission to wait for
     mission_id: String,
@@ -499,8 +600,103 @@ impl OrchestratorMcp {
                 }),
             },
             ToolDefinition {
+                name: "plan_tasks".to_string(),
+                description: "PREFERRED orchestration tool. Register tasks on this mission's task board. The server-side scheduler then owns everything mechanical: it spawns a worker mission for every dependency-satisfied task while capacity allows, retries failures once, and MESSAGES YOU A DIGEST as each task settles. You never create workers, wait, or poll. Each task needs: task_key (stable, unique), title, full prompt (scope, absolute paths, success condition, verification command — the done/BLOCKED turn contract is appended automatically), backend (codex/opencode/grok — never claudecode), and optionally model_override/model_effort, depends_on (keys of tasks that must settle successfully first), and worktree {path, branch, base} for an isolated checkout (created here, before registration). Re-calling with an existing key updates the task while it is still pending. After planning: END YOUR TURN — digests will wake you.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["tasks"],
+                    "properties": {
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["task_key", "title", "prompt", "backend"],
+                                "properties": {
+                                    "task_key": { "type": "string", "description": "Stable unique key on this board (e.g. 'p3-nonce')" },
+                                    "title": { "type": "string" },
+                                    "prompt": { "type": "string", "description": "Full worker prompt: exact scope, absolute paths, success condition, verification command" },
+                                    "backend": { "type": "string", "description": "codex | opencode | grok (never claudecode)" },
+                                    "model_override": { "type": "string" },
+                                    "model_effort": { "type": "string", "description": "low | medium | high | xhigh (codex)" },
+                                    "working_directory": { "type": "string", "description": "Worker cwd; superseded by worktree.path if a worktree is given" },
+                                    "depends_on": { "type": "array", "items": { "type": "string" }, "description": "task_keys that must settle successfully or be accepted first" },
+                                    "worktree": {
+                                        "type": "object",
+                                        "required": ["path", "branch"],
+                                        "properties": {
+                                            "path": { "type": "string", "description": "Absolute worktree path (inside the workspace)" },
+                                            "branch": { "type": "string" },
+                                            "base": { "type": "string", "description": "Base branch/commit (default HEAD)" },
+                                            "repo_path": { "type": "string", "description": "Repo owning the worktree (auto-detected if omitted)" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "board_status".to_string(),
+                description: "Current task board: every task with status (pending/running/settled/accepted/failed/cancelled), outcome, worker mission id, digest, plus utilization counters. Cheap snapshot — use instead of list_worker_missions/get_worker_status for board work.".to_string(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            },
+            ToolDefinition {
+                name: "review_task".to_string(),
+                description: "Full review payload for a board task: the task record (prompt, digest, notes) plus the tail of the worker mission's conversation. Use before accept_task/reject_task when the digest alone isn't enough to judge.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_key": { "type": "string", "description": "Task key on this board (preferred)" },
+                        "task_id": { "type": "string", "description": "Task UUID (alternative)" },
+                        "history_limit": { "type": "integer", "description": "Worker history entries to include (default 6)" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "accept_task".to_string(),
+                description: "Accept a settled task's result (terminal verdict). Unblocks nothing extra — successful settles already unblock dependents — but records your judgment and clears the awaiting-verdict queue.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "task_key": { "type": "string" },
+                        "task_id": { "type": "string" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "reject_task".to_string(),
+                description: "Reject a settled (or failed) task with feedback. The worker mission is resumed with your feedback so it keeps its context; if the worker is gone the task is re-queued with the feedback appended to its prompt. You'll get a fresh digest when it settles again.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["feedback"],
+                    "properties": {
+                        "task_key": { "type": "string" },
+                        "task_id": { "type": "string" },
+                        "feedback": { "type": "string", "description": "What is wrong and what to change — delivered verbatim to the worker" }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "merge_branch".to_string(),
+                description: "Merge a worker branch into a target branch (e.g. worker worktree branch → PR branch). Clean merge: optionally push and delete the source branch. Conflict: the merge is aborted safely and a conflict-resolver task is registered on the board automatically — you'll get a digest when it settles. This makes splitting one PR across several worktree workers routine.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["source_branch", "target_branch"],
+                    "properties": {
+                        "source_branch": { "type": "string" },
+                        "target_branch": { "type": "string" },
+                        "repo_path": { "type": "string", "description": "Repo directory (auto-detected if omitted). Must be checked out on target_branch or switchable to it." },
+                        "push": { "type": "boolean", "description": "Push target to origin after a clean merge" },
+                        "delete_source": { "type": "boolean", "description": "Delete the source branch after a clean merge" },
+                        "resolver_backend": { "type": "string", "description": "Backend for the auto conflict-resolver task (default codex)" },
+                        "resolver_model": { "type": "string", "description": "Model for the resolver task (default gpt-5.5)" }
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "create_worker_mission".to_string(),
-                description: "Create a new worker mission (child of the current boss mission). The worker will start executing immediately and runs in the same workspace as the boss by default, so it sees the boss's container, mounts, and installed tooling. IMPORTANT: You must set the 'backend' field to match the harness you want (claudecode, codex, gemini, grok, opencode). If omitted, defaults to the workspace default (usually claudecode).".to_string(),
+                description: "LEGACY — prefer plan_tasks, which schedules, retries, and notifies automatically. Create a new worker mission (child of the current boss mission). The worker will start executing immediately and runs in the same workspace as the boss by default, so it sees the boss's container, mounts, and installed tooling. IMPORTANT: You must set the 'backend' field to match the harness you want (claudecode, codex, gemini, grok, opencode). If omitted, defaults to the workspace default (usually claudecode).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["title", "prompt"],
@@ -754,7 +950,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "wait_for_worker".to_string(),
-                description: "Block until a single worker mission reaches a terminal status. Use wait_for_any_worker to monitor multiple workers simultaneously.".to_string(),
+                description: "Block until a single worker mission reaches a settled status (including awaiting_user, the normal end-of-turn state). Prefer wait_for_any_worker to monitor multiple workers simultaneously — blocking on one worker while others sit idle serializes your pipeline. For waits beyond a few minutes, end your turn and schedule a wakeup instead of polling (each ~90s poll costs a model call).".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_id"],
@@ -766,7 +962,7 @@ impl OrchestratorMcp {
                         "target_statuses": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Statuses to wait for (default: ['completed', 'failed', 'interrupted'])"
+                            "description": "Statuses to wait for (default: ['completed', 'awaiting_user', 'failed', 'interrupted', 'not_feasible'])"
                         },
                         "timeout_seconds": {
                             "type": "integer",
@@ -781,7 +977,7 @@ impl OrchestratorMcp {
             },
             ToolDefinition {
                 name: "wait_for_any_worker".to_string(),
-                description: "Block until ANY of the specified worker missions reaches a terminal status. Returns the first worker that finishes. Use this to monitor a pool of workers and react as each completes.".to_string(),
+                description: "Block until ANY of the specified worker missions reaches a settled status (including awaiting_user, the normal end-of-turn state). Returns the first worker that settles. Use this to monitor a pool of workers and react as each completes. PARALLELISM: when this returns, re-dispatch ALL idle workers (resume_worker / create_worker_mission for every independent track) BEFORE doing any deep analysis of the returned result — workers sitting in awaiting_user are wasted capacity while you read logs. TOKEN ECONOMY: the wait is capped at ~90s per call, so polling a long-running worker burns one of YOUR model calls per 90s. If no worker is likely to finish within a couple of polls, END YOUR TURN and schedule a wakeup (ScheduleWakeup, 10-30 min) instead — check workers once per wakeup.".to_string(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["mission_ids"],
@@ -794,7 +990,7 @@ impl OrchestratorMcp {
                         "target_statuses": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Statuses to wait for (default: ['completed', 'failed', 'interrupted'])"
+                            "description": "Statuses to wait for (default: ['completed', 'awaiting_user', 'failed', 'interrupted', 'not_feasible'])"
                         },
                         "timeout_seconds": {
                             "type": "integer",
@@ -893,6 +1089,37 @@ impl OrchestratorMcp {
     }
 
     async fn create_worker(&self, params: CreateWorkerParams) -> Result<Value, String> {
+        // Worker model allowlist: Claude models are reserved for the boss and
+        // the oracle; spending them on workers defeats the budget the policy
+        // protects. Prompt-level policy proved insufficient (two violations in
+        // one campaign), so this is enforced here. Override with
+        // SANDBOXED_SH_ALLOW_CLAUDE_WORKERS=1 when the operator explicitly
+        // approves a Claude worker.
+        let claude_worker = params.backend.as_deref() == Some("claudecode")
+            || params
+                .model_override
+                .as_deref()
+                .map(|m| m.to_ascii_lowercase().contains("claude"))
+                .unwrap_or(false);
+        let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // Omitted backend/model would fall through to the server-side default
+        // (which may be a Claude backend) — require an explicit choice so the
+        // policy cannot be bypassed by omission.
+        if !claude_allowed && params.backend.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(
+                "Refused: specify an explicit non-Claude `backend` (and matching                  `model_override`) for worker missions — omitting it falls back to                  the server default, which may be a Claude backend (operator policy)."
+                    .to_string(),
+            );
+        }
+        if claude_worker && !claude_allowed {
+            return Err(
+                "Refused: Claude models/backends are not allowed for worker missions                  (operator policy). Use opencode+builtin/smart, opencode+genius,                  codex+gpt-5.5, or grok instead. If the operator explicitly approved a                  Claude worker, set SANDBOXED_SH_ALLOW_CLAUDE_WORKERS=1."
+                    .to_string(),
+            );
+        }
+
         // Fail fast if working_directory points outside the boss's container
         // workspace mount: the worker container will not be able to see paths
         // outside the bind-mounted workspace root, so accepting the request
@@ -921,6 +1148,12 @@ impl OrchestratorMcp {
             "parent_mission_id": self.mission_id.to_string(),
             "working_directory": params.working_directory,
             "workspace_id": workspace_id,
+            // Atomic create+start: the API stores the prompt as the mission's
+            // deferred goal and the scheduler dispatches it once capacity
+            // allows. The old create-then-message pattern could be dropped at
+            // capacity, leaving a zombie Pending worker the boss believed was
+            // running.
+            "prompt": params.prompt,
         });
 
         let response = self.api_post("/api/control/missions", body).await?;
@@ -933,21 +1166,6 @@ impl OrchestratorMcp {
             .json()
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        let worker_id = mission["id"].as_str().unwrap_or("");
-
-        // If a prompt was provided, send it as the first message
-        if let Some(prompt) = params.prompt {
-            if !prompt.trim().is_empty() && !worker_id.is_empty() {
-                let msg_body = json!({
-                    "content": prompt,
-                    "mission_id": worker_id,
-                });
-                if let Err(e) = self.api_post("/api/control/message", msg_body).await {
-                    eprintln!("[orchestrator-mcp] Warning: created mission but failed to send initial prompt: {}", e);
-                }
-            }
-        }
 
         Ok(mission)
     }
@@ -1504,6 +1722,337 @@ impl OrchestratorMcp {
         }))
     }
 
+    // ---- Task board -------------------------------------------------------
+
+    /// Register tasks on this boss mission's board. The server-side scheduler
+    /// spawns workers for ready tasks automatically — no create/wait calls.
+    async fn plan_tasks(&self, params: PlanTasksParams) -> Result<Value, String> {
+        if params.tasks.is_empty() {
+            return Err("tasks is required".to_string());
+        }
+
+        let claude_allowed = std::env::var("SANDBOXED_SH_ALLOW_CLAUDE_WORKERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let mut registered = Vec::with_capacity(params.tasks.len());
+        let mut worktrees_created = Vec::new();
+        for spec in params.tasks {
+            // Same operator policy as create_worker_mission: workers never
+            // burn Claude tokens.
+            let is_claude = spec.backend.eq_ignore_ascii_case("claudecode")
+                || spec
+                    .model_override
+                    .as_deref()
+                    .map(|m| m.to_ascii_lowercase().contains("claude"))
+                    .unwrap_or(false);
+            if spec.backend.trim().is_empty() || (is_claude && !claude_allowed) {
+                return Err(format!(
+                    "task `{}`: specify an explicit non-Claude backend (got `{}`) — \
+                     use codex, opencode, or grok (operator policy)",
+                    spec.task_key, spec.backend
+                ));
+            }
+
+            let working_directory = if let Some(wt) = &spec.worktree {
+                self.create_worktree(CreateWorktreeParams {
+                    path: wt.path.clone(),
+                    branch: wt.branch.clone(),
+                    base: wt.base.clone(),
+                    repo_path: wt.repo_path.clone(),
+                })
+                .map_err(|e| format!("task `{}`: worktree failed: {}", spec.task_key, e))?;
+                worktrees_created.push(json!({
+                    "task_key": spec.task_key,
+                    "path": wt.path,
+                    "branch": wt.branch,
+                }));
+                Some(wt.path.clone())
+            } else {
+                spec.working_directory.clone()
+            };
+            if let Some(wd) = working_directory.as_deref() {
+                validate_working_directory_visible_to_worker(wd)?;
+            }
+
+            registered.push(json!({
+                "task_key": spec.task_key,
+                "title": spec.title,
+                "prompt": spec.prompt,
+                "backend": spec.backend,
+                "model_override": spec.model_override,
+                "model_effort": spec.model_effort,
+                "working_directory": working_directory,
+                "depends_on": spec.depends_on,
+            }));
+        }
+
+        let response = self
+            .api_post(
+                &format!("/api/control/missions/{}/board/tasks", self.mission_id),
+                json!({ "tasks": registered }),
+            )
+            .await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to register board tasks: {}", text));
+        }
+        let mut board: Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse board response: {}", e))?;
+        if let Some(obj) = board.as_object_mut() {
+            obj.insert("worktrees_created".to_string(), json!(worktrees_created));
+            obj.insert(
+                "hint".to_string(),
+                json!(
+                    "Tasks registered. The scheduler spawns workers automatically and will \
+                     message you a digest as each task settles. Do NOT wait or poll — end \
+                     your turn now."
+                ),
+            );
+        }
+        Ok(board)
+    }
+
+    /// Current board state with utilization counters.
+    async fn board_status(&self) -> Result<Value, String> {
+        let response = self
+            .api_get(&format!("/api/control/missions/{}/board", self.mission_id))
+            .await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed to fetch board: {}", text));
+        }
+        response
+            .json::<Value>()
+            .await
+            .map_err(|e| format!("Failed to parse board: {}", e))
+    }
+
+    /// Resolve a task by key (on this board) or by UUID.
+    async fn resolve_board_task(
+        &self,
+        task_key: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let board = self.board_status().await?;
+        let tasks = board["tasks"]
+            .as_array()
+            .ok_or("Malformed board response")?;
+        let found = tasks.iter().find(|t| match (task_key, task_id) {
+            (Some(k), _) => t["task_key"].as_str() == Some(k),
+            (None, Some(id)) => t["id"].as_str() == Some(id),
+            (None, None) => false,
+        });
+        found.cloned().ok_or_else(|| {
+            format!(
+                "Task not found (key={:?}, id={:?}). Keys on this board: {}",
+                task_key,
+                task_id,
+                tasks
+                    .iter()
+                    .filter_map(|t| t["task_key"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+    }
+
+    /// Full review payload for a settled task: the task record plus the tail
+    /// of the worker mission's conversation.
+    async fn review_task(&self, params: ReviewTaskParams) -> Result<Value, String> {
+        let task = self
+            .resolve_board_task(params.task_key.as_deref(), params.task_id.as_deref())
+            .await?;
+        let mut out = json!({ "task": task });
+        if let Some(worker_id) = task["worker_mission_id"].as_str() {
+            let response = self
+                .api_get(&format!("/api/control/missions/{}", worker_id))
+                .await?;
+            if response.status().is_success() {
+                if let Ok(mission) = response.json::<Value>().await {
+                    let history = mission["history"].as_array().cloned().unwrap_or_default();
+                    let tail: Vec<Value> = history
+                        .iter()
+                        .rev()
+                        .take(params.history_limit.max(1))
+                        .rev()
+                        .cloned()
+                        .collect();
+                    out["worker_history_tail"] = json!(tail);
+                    out["worker_status"] = mission["status"].clone();
+                    out["worker_working_directory"] = mission["working_directory"].clone();
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn task_verdict(
+        &self,
+        task_key: Option<&str>,
+        task_id: Option<&str>,
+        action: &str,
+        feedback: Option<&str>,
+    ) -> Result<Value, String> {
+        let task = self.resolve_board_task(task_key, task_id).await?;
+        let id = task["id"].as_str().ok_or("Malformed task record")?;
+        let response = self
+            .api_post(
+                &format!("/api/control/board/tasks/{}/verdict", id),
+                json!({ "action": action, "feedback": feedback }),
+            )
+            .await?;
+        if !response.status().is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Verdict failed: {}", text));
+        }
+        response
+            .json::<Value>()
+            .await
+            .map_err(|e| format!("Failed to parse verdict response: {}", e))
+    }
+
+    /// Merge a worker branch into a target branch. On conflict the merge is
+    /// aborted and a resolver task is registered on the board automatically.
+    async fn merge_branch(&self, params: MergeBranchParams) -> Result<Value, String> {
+        let repo_dir = resolve_repo_path(params.repo_path.as_deref());
+        let source = params.source_branch.trim();
+        let target = params.target_branch.trim();
+        if source.is_empty() || target.is_empty() {
+            return Err("source_branch and target_branch are required".to_string());
+        }
+
+        let run = |args: &[&str]| -> Result<(bool, String), String> {
+            let output = Command::new("git")
+                .current_dir(&repo_dir)
+                .args(args)
+                .output()
+                .map_err(|e| format!("Failed to run git {:?}: {}", args, e))?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok((output.status.success(), text))
+        };
+
+        // The main checkout must be on the target branch; checking it out
+        // under a running worker would yank files out from under it.
+        let (ok, head) = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+        if !ok {
+            return Err(format!("git rev-parse failed in {}: {}", repo_dir, head));
+        }
+        let head = head.trim().to_string();
+        if head != target {
+            let (ok, out) = run(&["checkout", target])?;
+            if !ok {
+                return Err(format!(
+                    "Cannot checkout target branch `{}` (HEAD is `{}`): {}",
+                    target, head, out
+                ));
+            }
+        }
+
+        let (merged, merge_out) = run(&["merge", "--no-edit", source])?;
+        if merged {
+            let mut result = json!({
+                "merged": true,
+                "source_branch": source,
+                "target_branch": target,
+                "repo_path": repo_dir,
+                "output": merge_out.trim(),
+            });
+            if params.push {
+                let (pushed, push_out) = run(&["push", "origin", target])?;
+                result["pushed"] = json!(pushed);
+                if !pushed {
+                    result["push_error"] = json!(push_out.trim());
+                }
+            }
+            if params.delete_source {
+                let (deleted, del_out) = run(&["branch", "-D", source])?;
+                result["source_deleted"] = json!(deleted);
+                if !deleted {
+                    result["delete_error"] = json!(del_out.trim());
+                }
+            }
+            return Ok(result);
+        }
+
+        // Conflict (or other merge failure): collect conflicted files, abort,
+        // and register a resolver task.
+        let (_, conflicted) = run(&["diff", "--name-only", "--diff-filter=U"])?;
+        let conflicted_files: Vec<String> = conflicted
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let _ = run(&["merge", "--abort"]);
+
+        if conflicted_files.is_empty() {
+            // Not a content conflict — surface the raw error instead of
+            // spawning a resolver that can't do anything.
+            return Err(format!(
+                "git merge failed (no conflicted files detected): {}",
+                merge_out.trim()
+            ));
+        }
+
+        let stamp = chrono::Utc::now().format("%H%M%S");
+        let resolver_key = format!("merge-{}-{}", source.replace('/', "_"), stamp);
+        let resolver_prompt = format!(
+            "Merge conflict resolution in {repo}.\n\
+             Run: `git checkout {target}` then `git merge --no-edit {source}`.\n\
+             Conflicted files:\n{files}\n\
+             Resolve every conflict so BOTH changes' intent is preserved (read both branch \
+             histories with `git log {target} -5 --oneline` and `git log {source} -5 --oneline` \
+             for context). After resolving: build/verify, `git add -A`, `git commit --no-edit`. \
+             Do NOT push. Success condition: merge commit exists on `{target}` and verification \
+             passes.",
+            repo = repo_dir,
+            target = target,
+            source = source,
+            files = conflicted_files.join("\n"),
+        );
+        let resolver = self
+            .plan_tasks(PlanTasksParams {
+                tasks: vec![PlanTaskSpec {
+                    task_key: resolver_key.clone(),
+                    title: format!("Resolve merge conflict {} → {}", source, target),
+                    prompt: resolver_prompt,
+                    backend: params
+                        .resolver_backend
+                        .unwrap_or_else(|| "codex".to_string()),
+                    model_override: Some(
+                        params
+                            .resolver_model
+                            .unwrap_or_else(|| "gpt-5.5".to_string()),
+                    ),
+                    model_effort: Some("high".to_string()),
+                    working_directory: Some(repo_dir.clone()),
+                    depends_on: vec![],
+                    worktree: None,
+                }],
+            })
+            .await;
+
+        Ok(json!({
+            "merged": false,
+            "conflict": true,
+            "source_branch": source,
+            "target_branch": target,
+            "repo_path": repo_dir,
+            "conflicted_files": conflicted_files,
+            "resolver_task": resolver_key,
+            "resolver_registered": resolver.is_ok(),
+            "resolver_error": resolver.err(),
+            "hint": "Merge aborted cleanly. A resolver task was registered on the board; \
+                     you'll get a digest when it settles. End your turn.",
+        }))
+    }
+
     async fn batch_create_workers(
         &self,
         params: BatchCreateWorkersParams,
@@ -1600,6 +2149,7 @@ impl OrchestratorMcp {
         let target_statuses = if params.target_statuses.is_empty() {
             vec![
                 "completed".to_string(),
+                "awaiting_user".to_string(),
                 "failed".to_string(),
                 "interrupted".to_string(),
                 "not_feasible".to_string(),
@@ -1717,6 +2267,7 @@ impl OrchestratorMcp {
         let target_statuses = if params.target_statuses.is_empty() {
             vec![
                 "completed".to_string(),
+                "awaiting_user".to_string(),
                 "failed".to_string(),
                 "interrupted".to_string(),
                 "not_feasible".to_string(),
@@ -1938,6 +2489,44 @@ impl OrchestratorMcp {
                 let params: SendMessageParams =
                     serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
                 self.retask_worker(params).await
+            }
+            "plan_tasks" => {
+                let params: PlanTasksParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.plan_tasks(params).await
+            }
+            "board_status" => self.board_status().await,
+            "review_task" => {
+                let params: ReviewTaskParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.review_task(params).await
+            }
+            "accept_task" => {
+                let params: TaskRefParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.task_verdict(
+                    params.task_key.as_deref(),
+                    params.task_id.as_deref(),
+                    "accept",
+                    None,
+                )
+                .await
+            }
+            "reject_task" => {
+                let params: RejectTaskParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.task_verdict(
+                    params.task_key.as_deref(),
+                    params.task_id.as_deref(),
+                    "reject",
+                    Some(&params.feedback),
+                )
+                .await
+            }
+            "merge_branch" => {
+                let params: MergeBranchParams =
+                    serde_json::from_value(params).map_err(|e| format!("Invalid params: {}", e))?;
+                self.merge_branch(params).await
             }
             "create_worktree" => {
                 let params: CreateWorktreeParams =

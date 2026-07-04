@@ -19,12 +19,23 @@ const STATUS_COLORS: Record<MissionStatus, string> = {
   interrupted: "#f87171", // red-400
   blocked: "#f87171", // red-400
   not_feasible: "#f87171", // red-400
+  waiting_background: "#818cf8", // indigo-400, work still running in background
 };
 
-/** Dot radius & position (on a 64×64 canvas). */
+/** Status dot radius & position (bottom-right, on a 64×64 canvas). */
 const DOT_RADIUS = 10;
 const DOT_X = 52;
 const DOT_Y = 52;
+
+/**
+ * Attention badge (top-right): drawn only while a mission is waiting for the
+ * user to answer a prompt. Bigger than the status dot and in a distinct
+ * corner so a pending question is unmistakable even in a background tab.
+ */
+const ATTENTION_RADIUS = 12;
+const ATTENTION_X = 52;
+const ATTENTION_Y = 12;
+const ATTENTION_COLOR = "#f472b6"; // pink-400, the "needs user" hue
 
 /** Always use the SVG source as the base image for canvas drawing. */
 const BASE_FAVICON = "/favicon.svg";
@@ -39,7 +50,11 @@ const DATA_ATTR = "data-favicon-status";
  * remove framework-managed head nodes: React tracks those as hoistable
  * resources and expects to own their lifecycle during route updates.
  */
-export function useFaviconStatus(status: MissionStatus | null, isRunning: boolean) {
+export function useFaviconStatus(
+  status: MissionStatus | null,
+  isRunning: boolean,
+  awaitingUser = false,
+) {
   const cachedImg = useRef<HTMLImageElement | null>(null);
   const originalLinks = useRef(new Map<HTMLLinkElement, { href: string; type: string | null }>());
 
@@ -88,6 +103,19 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
       ctx.arc(DOT_X, DOT_Y, DOT_RADIUS, 0, Math.PI * 2);
       ctx.fillStyle = color;
       ctx.fill();
+
+      // Attention badge (top-right) when the agent is paused on a question.
+      if (awaitingUser) {
+        ctx.beginPath();
+        ctx.arc(ATTENTION_X, ATTENTION_Y, ATTENTION_RADIUS + 2, 0, Math.PI * 2);
+        ctx.fillStyle = "#121214";
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(ATTENTION_X, ATTENTION_Y, ATTENTION_RADIUS, 0, Math.PI * 2);
+        ctx.fillStyle = ATTENTION_COLOR;
+        ctx.fill();
+      }
 
       const dataUrl = canvas.toDataURL("image/png");
 
@@ -151,7 +179,7 @@ export function useFaviconStatus(status: MissionStatus | null, isRunning: boolea
       document.removeEventListener("visibilitychange", onVisibility);
       observer.disconnect();
     };
-  }, [status, isRunning]);
+  }, [status, isRunning, awaitingUser]);
 
   // Cleanup on full unmount: restore originals, remove managed link
   useEffect(() => {

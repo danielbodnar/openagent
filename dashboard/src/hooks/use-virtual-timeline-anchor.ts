@@ -30,6 +30,7 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
   const [isAtBottom, setIsAtBottom] = useState(true);
   const isAtBottomRef = useRef(true);
   const rafRef = useRef<number | null>(null);
+  const contentObserverRef = useRef<ResizeObserver | null>(null);
 
   const cancelPendingScroll = useCallback(() => {
     if (rafRef.current !== null) {
@@ -60,6 +61,38 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
       });
     },
     [cancelPendingScroll, scrollElementRef, virtualizer],
+  );
+
+  // Callback ref for the virtualizer's sizer element (the tall content div
+  // whose height tracks `getTotalSize()`). A row expanding by default, a tool
+  // result landing in an already-open row, or heavy markdown that only
+  // settles its height after paint all grow this element *without* changing
+  // `changeKey` — so neither the layout-effect correction nor tanstack's
+  // (disabled) size-change compensation re-pins. Observing the sizer catches
+  // every such growth; the `isAtBottomRef` gate means a user who has scrolled
+  // up is never dragged back down.
+  const registerContent = useCallback(
+    (node: HTMLElement | null) => {
+      contentObserverRef.current?.disconnect();
+      contentObserverRef.current = null;
+      if (!node || typeof ResizeObserver === "undefined") return;
+      const observer = new ResizeObserver(() => {
+        if (!isAtBottomRef.current) return;
+        const el = scrollElementRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+      observer.observe(node);
+      contentObserverRef.current = observer;
+    },
+    [scrollElementRef],
+  );
+
+  useEffect(
+    () => () => {
+      contentObserverRef.current?.disconnect();
+      contentObserverRef.current = null;
+    },
+    [],
   );
 
   const updateAnchorFromScroll = useCallback(() => {
@@ -119,5 +152,6 @@ export function useVirtualTimelineAnchor<TScrollElement extends HTMLElement>({
   return {
     isAtBottom,
     scrollToBottom,
+    registerContent,
   };
 }

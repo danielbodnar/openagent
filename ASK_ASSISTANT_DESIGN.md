@@ -86,7 +86,7 @@ Store: `src/api/ask/store.rs` (`AskStore`). Global singleton via tokio
   `MetadataLlmConfig`; forwards `reasoning_effort` so reasoning models return
   visible content).
 - `mod.rs` — `run_ask_turn`: persist user msg → seed system prompt (recent
-  events + summary) → tool loop (≤6 iterations) → persist assistant answer.
+  events + summary) → tool loop (≤10 iterations) → persist assistant answer.
 - `http.rs` — handlers.
 
 Tools (read-on-demand so the 128K context ceiling never bites):

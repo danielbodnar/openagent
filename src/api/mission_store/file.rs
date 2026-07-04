@@ -21,6 +21,10 @@ const METADATA_SOURCE_USER: &str = "user";
 struct MissionStoreSnapshot {
     missions: HashMap<Uuid, Mission>,
     trees: HashMap<Uuid, AgentTreeNode>,
+    /// FLEET-001 scheduling: deferred goals held outside the Mission struct
+    /// (mirrors the sqlite `deferred_goal` column).
+    #[serde(default)]
+    deferred_goals: HashMap<Uuid, String>,
 }
 
 #[derive(Clone)]
@@ -28,6 +32,7 @@ pub struct FileMissionStore {
     path: PathBuf,
     missions: Arc<RwLock<HashMap<Uuid, Mission>>>,
     trees: Arc<RwLock<HashMap<Uuid, AgentTreeNode>>>,
+    deferred_goals: Arc<RwLock<HashMap<Uuid, String>>>,
     persist_lock: Arc<Mutex<()>>,
 }
 
@@ -59,6 +64,7 @@ impl FileMissionStore {
             path,
             missions: Arc::new(RwLock::new(snapshot.missions)),
             trees: Arc::new(RwLock::new(snapshot.trees)),
+            deferred_goals: Arc::new(RwLock::new(snapshot.deferred_goals)),
             persist_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -68,6 +74,7 @@ impl FileMissionStore {
         let snapshot = MissionStoreSnapshot {
             missions: self.missions.read().await.clone(),
             trees: self.trees.read().await.clone(),
+            deferred_goals: self.deferred_goals.read().await.clone(),
         };
         let data = serde_json::to_vec_pretty(&snapshot)
             .map_err(|e| format!("Failed to serialize mission store: {}", e))?;
@@ -156,8 +163,9 @@ impl MissionStore for FileMissionStore {
             config_profile: config_profile.map(|s| s.to_string()),
             history: vec![],
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
             interrupted_at: None,
+            paused_at: None,
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: Some(Uuid::new_v4().to_string()),
@@ -168,6 +176,13 @@ impl MissionStore for FileMissionStore {
             goal_mode: false,
             goal_objective: None,
             first_viewed_at: None,
+            scheduling: Default::default(),
+            project: Default::default(),
+            activity: super::MissionActivity {
+                last_status_change_at: Some(now.clone()),
+                ..Default::default()
+            },
+            awaiting_kind: None,
         };
         self.missions
             .write()
@@ -201,9 +216,13 @@ impl MissionStore for FileMissionStore {
         let mission = missions
             .get_mut(&id)
             .ok_or_else(|| format!("Mission {} not found", id))?;
+        let status_changed = mission.status != status;
         mission.status = status;
         let now = now_string();
         mission.updated_at = now.clone();
+        if status_changed {
+            mission.activity.last_status_change_at = Some(now.clone());
+        }
         mission.terminal_reason = terminal_reason.map(|s| s.to_string());
         // AwaitingUser is resumable too (any user message wakes the agent).
         // Failed missions with LlmError are also resumable (transient API errors).
@@ -214,6 +233,7 @@ impl MissionStore for FileMissionStore {
                 | MissionStatus::Failed
                 | MissionStatus::AwaitingUser
                 | MissionStatus::Acknowledged
+                | MissionStatus::WaitingBackground
         );
         mission.interrupted_at =
             if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked) {
@@ -223,6 +243,11 @@ impl MissionStore for FileMissionStore {
             };
         if matches!(status, MissionStatus::Active) {
             mission.first_viewed_at = None;
+        }
+        // awaiting_kind only describes an AwaitingUser mission; clear it on any
+        // change away from that state (parity with the sqlite store).
+        if !matches!(status, MissionStatus::AwaitingUser) {
+            mission.awaiting_kind = None;
         }
         drop(missions);
         self.persist().await
@@ -426,6 +451,58 @@ impl MissionStore for FileMissionStore {
         self.persist().await
     }
 
+    async fn update_mission_project(
+        &self,
+        id: Uuid,
+        patch: super::MissionProjectPatch,
+    ) -> Result<(), String> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        if let Some(project) = patch.project {
+            mission.project.project = project;
+        }
+        if let Some(track) = patch.track {
+            mission.project.track = track;
+        }
+        if let Some(intent) = patch.intent {
+            mission.project.intent = intent;
+        }
+        if let Some(github_pr) = patch.github_pr {
+            mission.project.github_pr = github_pr;
+        }
+        if let Some(tags) = patch.tags {
+            mission.project.tags = tags;
+        }
+        if let Some(desired_state) = patch.desired_state {
+            mission.project.desired_state = desired_state;
+        }
+        if let Some(next_check_at) = patch.next_check_at {
+            mission.project.next_check_at = next_check_at;
+        }
+        mission.updated_at = now_string();
+        drop(missions);
+        self.persist().await
+    }
+
+    async fn set_mission_awaiting_kind(
+        &self,
+        id: Uuid,
+        kind: Option<super::AwaitingKind>,
+    ) -> Result<(), String> {
+        let mut missions = self.missions.write().await;
+        let mission = missions
+            .get_mut(&id)
+            .ok_or_else(|| format!("Mission {} not found", id))?;
+        mission.awaiting_kind = kind;
+        drop(missions);
+        self.persist().await
+    }
+
     async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String> {
         let mut missions = self.missions.write().await;
         let mission = missions
@@ -519,6 +596,56 @@ impl MissionStore for FileMissionStore {
             .filter(|m| m.status == MissionStatus::Active)
             .cloned()
             .collect();
+        Ok(missions)
+    }
+
+    async fn set_deferred_goal(
+        &self,
+        mission_id: Uuid,
+        goal: Option<String>,
+    ) -> Result<(), String> {
+        {
+            let mut goals = self.deferred_goals.write().await;
+            match goal {
+                Some(g) => {
+                    goals.insert(mission_id, g);
+                }
+                None => {
+                    goals.remove(&mission_id);
+                }
+            }
+        }
+        self.persist().await
+    }
+
+    async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String> {
+        Ok(self.deferred_goals.read().await.get(&mission_id).cloned())
+    }
+
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String> {
+        {
+            if let Some(m) = self.missions.write().await.get_mut(&mission_id) {
+                m.paused_at = paused_at;
+            }
+        }
+        self.persist().await
+    }
+
+    async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String> {
+        let goals = self.deferred_goals.read().await;
+        let mut missions: Vec<Mission> = self
+            .missions
+            .read()
+            .await
+            .values()
+            .filter(|m| m.status == MissionStatus::Pending && goals.contains_key(&m.id))
+            .cloned()
+            .collect();
+        missions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         Ok(missions)
     }
 

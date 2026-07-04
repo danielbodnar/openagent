@@ -111,11 +111,11 @@ impl Backend for CodexBackend {
         session: &Session,
         message: &str,
     ) -> Result<(mpsc::Receiver<ExecutionEvent>, JoinHandle<()>), Error> {
-        let config = self.config.read().await.clone();
         // All codex missions go through app-server now (Path A). The legacy
         // `codex exec` branch was removed because it can't parse slash
         // commands, never arms goals.rs, and the new path covers both
         // regular and goal missions.
+        let config = self.config.read().await.clone();
         send_message_streaming_app_server(config, session, message, self.workspace_exec.as_ref())
             .await
     }
@@ -212,7 +212,7 @@ async fn send_message_streaming_app_server(
         enabled_features: vec!["goals".to_string()],
         default_model: cfg.default_model.clone(),
         model_effort: cfg.model_effort.clone(),
-        env: std::collections::HashMap::new(),
+        env: cfg.extra_env.clone(),
     };
     // Keep an owned clone of the spawn config so the driver task can
     // re-spawn the codex process via `thread/resume` if the stdio

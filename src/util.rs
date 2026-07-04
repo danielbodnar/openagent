@@ -3,6 +3,39 @@
 /// Relative path from a working directory to the AI providers config file.
 pub const AI_PROVIDERS_PATH: &str = ".sandboxed-sh/ai_providers.json";
 
+/// Relative path from a working directory to the connected-GitHub-account file
+/// written by the dashboard "Connect GitHub" flow. Holds a single OAuth token
+/// (so it is written `0600`) and is read back at mission-prep time to inject
+/// git credentials. See [`crate::github_connection`].
+pub const GITHUB_CONNECTION_PATH: &str = ".sandboxed-sh/github_connection.json";
+
+/// Write `bytes` to `path` with `0600` permissions (owner read/write only).
+///
+/// Used for files that carry credentials (OAuth tokens, `.git-credentials`).
+/// The mode is re-asserted after writing in case the file pre-existed with
+/// looser permissions. On non-Unix platforms this falls back to a plain write.
+#[cfg(unix)]
+pub fn write_file_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    let mut perms = f.metadata()?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn write_file_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
 /// Parse an environment variable as a boolean, returning `default` if unset.
 ///
 /// Recognises `1`, `true`, `yes`, `y`, `on` (case-insensitive) as `true`;

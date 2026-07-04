@@ -92,8 +92,8 @@ To route traffic through a home connection:
 3. Use the `tailscale-ubuntu` template (or add Tailscale to your own template).
 
 The template's init script installs Tailscale and creates helper scripts:
-- `sandboxed.sh-network-up` --- brings up the virtual ethernet and DHCP.
-- `sandboxed.sh-tailscale-up` --- connects to your tailnet and sets the exit node.
+- `sandboxed-network-up` --- brings up the virtual ethernet and DHCP.
+- `sandboxed-tailscale-up` --- connects to your tailnet and sets the exit node.
 
 **Host NAT requirement**: isolated networking needs IP forwarding and NAT rules
 on the host. See the installation guide (section 8.3) for the `iptables`
@@ -164,7 +164,7 @@ Templates live in `workspace-template/<name>.json` in your Library repo:
 ### Init Script Best Practices
 
 - Start with `set -euo pipefail` and error trapping.
-- Log to `/var/log/sandboxed.sh-init.log` for debugging.
+- Log to `/var/log/sandboxed-init.log` for debugging.
 - Use `retry()` wrappers for network operations (apt, curl) to handle transient
   failures.
 - Guard installations with `if ! command -v <tool>` so re-running the init

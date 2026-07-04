@@ -185,7 +185,7 @@ Describe what this command does.
   }
 
   return (
-    <div className="h-screen flex flex-col p-6 gap-4 overflow-hidden">
+    <div className="h-[calc(100vh-3rem)] lg:h-screen flex flex-col p-6 gap-4 overflow-hidden">
       {libraryUnavailable ? (
         <LibraryUnavailable message={libraryUnavailableMessage} onConfigured={refresh} />
       ) : (

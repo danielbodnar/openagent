@@ -550,7 +550,7 @@ set -e
   }
 
   return (
-    <div className="h-screen flex flex-col overflow-hidden p-6 max-w-7xl mx-auto space-y-4">
+    <div className="h-[calc(100vh-3rem)] lg:h-screen flex flex-col overflow-hidden p-6 max-w-7xl mx-auto space-y-4">
       {/* Git Status Bar */}
       {status && (
         <div className="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06]">

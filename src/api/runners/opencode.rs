@@ -451,6 +451,10 @@ pub async fn run_opencode_turn(
     // Build environment variables
     let mut env: HashMap<String, String> = HashMap::new();
     env.insert("MISSION_ID".to_string(), mission_id.to_string());
+    // DGX Spark build offload (opt-in per workspace) — see Workspace::spark_offload_env.
+    if let Some(spark_vars) = workspace.spark_offload_env(mission_id) {
+        env.extend(spark_vars);
+    }
     if let Some(public_url) = public_api_base_url_from_env() {
         env.insert("API_URL".to_string(), public_url);
     } else if let Some(local_url) = workspace_api_base_url(workspace) {

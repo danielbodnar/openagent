@@ -23,6 +23,9 @@ pub struct CodexConfig {
     /// observes it directly so goal-mode cancellation can call
     /// `thread/goal/clear` against the live thread before shutdown.
     pub cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Extra environment variables exported to the codex app-server process
+    /// (e.g. the per-mission DGX Spark offload vars). Empty by default.
+    pub extra_env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +44,7 @@ impl Default for CodexConfig {
             model_effort: None,
             external_chatgpt_auth: None,
             cancel_token: None,
+            extra_env: std::collections::HashMap::new(),
         }
     }
 }

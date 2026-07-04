@@ -306,7 +306,7 @@ function ServerCard() {
 
 export default function InspectPage() {
   return (
-    <div className="min-h-screen flex flex-col p-6 max-w-4xl mx-auto space-y-6">
+    <div className="min-h-[calc(100vh-3rem)] lg:min-h-screen flex flex-col p-6 max-w-4xl mx-auto space-y-6">
       <div>
         <h1 className="text-2xl font-semibold text-white">Inspect</h1>
         <p className="text-sm text-white/60 mt-1">

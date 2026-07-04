@@ -21,6 +21,155 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+/// FLEET-001 scheduling metadata for a mission. Flattened into [`Mission`] so
+/// the fields surface at the top level of API responses (the fleet watcher
+/// reads `priority`/`not_before`/`deadline` directly) while keeping the
+/// scheduler inputs grouped in one place.
+///
+/// Timestamps are stored as RFC3339 strings to match the rest of the mission
+/// row (`created_at`/`updated_at`) and the underlying TEXT columns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionScheduling {
+    /// Dispatch priority; higher wins. FIFO (by `created_at`) within a tier.
+    #[serde(default)]
+    pub priority: i32,
+    /// Do not dispatch before this RFC3339 timestamp. The scheduler holds the
+    /// mission's goal in `deferred_goal` and only dispatches once `now` passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    /// Deadline (RFC3339). The scheduler fails a still-undispatched scheduled
+    /// mission with reason `deadline_exceeded` once this passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+}
+
+/// Project tagging metadata for a mission. Flattened into `Mission` so the
+/// fields appear top-level in serialized output. Lets external consumers (e.g.
+/// Paloma) group/filter/route missions by project, track, intent, PR, or
+/// freeform tags instead of parsing conventions out of free-text titles like
+/// `[beal-research] BR-07 ...`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionProject {
+    /// Stable project identifier (e.g. "verity-core").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Track / workstream within the project (e.g. "C3-bridge-collapse").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<String>,
+    /// Intent of the mission (e.g. "repair-build", "review_merge_pr").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    /// Associated GitHub PR, as a free-form reference (e.g.
+    /// "lfglabs-dev/verity#2070" or just "2070").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_pr: Option<String>,
+    /// Freeform tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Operator-declared desired/track state, e.g. "waiting_ci",
+    /// "waiting_review", "blocked_external". Free-form so consumers can evolve
+    /// the vocabulary without a server enum. Lets a watchdog tell "no worker =
+    /// problem" apart from "no worker = intentionally waiting on CI".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_state: Option<String>,
+    /// When the track should next be checked (RFC3339). Paired with
+    /// `desired_state` so a watchdog knows when a `waiting_*` mission is overdue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check_at: Option<String>,
+}
+
+impl MissionProject {
+    /// True when no project metadata is set.
+    pub fn is_empty(&self) -> bool {
+        self.project.is_none()
+            && self.track.is_none()
+            && self.intent.is_none()
+            && self.github_pr.is_none()
+            && self.tags.is_empty()
+            && self.desired_state.is_none()
+            && self.next_check_at.is_none()
+    }
+}
+
+/// Tri-state patch for project metadata: each field is `None` to leave
+/// unchanged, `Some(None)` to clear, `Some(Some(v))` to set. `tags` is
+/// `Some(vec)` to replace the whole list.
+#[derive(Debug, Clone, Default)]
+pub struct MissionProjectPatch {
+    pub project: Option<Option<String>>,
+    pub track: Option<Option<String>>,
+    pub intent: Option<Option<String>>,
+    pub github_pr: Option<Option<String>>,
+    pub tags: Option<Vec<String>>,
+    pub desired_state: Option<Option<String>>,
+    pub next_check_at: Option<Option<String>>,
+}
+
+impl MissionProjectPatch {
+    /// True when the patch would change nothing.
+    pub fn is_empty(&self) -> bool {
+        self.project.is_none()
+            && self.track.is_none()
+            && self.intent.is_none()
+            && self.github_pr.is_none()
+            && self.tags.is_none()
+            && self.desired_state.is_none()
+            && self.next_check_at.is_none()
+    }
+}
+
+/// Activity timestamps for a mission, surfaced so watchdogs/consumers can
+/// reason about staleness without guessing from `updated_at` alone (which also
+/// bumps on metadata edits). `last_status_change_at` is persisted; the event
+/// timestamps are computed on read from the event log and may be `None` when
+/// not requested (e.g. internal store reads that skip enrichment).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissionActivity {
+    /// When the mission's status last changed (persisted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status_change_at: Option<String>,
+    /// Timestamp of the most recent mission event of any kind (computed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_agent_event_at: Option<String>,
+    /// Timestamp of the most recent assistant output (computed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<String>,
+    /// Convenience: max(updated_at, last_agent_event_at) (computed). Lets a
+    /// consumer derive staleness with a single field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+}
+
+/// Disambiguates *why* a mission is parked in `AwaitingUser`: the agent asked a
+/// real question that needs a decision, vs. it just finished a turn / its work
+/// and is waiting to be acknowledged or merged. Only meaningful while the
+/// status is `AwaitingUser`; `None` for every other status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaitingKind {
+    /// The agent is asking the user something and needs an answer to proceed.
+    Decision,
+    /// The agent finished its turn / work and is waiting for acknowledgement.
+    Ack,
+}
+
+impl AwaitingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AwaitingKind::Decision => "decision",
+            AwaitingKind::Ack => "ack",
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "decision" => Some(AwaitingKind::Decision),
+            "ack" => Some(AwaitingKind::Ack),
+            _ => None,
+        }
+    }
+}
+
 /// A mission (persistent goal-oriented session).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mission {
@@ -64,6 +213,10 @@ pub struct Mission {
     /// When this mission was interrupted (if status is Interrupted)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interrupted_at: Option<String>,
+    /// FLEET-004: when this mission was last paused (if status is Paused). RFC3339.
+    /// Lets the UI show pause age and enables future zombie-pause cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
     /// Whether this mission can be resumed
     #[serde(default)]
     pub resumable: bool,
@@ -103,10 +256,26 @@ pub struct Mission {
     /// Active via a new user message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_viewed_at: Option<String>,
+    /// FLEET-001 scheduling metadata (priority, not_before, deadline).
+    /// Flattened so the fields appear top-level in serialized output.
+    #[serde(default, flatten)]
+    pub scheduling: MissionScheduling,
+    /// Project tagging metadata (project, track, intent, github_pr, tags).
+    /// Flattened so the fields appear top-level.
+    #[serde(default, flatten)]
+    pub project: MissionProject,
+    /// Activity timestamps (last_status_change_at persisted; event timestamps
+    /// computed on read). Flattened so the fields appear top-level.
+    #[serde(default, flatten)]
+    pub activity: MissionActivity,
+    /// When `status` is `AwaitingUser`, classifies whether the agent needs a
+    /// decision or just an acknowledgement. `None` for every other status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_kind: Option<AwaitingKind>,
 }
 
 /// Aggregate mission counts by status.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct MissionStatusCounts {
     pub total: usize,
     pub active: usize,
@@ -120,6 +289,55 @@ fn default_backend() -> String {
 
 fn default_workspace_id() -> Uuid {
     crate::workspace::DEFAULT_WORKSPACE_ID
+}
+
+impl Mission {
+    /// True when the `not_before` constraint (if any) is satisfied at `now`.
+    /// An unset or unparseable timestamp never blocks dispatch.
+    pub fn is_dispatchable_at(&self, now: chrono::DateTime<Utc>) -> bool {
+        match self.scheduling.not_before.as_deref() {
+            Some(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|t| t.with_timezone(&Utc) <= now)
+                .unwrap_or(true),
+            None => true,
+        }
+    }
+
+    /// True when a `deadline` is set and has already elapsed at `now`.
+    pub fn is_past_deadline(&self, now: chrono::DateTime<Utc>) -> bool {
+        match self.scheduling.deadline.as_deref() {
+            Some(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|t| t.with_timezone(&Utc) < now)
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+}
+
+/// FLEET-001: select the next mission to dispatch from a candidate set.
+///
+/// A mission is *runnable* when it is `Pending` (which excludes `Paused`,
+/// terminal, and in-flight states) and its `not_before` constraint is
+/// satisfied at `now`. Among runnable missions the highest `priority` wins,
+/// with ties broken by oldest `created_at` (FIFO). Returns `None` when
+/// nothing is runnable.
+///
+/// This is a pure function so the dispatch ordering has a single, unit-tested
+/// source of truth independent of any storage backend.
+pub fn select_next_runnable_mission(
+    missions: &[Mission],
+    now: chrono::DateTime<Utc>,
+) -> Option<&Mission> {
+    missions
+        .iter()
+        .filter(|m| m.status == MissionStatus::Pending)
+        .filter(|m| m.is_dispatchable_at(now))
+        .max_by(|a, b| {
+            a.scheduling
+                .priority
+                .cmp(&b.scheduling.priority)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        })
 }
 
 /// A single entry in the mission history.
@@ -1008,6 +1226,156 @@ pub fn now_string() -> String {
     Utc::now().to_rfc3339()
 }
 
+// ---------------------------------------------------------------------------
+// Task board: server-scheduled worker tasks owned by a boss mission.
+//
+// The board replaces LLM-driven scheduling: the boss agent registers a task
+// DAG once, and the control loop spawns worker missions for ready tasks up to
+// capacity, settles them when their turn ends, and notifies the boss with a
+// digest. See `api::control::board` for the scheduler.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of a board task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardTaskStatus {
+    /// Registered; waiting on dependencies and/or capacity.
+    Pending,
+    /// A worker mission is executing this task.
+    Running,
+    /// The worker's turn ended; awaiting a boss verdict.
+    Settled,
+    /// Boss accepted the result (terminal).
+    Accepted,
+    /// Worker failed after retry (terminal unless re-planned).
+    Failed,
+    /// Cancelled by the boss or the user (terminal).
+    Cancelled,
+}
+
+impl std::fmt::Display for BoardTaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Settled => "settled",
+            Self::Accepted => "accepted",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl BoardTaskStatus {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "settled" => Some(Self::Settled),
+            "accepted" => Some(Self::Accepted),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Terminal states never transition again (except via explicit re-plan).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Accepted | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// How a settled task's worker turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardTaskOutcome {
+    /// Worker reported completion.
+    Success,
+    /// Worker stopped with a BLOCKED question for the boss.
+    Blocked,
+    /// Worker turn failed (llm error, stall, interruption).
+    Failed,
+}
+
+impl std::fmt::Display for BoardTaskOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Success => "success",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl BoardTaskOutcome {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "success" => Some(Self::Success),
+            "blocked" => Some(Self::Blocked),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// A task on a boss mission's board.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardTask {
+    pub id: Uuid,
+    pub boss_mission_id: Uuid,
+    /// Stable, boss-chosen key (unique per board) used for `depends_on`
+    /// references and digests.
+    pub task_key: String,
+    pub title: String,
+    pub prompt: String,
+    /// Worker backend (e.g. "codex", "opencode", "grok"). Never claudecode.
+    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_effort: Option<String>,
+    /// Working directory for the worker (usually an isolated git worktree).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    /// Task keys (same board) that must settle successfully or be accepted
+    /// before this task may start.
+    pub depends_on: Vec<String>,
+    pub status: BoardTaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<BoardTaskOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_mission_id: Option<Uuid>,
+    /// Number of worker spawns so far (1 = first attempt).
+    pub attempts: u32,
+    /// Truncated tail of the worker's final message, set on settle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<String>,
+    /// Free-form audit trail: rejections with feedback, retries, cancellations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Payload for registering/updating tasks on a board.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewBoardTask {
+    pub task_key: String,
+    pub title: String,
+    pub prompt: String,
+    pub backend: String,
+    #[serde(default)]
+    pub model_override: Option<String>,
+    #[serde(default)]
+    pub model_effort: Option<String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
 /// Sanitize a string for use as a filename.
 pub fn sanitize_filename(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -1137,6 +1505,17 @@ pub trait MissionStore: Send + Sync {
     /// Update mission status.
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String>;
 
+    /// Persist FLEET-001 scheduling metadata (priority, not_before, deadline)
+    /// for a mission. Default is a no-op so non-persistent stores can ignore it;
+    /// the SQLite store overrides it to write the dedicated columns.
+    async fn set_mission_scheduling(
+        &self,
+        _id: Uuid,
+        _scheduling: &MissionScheduling,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Update mission status with terminal reason (for failed/completed missions).
     async fn update_mission_status_with_reason(
         &self,
@@ -1193,6 +1572,40 @@ pub trait MissionStore: Send + Sync {
         metadata_version: Option<Option<&str>>,
     ) -> Result<(), String>;
 
+    /// Update project tagging metadata (see [`MissionProjectPatch`] for the
+    /// tri-state semantics). Default no-op for stores that do not persist it.
+    async fn update_mission_project(
+        &self,
+        id: Uuid,
+        patch: MissionProjectPatch,
+    ) -> Result<(), String> {
+        let _ = (id, patch);
+        Ok(())
+    }
+
+    /// Computed activity timestamps for the given missions, keyed by id:
+    /// `(last_agent_event_at, last_output_at)` derived from the event log.
+    /// Empty map by default (stores without an event log skip this).
+    async fn get_mission_activity(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, (Option<String>, Option<String>)>, String> {
+        let _ = ids;
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Set (or clear) the `awaiting_kind` classification for a mission. Only
+    /// meaningful while the mission is in `AwaitingUser`. Default no-op for
+    /// stores that do not persist it.
+    async fn set_mission_awaiting_kind(
+        &self,
+        id: Uuid,
+        kind: Option<AwaitingKind>,
+    ) -> Result<(), String> {
+        let _ = (id, kind);
+        Ok(())
+    }
+
     /// Update mission session ID (for backends that generate their own IDs).
     async fn update_mission_session_id(&self, id: Uuid, session_id: &str) -> Result<(), String>;
 
@@ -1231,6 +1644,27 @@ pub trait MissionStore: Send + Sync {
     /// Get all missions currently in active status (for startup recovery).
     async fn get_all_active_missions(&self) -> Result<Vec<Mission>, String>;
 
+    /// FLEET-001 scheduling: persist (or clear, with `None`) the deferred goal a
+    /// `not_before`-scheduled mission will run once the dispatcher picks it up.
+    async fn set_deferred_goal(&self, mission_id: Uuid, goal: Option<String>)
+        -> Result<(), String>;
+
+    /// FLEET-001 scheduling: read the deferred goal for a mission, if any.
+    async fn get_deferred_goal(&self, mission_id: Uuid) -> Result<Option<String>, String>;
+
+    /// FLEET-001 scheduling: all `Pending` missions that carry a deferred goal
+    /// (i.e. are armed for scheduled dispatch). Scheduling fields are populated
+    /// so the dispatcher can order/expire them; history is not loaded.
+    async fn get_scheduled_pending_missions(&self) -> Result<Vec<Mission>, String>;
+
+    /// FLEET-004: set (or clear, with `None`) the timestamp at which a mission
+    /// was paused. Set on pause, cleared on resume.
+    async fn set_mission_paused_at(
+        &self,
+        mission_id: Uuid,
+        paused_at: Option<String>,
+    ) -> Result<(), String>;
+
     /// Record the first time the user opened this mission, if not already set.
     /// Returns `Some(timestamp)` if the field was set by this call, or `None`
     /// if it was already populated (no-op). Used by the new
@@ -1250,6 +1684,24 @@ pub trait MissionStore: Send + Sync {
         &self,
         grace_seconds: u64,
     ) -> Result<Vec<Uuid>, String>;
+
+    /// IDs of missions currently parked in `WaitingBackground` — the agent's
+    /// turn ended but tracked background shell jobs are (or were) still live.
+    ///
+    /// Used by the background-task auto-resume watcher to reconcile the
+    /// persisted status against the in-memory registry: a `WaitingBackground`
+    /// mission with no live jobs left must be flipped back to `AwaitingUser` so
+    /// the normal ack flow can settle it, instead of being stranded forever
+    /// (e.g. after a restart drops the in-memory registry). Default impl scans
+    /// via `list_missions`; the sqlite store overrides it with a targeted query.
+    async fn get_waiting_background_mission_ids(&self) -> Result<Vec<Uuid>, String> {
+        let missions = self.list_missions(1000, 0).await?;
+        Ok(missions
+            .into_iter()
+            .filter(|m| m.status == MissionStatus::WaitingBackground)
+            .map(|m| m.id)
+            .collect())
+    }
 
     /// Get recently interrupted missions that were stopped by server shutdown.
     async fn get_recent_server_shutdown_mission_ids(
@@ -2493,6 +2945,68 @@ pub trait MissionStore: Send + Sync {
         let _ = (workflow_id, limit);
         Ok(vec![])
     }
+
+    // ---- Task board ------------------------------------------------------
+
+    /// Register or update tasks on a boss mission's board. Tasks are keyed by
+    /// `(boss_mission_id, task_key)`: a new key inserts, an existing key in
+    /// `pending` status is updated in place, and any other status is left
+    /// untouched (the current row is returned so the caller sees the real
+    /// state). Returns the post-upsert rows in input order.
+    async fn upsert_board_tasks(
+        &self,
+        boss_mission_id: Uuid,
+        tasks: Vec<NewBoardTask>,
+    ) -> Result<Vec<BoardTask>, String> {
+        let _ = (boss_mission_id, tasks);
+        Err("Task board not supported by this mission store".to_string())
+    }
+
+    /// All tasks on a boss mission's board, oldest first.
+    async fn list_board_tasks(&self, boss_mission_id: Uuid) -> Result<Vec<BoardTask>, String> {
+        let _ = boss_mission_id;
+        Ok(vec![])
+    }
+
+    /// Boss mission ids that have at least one non-terminal task. Drives the
+    /// scheduler's per-tick scan.
+    async fn list_active_board_missions(&self) -> Result<Vec<Uuid>, String> {
+        Ok(vec![])
+    }
+
+    async fn get_board_task(&self, task_id: Uuid) -> Result<Option<BoardTask>, String> {
+        let _ = task_id;
+        Ok(None)
+    }
+
+    /// Look up the task currently bound to a worker mission, if any.
+    async fn get_board_task_by_worker(
+        &self,
+        worker_mission_id: Uuid,
+    ) -> Result<Option<BoardTask>, String> {
+        let _ = worker_mission_id;
+        Ok(None)
+    }
+
+    /// Persist the full state of a task (matched by `task.id`).
+    async fn save_board_task(&self, task: &BoardTask) -> Result<(), String> {
+        let _ = task;
+        Err("Task board not supported by this mission store".to_string())
+    }
+
+    /// Persist the control session's pending message queue as a JSON snapshot
+    /// so queued messages survive a server restart. Default no-op for
+    /// non-durable stores (memory/file); SQLite overrides this.
+    async fn save_control_queue(&self, user_id: &str, payload: &str) -> Result<(), String> {
+        let _ = (user_id, payload);
+        Ok(())
+    }
+
+    /// Load the persisted control-queue snapshot (empty string if none).
+    async fn load_control_queue(&self, user_id: &str) -> Result<String, String> {
+        let _ = user_id;
+        Ok(String::new())
+    }
 }
 
 /// Mission store type selection.
@@ -2594,6 +3108,111 @@ mod tests {
         );
     }
 
+    /// FLEET-001: a Pending mission appears in the scheduled-pending list only
+    /// while it carries a deferred goal, and disappears once dispatched (Active)
+    /// or the goal is cleared.
+    #[tokio::test]
+    async fn test_scheduled_pending_missions_track_deferred_goal() {
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("Scheduled"), None, None, None, None, None, None)
+            .await
+            .expect("create mission");
+
+        // No goal yet -> not scheduled-pending.
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+
+        // Stash a goal -> appears, with the goal readable.
+        store
+            .set_deferred_goal(mission.id, Some("do the thing".to_string()))
+            .await
+            .expect("set goal");
+        assert_eq!(
+            store
+                .get_deferred_goal(mission.id)
+                .await
+                .expect("get goal")
+                .as_deref(),
+            Some("do the thing")
+        );
+        let pending = store.get_scheduled_pending_missions().await.expect("list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, mission.id);
+
+        // Dispatched (Active) -> no longer scheduled-pending even with goal set.
+        store
+            .update_mission_status(mission.id, MissionStatus::Active)
+            .await
+            .expect("activate");
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+
+        // Back to Pending but goal cleared -> still not scheduled-pending.
+        store
+            .update_mission_status(mission.id, MissionStatus::Pending)
+            .await
+            .expect("repend");
+        store
+            .set_deferred_goal(mission.id, None)
+            .await
+            .expect("clear goal");
+        assert!(store
+            .get_deferred_goal(mission.id)
+            .await
+            .expect("get goal")
+            .is_none());
+        assert!(store
+            .get_scheduled_pending_missions()
+            .await
+            .expect("list")
+            .is_empty());
+    }
+
+    /// FLEET-004: paused_at round-trips through the store (set on pause, read
+    /// back on the mission, cleared on resume).
+    #[tokio::test]
+    async fn test_paused_at_round_trip() {
+        let store = InMemoryMissionStore::new();
+        let mission = store
+            .create_mission(Some("Pausable"), None, None, None, None, None, None)
+            .await
+            .expect("create");
+        assert!(mission.paused_at.is_none());
+
+        store
+            .set_mission_paused_at(mission.id, Some("2026-06-25T05:00:00+00:00".to_string()))
+            .await
+            .expect("set paused_at");
+        let loaded = store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(
+            loaded.paused_at.as_deref(),
+            Some("2026-06-25T05:00:00+00:00")
+        );
+
+        store
+            .set_mission_paused_at(mission.id, None)
+            .await
+            .expect("clear paused_at");
+        assert!(store
+            .get_mission(mission.id)
+            .await
+            .expect("get")
+            .expect("some")
+            .paused_at
+            .is_none());
+    }
+
     /// Test that missions transition correctly from Pending to Active.
     #[tokio::test]
     async fn test_mission_status_transition_pending_to_active() {
@@ -2693,5 +3312,135 @@ mod tests {
         assert_eq!(format!("{}", MissionStatus::Active), "active");
         assert_eq!(format!("{}", MissionStatus::Completed), "completed");
         assert_eq!(format!("{}", MissionStatus::Interrupted), "interrupted");
+    }
+
+    // ---- FLEET-001 / FLEET-004 scheduling tests ----
+
+    /// Build a minimal Pending mission with the given scheduling inputs for
+    /// the dispatcher tests.
+    fn scheduling_mission(
+        created_at: &str,
+        priority: i32,
+        not_before: Option<&str>,
+        status: MissionStatus,
+    ) -> Mission {
+        Mission {
+            id: Uuid::new_v4(),
+            status,
+            title: None,
+            short_description: None,
+            metadata_updated_at: None,
+            metadata_source: None,
+            metadata_model: None,
+            metadata_version: None,
+            workspace_id: default_workspace_id(),
+            workspace_name: None,
+            agent: None,
+            model_override: None,
+            model_effort: None,
+            backend: default_backend(),
+            config_profile: None,
+            history: vec![],
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+            interrupted_at: None,
+            paused_at: None,
+            resumable: false,
+            desktop_sessions: Vec::new(),
+            session_id: None,
+            terminal_reason: None,
+            parent_mission_id: None,
+            working_directory: None,
+            mission_mode: MissionMode::default(),
+            goal_mode: false,
+            goal_objective: None,
+            first_viewed_at: None,
+            scheduling: MissionScheduling {
+                priority,
+                not_before: not_before.map(|s| s.to_string()),
+                deadline: None,
+            },
+            project: MissionProject::default(),
+            activity: MissionActivity::default(),
+            awaiting_kind: None,
+        }
+    }
+
+    /// FLEET-004: Paused is a non-terminal status (unlike Blocked), so a paused
+    /// mission can later be resumed.
+    #[test]
+    fn test_paused_not_terminal() {
+        use crate::api::control::mission_status_is_terminal;
+        assert!(!mission_status_is_terminal(MissionStatus::Paused));
+        // Sanity: a genuinely terminal status still reports terminal.
+        assert!(mission_status_is_terminal(MissionStatus::Completed));
+        assert!(mission_status_is_terminal(MissionStatus::Blocked));
+    }
+
+    /// FLEET-001: higher priority wins; ties broken by oldest created_at (FIFO).
+    #[test]
+    fn test_priority_sorting() {
+        let now = Utc::now();
+        let missions = vec![
+            scheduling_mission("2026-01-01T00:00:00Z", 0, None, MissionStatus::Pending),
+            scheduling_mission("2026-01-01T01:00:00Z", 5, None, MissionStatus::Pending),
+            scheduling_mission("2026-01-01T02:00:00Z", 5, None, MissionStatus::Pending),
+        ];
+        let next = select_next_runnable_mission(&missions, now).expect("a runnable mission");
+        // Highest priority is 5; between the two priority-5 missions the older
+        // (01:00) wins over the newer (02:00).
+        assert_eq!(next.scheduling.priority, 5);
+        assert_eq!(next.created_at, "2026-01-01T01:00:00Z");
+    }
+
+    /// FLEET-001: missions with `not_before` in the future are not runnable;
+    /// `Paused` missions are excluded even when otherwise eligible.
+    #[test]
+    fn test_not_before_filtering() {
+        let now = Utc::now();
+        let future = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let past = (now - chrono::Duration::hours(1)).to_rfc3339();
+
+        // Only a future not_before -> nothing runnable.
+        let blocked = vec![scheduling_mission(
+            "2026-01-01T00:00:00Z",
+            10,
+            Some(&future),
+            MissionStatus::Pending,
+        )];
+        assert!(select_next_runnable_mission(&blocked, now).is_none());
+
+        // A past not_before is runnable; a higher-priority Paused mission is
+        // skipped; a higher-priority future mission is skipped.
+        let mixed = vec![
+            scheduling_mission(
+                "2026-01-01T00:00:00Z",
+                1,
+                Some(&past),
+                MissionStatus::Pending,
+            ),
+            scheduling_mission("2026-01-01T00:00:00Z", 99, None, MissionStatus::Paused),
+            scheduling_mission(
+                "2026-01-01T00:00:00Z",
+                99,
+                Some(&future),
+                MissionStatus::Pending,
+            ),
+        ];
+        let next = select_next_runnable_mission(&mixed, now).expect("the past-eligible mission");
+        assert_eq!(next.scheduling.priority, 1);
+        assert!(next.is_dispatchable_at(now));
+    }
+
+    /// FLEET-001: deadline helper reports elapsed deadlines and ignores unset.
+    #[test]
+    fn test_deadline_detection() {
+        let now = Utc::now();
+        let mut m = scheduling_mission("2026-01-01T00:00:00Z", 0, None, MissionStatus::Pending);
+        assert!(!m.is_past_deadline(now));
+        m.scheduling.deadline = Some((now - chrono::Duration::minutes(1)).to_rfc3339());
+        assert!(m.is_past_deadline(now));
+        m.scheduling.deadline = Some((now + chrono::Duration::minutes(1)).to_rfc3339());
+        assert!(!m.is_past_deadline(now));
     }
 }

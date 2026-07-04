@@ -109,8 +109,8 @@ DESKTOP_ENABLED=true
 # Xvfb resolution (width x height)
 DESKTOP_RESOLUTION=1920x1080
 
-# Starting display number (will increment for concurrent sessions)
-DESKTOP_DISPLAY_START=99
+# X display to use for desktop automation
+DESKTOP_DISPLAY=:99
 ```
 
 ## Manual Testing

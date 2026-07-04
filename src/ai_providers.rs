@@ -104,6 +104,7 @@ pub enum ProviderType {
     GithubCopilot,
     Zai,
     Minimax,
+    Kimi,
     Custom,
 }
 
@@ -127,6 +128,7 @@ impl ProviderType {
             Self::GithubCopilot => "GitHub Copilot",
             Self::Zai => "Z.AI",
             Self::Minimax => "Minimax",
+            Self::Kimi => "Kimi",
             Self::Custom => "Custom",
         }
     }
@@ -150,6 +152,7 @@ impl ProviderType {
             Self::GithubCopilot => "github-copilot",
             Self::Zai => "zai",
             Self::Minimax => "minimax",
+            Self::Kimi => "kimi",
             Self::Custom => "custom",
         }
     }
@@ -174,6 +177,7 @@ impl ProviderType {
             "github-copilot" => Some(Self::GithubCopilot),
             "zai" => Some(Self::Zai),
             "minimax" => Some(Self::Minimax),
+            "kimi" => Some(Self::Kimi),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -198,6 +202,7 @@ impl ProviderType {
             Self::GithubCopilot => None, // Uses OAuth
             Self::Zai => Some("ZHIPU_API_KEY"),
             Self::Minimax => Some("MINIMAX_API_KEY"),
+            Self::Kimi => None, // OAuth-only (Kimi Code subscription)
             Self::Custom => None,
         }
     }
@@ -206,7 +211,12 @@ impl ProviderType {
     pub fn uses_oauth(&self) -> bool {
         matches!(
             self,
-            Self::Anthropic | Self::GithubCopilot | Self::OpenAI | Self::Google | Self::Xai
+            Self::Anthropic
+                | Self::GithubCopilot
+                | Self::OpenAI
+                | Self::Google
+                | Self::Xai
+                | Self::Kimi
         )
     }
 
@@ -283,6 +293,13 @@ impl ProviderType {
                     description: Some("Enter an existing xAI API key".to_string()),
                 },
             ],
+            Self::Kimi => vec![AuthMethod {
+                label: "Kimi Code (Device OAuth)".to_string(),
+                method_type: AuthMethodType::Oauth,
+                description: Some(
+                    "Authorize your Kimi Code subscription via device-code login".to_string(),
+                ),
+            }],
             _ => vec![AuthMethod {
                 label: "API Key".to_string(),
                 method_type: AuthMethodType::Api,

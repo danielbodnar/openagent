@@ -15,6 +15,9 @@ interface SystemMetrics {
   memory_percent: number;
   network_rx_bytes_per_sec: number;
   network_tx_bytes_per_sec: number;
+  disk_used: number;
+  disk_total: number;
+  disk_percent: number;
   timestamp_ms: number;
 }
 
@@ -384,6 +387,42 @@ function MemoryChart({
   );
 }
 
+// Simple area chart for Disk usage
+function DiskChart({
+  data,
+  percent,
+  used,
+  total,
+  height = 80,
+}: {
+  data: number[];
+  percent: number;
+  used: number;
+  total: number;
+  height?: number;
+}) {
+  return (
+    <AreaChart
+      data={data}
+      gridFractions={MEM_GRID}
+      height={height}
+      topLeft={
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] leading-none font-medium uppercase tracking-wide text-white/50">DISK</span>
+          <span className="text-[10px] leading-none font-semibold tabular-nums text-white/80">
+            {percent.toFixed(0)}%
+          </span>
+        </div>
+      }
+      topRight={
+        <span className="text-[10px] leading-none font-medium tabular-nums text-white/50">
+          {formatBytes(used)} / {formatBytes(total)}
+        </span>
+      }
+    />
+  );
+}
+
 // Network chart with dual lines (rx/tx)
 function NetworkChart({
   rxData,
@@ -566,6 +605,7 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [coreHistories, setCoreHistories] = useState<number[][]>([]);
   const [memoryHistory, setMemoryHistory] = useState<number[]>([]);
+  const [diskHistory, setDiskHistory] = useState<number[]>([]);
   const [networkRxHistory, setNetworkRxHistory] = useState<number[]>([]);
   const [networkTxHistory, setNetworkTxHistory] = useState<number[]>([]);
   const [containerHistories, setContainerHistories] = useState<Map<string, ContainerHistory>>(new Map());
@@ -636,6 +676,7 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
               setCoreHistories(cores);
 
               setMemoryHistory(historyData.map((m) => m.memory_percent));
+              setDiskHistory(historyData.map((m) => m.disk_percent));
               setNetworkRxHistory(historyData.map((m) => m.network_rx_bytes_per_sec));
               setNetworkTxHistory(historyData.map((m) => m.network_tx_bytes_per_sec));
             }
@@ -708,6 +749,12 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
           // Update memory history
           setMemoryHistory((prev) => {
             const next = [...prev, data.memory_percent];
+            return next.slice(-maxHistory);
+          });
+
+          // Update disk history
+          setDiskHistory((prev) => {
+            const next = [...prev, data.disk_percent];
             return next.slice(-maxHistory);
           });
 
@@ -839,13 +886,20 @@ export function SystemMonitor({ className, intervalMs = 1000 }: SystemMonitorPro
           height={200}
         />
 
-        {/* Memory and Network - Split bottom */}
-        <div className="grid grid-cols-2 gap-3 min-h-0">
+        {/* Memory, Disk and Network - 3-across on desktop; stacks on phones. */}
+        <div className="grid grid-cols-1 gap-3 min-h-0 sm:grid-cols-3">
           <MemoryChart
             data={memoryHistory}
             percent={metrics?.memory_percent ?? 0}
             used={metrics?.memory_used ?? 0}
             total={metrics?.memory_total ?? 0}
+            height={150}
+          />
+          <DiskChart
+            data={diskHistory}
+            percent={metrics?.disk_percent ?? 0}
+            used={metrics?.disk_used ?? 0}
+            total={metrics?.disk_total ?? 0}
             height={150}
           />
           <NetworkChart

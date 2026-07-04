@@ -69,7 +69,11 @@ describe("deriveItemViews", () => {
       endTime: 3,
     };
 
-    const views = deriveItemViews([completedStream, assistantItem], true, false);
+    const views = deriveItemViews(
+      [completedStream, assistantItem],
+      true,
+      false,
+    );
 
     expect(views.thinkingItems).toEqual([completedStream]);
     expect(views.groupedItems).toEqual([assistantItem]);
@@ -215,6 +219,54 @@ describe("appendUnpersistedLiveTail", () => {
     const views = appendUnpersistedLiveTail([userItem], [userItem, streamItem]);
 
     expect(views).toEqual([userItem, streamItem]);
+  });
+
+  it("does not carry a live stream from another mission", () => {
+    const missionAUser: Extract<ChatItem, { kind: "user" }> = {
+      ...userItem,
+      missionId: "mission-a",
+    };
+    const missionAStream: Extract<ChatItem, { kind: "stream" }> = {
+      ...streamItem,
+      missionId: "mission-a",
+    };
+    const missionBUser: Extract<ChatItem, { kind: "user" }> = {
+      ...userItem,
+      id: "user-b",
+      missionId: "mission-b",
+    };
+
+    const views = appendUnpersistedLiveTail(
+      [missionBUser],
+      [missionAUser, missionAStream],
+      "mission-b",
+    );
+
+    expect(views).toEqual([missionBUser]);
+  });
+
+  it("uses the viewed mission user as the live tail anchor", () => {
+    const missionAUser: Extract<ChatItem, { kind: "user" }> = {
+      ...userItem,
+      missionId: "mission-a",
+    };
+    const missionAStream: Extract<ChatItem, { kind: "stream" }> = {
+      ...streamItem,
+      missionId: "mission-a",
+    };
+    const missionBUser: Extract<ChatItem, { kind: "user" }> = {
+      ...userItem,
+      id: "user-b",
+      missionId: "mission-b",
+    };
+
+    const views = appendUnpersistedLiveTail(
+      [missionAUser],
+      [missionAUser, missionAStream, missionBUser],
+      "mission-a",
+    );
+
+    expect(views).toEqual([missionAUser, missionAStream]);
   });
 
   it("carries over a failed user row not present in server history", () => {

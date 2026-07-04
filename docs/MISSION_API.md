@@ -181,7 +181,7 @@ GET /api/control/stream
 Server-Sent Events stream for real-time updates. Events have `event:` and `data:` fields.
 
 **Event types**:
-- `status` — control state changed (`idle`, `running`, `tool_waiting`)
+- `status` — control state changed (`idle`, `running`, `waiting_for_tool`)
 - `user_message` — user message received
 - `assistant_message` — agent response complete
 - `thinking` — agent reasoning (streaming)
@@ -208,7 +208,6 @@ data: {"id":"uuid","content":"Done!","success":true,"cost_cents":5,"model":"clau
 | `/api/control/missions/:id/tree` | GET | Get agent tree for mission |
 | `/api/control/missions/current` | GET | Get current active mission |
 | `/api/control/missions/:id/resume` | POST | Resume interrupted mission |
-| `/api/control/tree` | GET | Get live agent tree |
 | `/api/control/progress` | GET | Get execution progress |
 
 ## Automations
@@ -240,8 +239,8 @@ POST /api/control/missions/:id/automations
 **Body**:
 ```json
 {
-  "command_source": {"library": {"name": "my-command"}},
-  "trigger": {"interval": {"seconds": 300}},
+  "command_source": {"type": "library", "name": "my-command"},
+  "trigger": {"type": "interval", "seconds": 300},
   "variables": {"key": "value"},
   "retry_config": {
     "max_retries": 3,
@@ -252,14 +251,19 @@ POST /api/control/missions/:id/automations
 }
 ```
 
+Both `command_source` and `trigger` are internally tagged: a `"type"`
+discriminator selects the variant and its fields sit alongside it.
+
 **Trigger types**:
-- `{"interval": {"seconds": 300}}` — Run every N seconds
-- `{"webhook": {"config": {"webhook_id": "optional-uuid"}}}` — Trigger via webhook
-- `"agent_finished"` — Trigger after each agent turn completes
+- `{"type": "interval", "seconds": 300}` — Run every N seconds
+- `{"type": "cron", "expression": "0 8 * * *", "timezone": "Europe/Paris"}` — Cron schedule (timezone defaults to UTC)
+- `{"type": "webhook", "config": {"webhook_id": "optional-uuid"}}` — Trigger via webhook
+- `{"type": "agent_finished"}` — Trigger after each agent turn completes
 
 **Command sources**:
-- `{"library": {"name": "command-name"}}` — Use a library command
-- `{"inline": {"command": "echo hello"}}` — Inline shell command
+- `{"type": "library", "name": "command-name"}` — Use a library command
+- `{"type": "local_file", "path": "scripts/run.sh"}` — Command from a file in the mission workspace
+- `{"type": "inline", "content": "echo hello"}` — Inline shell command
 
 **Response**: `Automation` object.
 
@@ -280,8 +284,8 @@ PATCH /api/control/automations/:id
 **Body** (all fields optional):
 ```json
 {
-  "command_source": {"library": {"name": "new-command"}},
-  "trigger": {"interval": {"seconds": 600}},
+  "command_source": {"type": "library", "name": "new-command"},
+  "trigger": {"type": "interval", "seconds": 600},
   "variables": {"key": "new-value"},
   "retry_config": {"max_retries": 5},
   "active": false
@@ -320,8 +324,8 @@ GET /api/control/missions/:id/automation-executions
 {
   "id": "uuid",
   "mission_id": "uuid",
-  "command_source": {"library": {"name": "my-command"}},
-  "trigger": {"interval": {"seconds": 300}},
+  "command_source": {"type": "library", "name": "my-command"},
+  "trigger": {"type": "interval", "seconds": 300},
   "variables": {"key": "value"},
   "active": true,
   "created_at": "2025-01-13T10:00:00Z",
@@ -345,9 +349,9 @@ GET /api/control/missions/:id/automation-executions
   "trigger_source": "interval",
   "status": "success",
   "webhook_payload": null,
-  "started_at": "2025-01-13T10:05:00Z",
+  "variables_used": {"key": "value"},
   "completed_at": "2025-01-13T10:05:05Z",
-  "result_message": "Command completed successfully",
+  "error": null,
   "retry_count": 0
 }
 ```

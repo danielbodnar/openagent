@@ -78,3 +78,6 @@ ios_dashboard/build/
 ios_dashboard/**/xcuserdata/
 ios_dashboard/SandboxedDashboard.xcodeproj/*
 !ios_dashboard/SandboxedDashboard.xcodeproj/project.pbxproj
+
+# Android simulator run artifacts
+android_dashboard/test-artifacts/

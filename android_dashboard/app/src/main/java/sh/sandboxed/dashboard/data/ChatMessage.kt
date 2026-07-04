@@ -27,9 +27,14 @@ data class SharedFile(
     val sizeBytes: Long? = null,
 )
 
+/// Delivery state for locally-authored user messages. Server-sourced
+/// messages are always SENT.
+enum class SendState { PENDING, SENT, FAILED }
+
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
     val kind: ChatMessageKind,
     val content: String,
     val timestamp: Long = System.currentTimeMillis(),
+    val sendState: SendState = SendState.SENT,
 )

@@ -60,7 +60,45 @@ fn decode_xml_text(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn parse_text_tool_calls(content: &str) -> Vec<ToolCall> {
+/// Strip MiniMax interleave sentinels (`]<]minimax[>[`, `]<]minimax[>`) that
+/// the model wraps around tool-call markup when it falls back to emitting the
+/// call as text. Without this, neither regex below matches and the raw markup
+/// leaks into the chat as garbage (observed in prod Ask threads).
+fn strip_model_markup_sentinels(content: &str) -> String {
+    content
+        .replace("]<]minimax[>[", "")
+        .replace("]<]minimax[>", "")
+}
+
+/// Sanitize a *final* answer before it is shown to the operator.
+///
+/// The forced final-synthesis pass runs with tools disabled, so
+/// [`parse_text_tool_calls`] is skipped (it only fires when tools are offered).
+/// MiniMax nonetheless sometimes free-styles a tool call as text on that pass —
+/// wrapped in its interleave sentinels — and the raw `<tool_call>`/`<invoke>`
+/// markup would otherwise reach the chat verbatim (observed in prod). This
+/// strips the sentinels and any leaked tool-call markup, returning only the
+/// prose the model actually wrote (often empty when it emitted only a call).
+pub(crate) fn strip_leaked_tool_markup(content: &str) -> String {
+    let content = strip_model_markup_sentinels(content);
+    // Remove well-formed tool-call blocks (non-greedy; an `<invoke>` nested in a
+    // `<tool_call>` is consumed by the outer match).
+    let tool_block = regex::Regex::new(r#"(?s)<tool_call>.*?</tool_call>"#)
+        .expect("valid tool-call block regex");
+    let invoke_block =
+        regex::Regex::new(r#"(?s)<invoke\b.*?</invoke>"#).expect("valid invoke block regex");
+    let s = tool_block.replace_all(&content, "");
+    let s = invoke_block.replace_all(&s, "");
+    // Drop any dangling/unclosed markup fragments the model left behind.
+    let dangling =
+        regex::Regex::new(r#"(?s)</?(?:tool_call|invoke|command|arg_key|arg_value)\b[^>]*>"#)
+            .expect("valid dangling-tag regex");
+    dangling.replace_all(&s, "").trim().to_string()
+}
+
+fn parse_text_tool_calls(raw_content: &str) -> Vec<ToolCall> {
+    let content = strip_model_markup_sentinels(raw_content);
+    let content = content.as_str();
     let tool_re =
         regex::Regex::new(r#"(?s)<tool_call>\s*([A-Za-z_][A-Za-z0-9_-]*)\s*(.*?)</tool_call>"#)
             .expect("valid tool-call regex");
@@ -69,7 +107,7 @@ fn parse_text_tool_calls(content: &str) -> Vec<ToolCall> {
     )
     .expect("valid tool-arg regex");
 
-    tool_re
+    let calls: Vec<ToolCall> = tool_re
         .captures_iter(content)
         .filter_map(|caps| {
             let name = caps.get(1)?.as_str().trim().to_string();
@@ -84,6 +122,47 @@ fn parse_text_tool_calls(content: &str) -> Vec<ToolCall> {
                     .map(|m| decode_xml_text(m.as_str()))
                     .unwrap_or_default();
                 args.insert(key.to_string(), Value::String(value));
+            }
+            if args.is_empty() {
+                return None;
+            }
+            Some(ToolCall {
+                id: format!("text-tool-{}", Uuid::new_v4()),
+                name,
+                arguments: Value::Object(args).to_string(),
+            })
+        })
+        .collect();
+    if !calls.is_empty() {
+        return calls;
+    }
+
+    // Fallback: Anthropic-style `<invoke name="X"><param>value</param></invoke>`
+    // blocks — MiniMax emits these (wrapped in its sentinels) when it
+    // free-styles a tool call into text instead of the function-call channel.
+    let invoke_re =
+        regex::Regex::new(r#"(?s)<invoke\s+name="([A-Za-z_][A-Za-z0-9_-]*)"\s*>(.*?)</invoke>"#)
+            .expect("valid invoke regex");
+    let param_re =
+        regex::Regex::new(r#"(?s)<([A-Za-z_][A-Za-z0-9_]*)>(.*?)</([A-Za-z_][A-Za-z0-9_]*)>"#)
+            .expect("valid param regex");
+    invoke_re
+        .captures_iter(content)
+        .filter_map(|caps| {
+            let name = caps.get(1)?.as_str().trim().to_string();
+            let body = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let mut args = serde_json::Map::new();
+            for p in param_re.captures_iter(body) {
+                let (Some(open), Some(value), Some(close)) = (p.get(1), p.get(2), p.get(3)) else {
+                    continue;
+                };
+                if open.as_str() != close.as_str() {
+                    continue;
+                }
+                args.insert(
+                    open.as_str().to_string(),
+                    Value::String(decode_xml_text(value.as_str().trim())),
+                );
             }
             if args.is_empty() {
                 return None;
@@ -192,7 +271,12 @@ impl AskClient {
                 }
             }
         }
-        if tool_calls.is_empty() {
+        // Only reinterpret text as tool calls when tools were actually
+        // offered. The forced final-synthesis pass runs with tools disabled;
+        // without this gate a model that writes tool-shaped markup there gets
+        // its entire answer swallowed (content -> None) and the operator sees
+        // "(The assistant reached the tool-call limit without a final answer.)".
+        if tool_calls.is_empty() && !tools.is_empty() {
             if let Some(text) = content.as_deref() {
                 tool_calls = parse_text_tool_calls(text);
             }
@@ -352,7 +436,7 @@ impl AskClient {
                 arguments,
             })
             .collect();
-        if tool_calls.is_empty() {
+        if tool_calls.is_empty() && !tools.is_empty() {
             tool_calls = parse_text_tool_calls(&content);
         }
 
@@ -377,6 +461,53 @@ impl AskClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_minimax_sentinel_invoke_tool_call() {
+        // Verbatim shape observed in a prod Ask thread (mission 5daaa900):
+        // MiniMax wraps Anthropic-style invoke markup in its interleave
+        // sentinels; previously this parsed to nothing and rendered raw.
+        let calls = parse_text_tool_calls(
+            "]<]minimax[>[<tool_call>> ]<]minimax[>[<invoke name=\"bash\">]<]minimax[>[<command>echo \"=== TASK ===\"; ls -la /tmp/probe1.out</command>]<]minimax[>[</invoke> ]<]minimax[>[</tool_call>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert!(args["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("echo \"=== TASK ===\""));
+    }
+
+    #[test]
+    fn parses_multiple_invoke_blocks() {
+        let calls = parse_text_tool_calls(
+            "<invoke name=\"bash\"><command>date -u</command></invoke> <invoke name=\"read_history\"><limit>15</limit></invoke>",
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[1].name, "read_history");
+    }
+
+    #[test]
+    fn strips_leaked_minimax_tool_markup_to_empty() {
+        // Verbatim shape leaked into a prod Ask answer (mission cd6cfe3f) on the
+        // tools-disabled synthesis pass, where the text tool-call parser is
+        // skipped. Nothing but markup → sanitized result is empty so the caller
+        // falls back to the canned notice instead of showing garbage.
+        let out = strip_leaked_tool_markup(
+            "]<]minimax[>[<tool_call> ]<]minimax[>[<invoke name=\"bash\">]<]minimax[>[<command>cd /workspaces/mission-cd6cfe3f/verity-benchmark && echo hi</command>]<]minimax[>[</invoke> ]<]minimax[>[</tool_call>",
+        );
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn keeps_prose_around_leaked_markup() {
+        let out = strip_leaked_tool_markup(
+            "Here is the status.\n]<]minimax[>[<invoke name=\"bash\"><command>ls</command></invoke> Done.",
+        );
+        assert_eq!(out, "Here is the status.\n Done.");
+    }
 
     #[test]
     fn parses_opencode_style_text_tool_call() {

@@ -40,12 +40,37 @@ const CODEX_MODEL_PROBE_TTL: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "anthropic",
     "openai",
+    "open-router",
     "google",
     "xai",
     "cerebras",
     "zai",
     "minimax",
 ];
+
+/// Upper bound on models merged for a single provider from live `/v1/models`
+/// and from models.dev. OpenRouter has no usable prefix filter and exposes a
+/// large, fast-growing catalog; without a bound it can flood the routing
+/// picker (and the cached catalog). Prefix-filtered providers stay well under
+/// this and are left uncapped.
+const MAX_CATALOG_MODELS_PER_PROVIDER: usize = 100;
+
+const OPENROUTER_PROVIDER_ID: &str = "open-router";
+
+/// Best-effort seed slugs kept in the default config; prioritized when capping
+/// the models.dev OpenRouter catalog (which has no popularity sort).
+const OPENROUTER_SEED_MODEL_IDS: &[&str] = &[
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-sonnet-4.6",
+    "google/gemini-3.1-pro-preview",
+    "openai/gpt-5.5",
+    "meta-llama/llama-3.3-70b-instruct:free",
+];
+
+/// Maximum length (in `char`s) of a model description surfaced from a
+/// `/v1/models` entry. OpenRouter descriptions can run several paragraphs; the
+/// picker only needs a short blurb.
+const MAX_MODEL_DESCRIPTION_CHARS: usize = 200;
 
 /// Where a catalog entry came from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +184,12 @@ pub struct ProvidersQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvidersResponse {
     pub providers: Vec<Provider>,
+    /// Provider ids that currently have working credentials for this account.
+    /// When `include_all` is set the `providers` list also contains
+    /// unconfigured catalog providers (so chains can be pre-built); clients use
+    /// this set to mark which are actually connected.
+    #[serde(default)]
+    pub configured_ids: Vec<String>,
 }
 
 /// Model option for a specific backend.
@@ -280,6 +311,57 @@ fn normalize_model_id(id: &str) -> String {
     id.trim().to_ascii_lowercase()
 }
 
+fn models_dev_provider_key(provider_id: &str) -> &str {
+    match provider_id {
+        // Sandboxed/OpenCode use `open-router`; models.dev uses `openrouter`.
+        "open-router" => "openrouter",
+        _ => provider_id,
+    }
+}
+
+/// Cap a catalog slice, keeping `priority_ids` first (in that order) then filling
+/// from the remainder in stable id order until `limit`.
+fn cap_catalog_entries(
+    mut entries: Vec<CatalogEntry>,
+    limit: usize,
+    priority_ids: &[&str],
+) -> Vec<CatalogEntry> {
+    if entries.len() <= limit {
+        return entries;
+    }
+
+    let priority_normalized: HashSet<String> = priority_ids
+        .iter()
+        .map(|id| normalize_model_id(id))
+        .collect();
+    let mut priority_entries = Vec::new();
+    let mut rest = Vec::new();
+    for entry in entries.drain(..) {
+        if priority_normalized.contains(&normalize_model_id(&entry.id)) {
+            priority_entries.push(entry);
+        } else {
+            rest.push(entry);
+        }
+    }
+    priority_entries.sort_by_key(|entry| {
+        priority_ids
+            .iter()
+            .position(|id| normalize_model_id(id) == normalize_model_id(&entry.id))
+            .unwrap_or(usize::MAX)
+    });
+    rest.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut capped = priority_entries;
+    for entry in rest {
+        if capped.len() >= limit {
+            break;
+        }
+        capped.push(entry);
+    }
+    capped.truncate(limit);
+    capped
+}
+
 fn merge_catalog_entries(
     catalog: &mut HashMap<String, Vec<CatalogEntry>>,
     provider_id: &str,
@@ -332,7 +414,7 @@ fn merge_cached_provider_models(
     }
 }
 
-fn sanitize_custom_provider_id(name: &str) -> String {
+pub(crate) fn sanitize_custom_provider_id(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect::<String>()
@@ -656,6 +738,46 @@ fn default_providers_config() -> ProvidersConfig {
                 ],
             },
             Provider {
+                id: "open-router".to_string(),
+                name: "OpenRouter (API Key)".to_string(),
+                billing: "pay-per-token".to_string(),
+                description: "Aggregator routing through OpenRouter".to_string(),
+                models: vec![
+                    // OpenRouter model IDs are vendor-prefixed (provider/model).
+                    // The live catalog is merged from models.dev and /v1/models
+                    // when available; these keep the picker useful before the
+                    // background catalog finishes. IDs verified against
+                    // OpenRouter's public catalog on 2026-06-17 — treat as
+                    // best-effort seeds that the live catalog supersedes (slugs
+                    // can drift as models are retired).
+                    ProviderModel {
+                        id: "anthropic/claude-opus-4.8".to_string(),
+                        name: "Claude Opus 4.8".to_string(),
+                        description: Some("Anthropic Claude via OpenRouter".to_string()),
+                    },
+                    ProviderModel {
+                        id: "anthropic/claude-sonnet-4.6".to_string(),
+                        name: "Claude Sonnet 4.6".to_string(),
+                        description: Some("Anthropic Claude via OpenRouter".to_string()),
+                    },
+                    ProviderModel {
+                        id: "google/gemini-3.1-pro-preview".to_string(),
+                        name: "Gemini 3.1 Pro Preview".to_string(),
+                        description: Some("Google Gemini via OpenRouter".to_string()),
+                    },
+                    ProviderModel {
+                        id: "openai/gpt-5.5".to_string(),
+                        name: "GPT-5.5".to_string(),
+                        description: Some("OpenAI GPT via OpenRouter".to_string()),
+                    },
+                    ProviderModel {
+                        id: "meta-llama/llama-3.3-70b-instruct:free".to_string(),
+                        name: "Llama 3.3 70B Instruct (free)".to_string(),
+                        description: Some("Meta Llama via OpenRouter".to_string()),
+                    },
+                ],
+            },
+            Provider {
                 id: "google".to_string(),
                 name: "Google AI (OAuth)".to_string(),
                 billing: "subscription".to_string(),
@@ -752,9 +874,14 @@ fn default_providers_config() -> ProvidersConfig {
                     // Check Z.AI / GLM model IDs here:
                     // https://docs.z.ai/guides/llm/glm
                     ProviderModel {
+                        id: "glm-5.2".to_string(),
+                        name: "GLM-5.2".to_string(),
+                        description: Some("Most capable GLM reasoning model".to_string()),
+                    },
+                    ProviderModel {
                         id: "glm-5.1".to_string(),
                         name: "GLM-5.1".to_string(),
-                        description: Some("Most capable GLM reasoning model".to_string()),
+                        description: Some("Previous flagship GLM reasoning model".to_string()),
                     },
                     ProviderModel {
                         id: "glm-5-turbo".to_string(),
@@ -825,6 +952,33 @@ fn default_providers_config() -> ProvidersConfig {
                     },
                 ],
             },
+            Provider {
+                id: "kimi".to_string(),
+                name: "Kimi (Subscription)".to_string(),
+                billing: "subscription".to_string(),
+                description: "Kimi Code via Moonshot OAuth (device login)".to_string(),
+                models: vec![
+                    ProviderModel {
+                        id: "kimi-for-coding".to_string(),
+                        name: "Kimi for Coding".to_string(),
+                        description: Some(
+                            "Stable coding alias that tracks the latest Kimi coding model \
+                             (recommended)"
+                                .to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "kimi-k2.6".to_string(),
+                        name: "Kimi K2.6".to_string(),
+                        description: Some("Latest Kimi K2 model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "kimi-k2-thinking".to_string(),
+                        name: "Kimi K2 Thinking".to_string(),
+                        description: Some("Extended-reasoning Kimi K2 variant".to_string()),
+                    },
+                ],
+            },
         ],
     }
 }
@@ -856,16 +1010,39 @@ fn model_id_to_display_name(id: &str) -> String {
         .join(" ")
 }
 
+/// Trim a model description to a sane length for the routing picker.
+/// OpenRouter (and some other catalogs) return multi-paragraph descriptions;
+/// keep a short blurb and append an ellipsis when truncated. Operates on
+/// `char` boundaries so multibyte text isn't split mid-codepoint.
+fn truncate_description(description: &str) -> String {
+    let trimmed = description.trim();
+    if trimmed.chars().count() <= MAX_MODEL_DESCRIPTION_CHARS {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(MAX_MODEL_DESCRIPTION_CHARS).collect();
+    format!("{}…", truncated.trim_end())
+}
+
 /// Fetch models from an OpenAI-compatible /v1/models endpoint.
 /// Filters results by the given prefix (e.g. "grok-", "glm-").
 /// Returns model IDs and generated display names.
+///
+/// `models_query` is appended after `/models` (e.g. `?sort=most-popular` for
+/// OpenRouter). When `sort_results_by_id` is false the API response order is
+/// preserved (used for server-side popularity sorts).
 pub async fn fetch_openai_compatible_models(
     base_url: &str,
     api_key: &str,
     prefix_filters: &[&str],
+    models_query: Option<&str>,
+    sort_results_by_id: bool,
 ) -> Result<Vec<ProviderModel>, String> {
     let client = reqwest::Client::new();
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let base = base_url.trim_end_matches('/');
+    let url = match models_query.filter(|query| !query.is_empty()) {
+        Some(query) => format!("{base}/models{query}"),
+        None => format!("{base}/models"),
+    };
 
     let resp = client
         .get(&url)
@@ -899,15 +1076,28 @@ pub async fn fetch_openai_compatible_models(
             {
                 return None;
             }
+            let name = entry
+                .get("display_name")
+                .or_else(|| entry.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| model_id_to_display_name(id));
+            let description = entry
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(truncate_description)
+                .filter(|d| !d.is_empty());
             Some(ProviderModel {
                 id: id.to_string(),
-                name: model_id_to_display_name(id),
-                description: None,
+                name,
+                description,
             })
         })
         .collect();
 
-    models.sort_by(|a, b| a.id.cmp(&b.id));
+    if sort_results_by_id {
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+    }
     Ok(models)
 }
 
@@ -988,29 +1178,48 @@ pub async fn fetch_models_dev_catalog() -> Result<HashMap<String, Vec<CatalogEnt
     let mut catalog: HashMap<String, Vec<CatalogEntry>> = HashMap::new();
 
     for provider_id in DEFAULT_CATALOG_PROVIDER_IDS {
-        let Some(provider) = providers.get(*provider_id) else {
+        let Some(provider) = providers.get(models_dev_provider_key(provider_id)) else {
             continue;
         };
         let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
             continue;
         };
 
-        let entries = models.iter().map(|(model_id, value)| {
-            let name = value
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or(model_id)
-                .to_string();
-            CatalogEntry {
-                id: model_id.clone(),
-                name,
-                provider_id: (*provider_id).to_string(),
-                sources: vec![CatalogSource::ModelsDev],
-                availability: CatalogAvailability::Known,
-                last_checked_at: now,
-                description: None,
-            }
-        });
+        let mut entries: Vec<CatalogEntry> = models
+            .iter()
+            .map(|(model_id, value)| {
+                let name = value
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or(model_id)
+                    .to_string();
+                CatalogEntry {
+                    id: model_id.clone(),
+                    name,
+                    provider_id: (*provider_id).to_string(),
+                    sources: vec![CatalogSource::ModelsDev],
+                    availability: CatalogAvailability::Known,
+                    last_checked_at: now,
+                    description: None,
+                }
+            })
+            .collect();
+
+        if *provider_id == OPENROUTER_PROVIDER_ID && entries.len() > MAX_CATALOG_MODELS_PER_PROVIDER
+        {
+            let before = entries.len();
+            entries = cap_catalog_entries(
+                entries,
+                MAX_CATALOG_MODELS_PER_PROVIDER,
+                OPENROUTER_SEED_MODEL_IDS,
+            );
+            tracing::info!(
+                "Capping open-router models.dev catalog from {} to {} models",
+                before,
+                entries.len()
+            );
+        }
+
         merge_catalog_entries(&mut catalog, provider_id, entries);
     }
 
@@ -1116,6 +1325,85 @@ pub fn get_api_key_for_provider(
 ///
 /// Returns a map of provider ID -> fetched models. Providers that fail
 /// or lack credentials are simply omitted (hardcoded defaults will be used).
+/// Fetch the catalog once and replace the cached snapshot, returning
+/// `(provider_count, model_count)`.
+async fn refresh_catalog_once(
+    catalog: &ModelCatalog,
+    ai_providers: &AIProviderStore,
+    working_dir: &Path,
+) -> (usize, usize) {
+    let fetched = fetch_model_catalog(ai_providers, working_dir).await;
+    let provider_count = fetched.len();
+    let model_count: usize = fetched.values().map(|v| v.len()).sum();
+    *catalog.write().await = fetched;
+    (provider_count, model_count)
+}
+
+/// Spawn the background task that keeps the model catalog populated. Performs an
+/// initial fetch immediately, then refreshes on an interval so newly-added
+/// provider models (e.g. a custom router exposing a new model via `/v1/models`)
+/// appear without a backend restart.
+///
+/// The interval is controlled by `MODEL_CATALOG_REFRESH_SECS` (default 600s).
+/// Set it to `0` to disable periodic refresh and keep the startup-only snapshot.
+pub fn spawn_model_catalog_refresh(
+    catalog: ModelCatalog,
+    ai_providers: Arc<AIProviderStore>,
+    working_dir: std::path::PathBuf,
+) {
+    let refresh_secs = std::env::var("MODEL_CATALOG_REFRESH_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(600);
+
+    tokio::spawn(async move {
+        loop {
+            let (providers, models) =
+                refresh_catalog_once(&catalog, &ai_providers, &working_dir).await;
+            tracing::info!(
+                "Model catalog populated: {} models from {} providers (refresh every {}s)",
+                models,
+                providers,
+                refresh_secs
+            );
+
+            if refresh_secs == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
+        }
+    });
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefreshCatalogResponse {
+    pub refreshed: bool,
+    pub providers: usize,
+    pub models: usize,
+}
+
+/// Force an immediate refetch of the model catalog from all provider APIs and
+/// custom routers, replacing the cached snapshot. Useful right after adding a
+/// model to a custom provider's `/v1/models` without waiting for the periodic
+/// refresh.
+pub async fn refresh_model_catalog(
+    State(state): State<Arc<AppState>>,
+) -> Json<RefreshCatalogResponse> {
+    let working_dir = state.config.working_dir.clone();
+    let (providers, models) =
+        refresh_catalog_once(&state.model_catalog, &state.ai_providers, &working_dir).await;
+    tracing::info!(
+        "Model catalog manually refreshed: {} models from {} providers",
+        models,
+        providers
+    );
+    Json(RefreshCatalogResponse {
+        refreshed: true,
+        providers,
+        models,
+    })
+}
+
 pub async fn fetch_model_catalog(
     ai_providers: &AIProviderStore,
     _working_dir: &Path,
@@ -1129,6 +1417,16 @@ pub async fn fetch_model_catalog(
         provider_id: &'static str,
         base_url: &'static str,
         prefix_filters: Vec<&'static str>,
+        /// Extra query on `/models` (e.g. OpenRouter `?sort=most-popular`).
+        models_query: Option<&'static str>,
+        /// When false, keep the API response order (popularity sorts).
+        sort_results_by_id: bool,
+        /// Fetch even when no API key is configured (public catalog endpoints).
+        allow_unauthenticated: bool,
+        /// Upper bound on models merged from this provider's `/v1/models`.
+        /// Set for prefix-less, large catalogs (OpenRouter) to keep the
+        /// routing picker bounded; `None` means no cap.
+        max_models: Option<usize>,
     }
 
     let targets = vec![
@@ -1137,30 +1435,61 @@ pub async fn fetch_model_catalog(
             provider_id: "openai",
             base_url: "https://api.openai.com/v1",
             prefix_filters: vec!["gpt-", "o1-", "o3-", "o4-", "chatgpt-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
+            max_models: None,
+        },
+        FetchTarget {
+            provider_type: ProviderType::OpenRouter,
+            provider_id: "open-router",
+            base_url: "https://openrouter.ai/api/v1",
+            // No usable prefix; ask OpenRouter for weekly token volume order.
+            prefix_filters: vec![],
+            models_query: Some("?sort=most-popular"),
+            sort_results_by_id: false,
+            allow_unauthenticated: true,
+            max_models: Some(MAX_CATALOG_MODELS_PER_PROVIDER),
         },
         FetchTarget {
             provider_type: ProviderType::Xai,
             provider_id: "xai",
             base_url: "https://api.x.ai/v1",
             prefix_filters: vec!["grok-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
+            max_models: None,
         },
         FetchTarget {
             provider_type: ProviderType::Cerebras,
             provider_id: "cerebras",
             base_url: "https://api.cerebras.ai/v1",
             prefix_filters: vec![],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
+            max_models: None,
         },
         FetchTarget {
             provider_type: ProviderType::Zai,
             provider_id: "zai",
             base_url: "https://open.bigmodel.cn/api/paas/v4",
             prefix_filters: vec!["glm-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
+            max_models: None,
         },
         FetchTarget {
             provider_type: ProviderType::Minimax,
             provider_id: "minimax",
             base_url: "https://api.minimax.io/v1",
             prefix_filters: vec!["MiniMax-"],
+            models_query: None,
+            sort_results_by_id: true,
+            allow_unauthenticated: false,
+            max_models: None,
         },
     ];
 
@@ -1219,6 +1548,10 @@ pub async fn fetch_model_catalog(
     for (target, key) in target_keys {
         let provider_id = target.provider_id.to_string();
         let base_url = target.base_url.to_string();
+        let max_models = target.max_models;
+        let models_query = target.models_query.map(str::to_string);
+        let sort_results_by_id = target.sort_results_by_id;
+        let allow_unauthenticated = target.allow_unauthenticated;
         let prefix_filters: Vec<String> = target
             .prefix_filters
             .iter()
@@ -1226,11 +1559,38 @@ pub async fn fetch_model_catalog(
             .collect();
 
         handles.push(tokio::spawn(async move {
-            match key {
+            let api_key = match key {
+                Some(k) if !k.is_empty() => Some(k),
+                _ if allow_unauthenticated => Some(String::new()),
+                _ => None,
+            };
+            match api_key {
                 Some(api_key) => {
                     let filters: Vec<&str> = prefix_filters.iter().map(|s| s.as_str()).collect();
-                    match fetch_openai_compatible_models(&base_url, &api_key, &filters).await {
-                        Ok(models) => {
+                    match fetch_openai_compatible_models(
+                        &base_url,
+                        &api_key,
+                        &filters,
+                        models_query.as_deref(),
+                        sort_results_by_id,
+                    )
+                    .await
+                    {
+                        Ok(mut models) => {
+                            // Bound large catalogs (OpenRouter). OpenRouter
+                            // keeps the API's most-popular order; others are
+                            // sorted by id before truncation.
+                            if let Some(limit) = max_models {
+                                if models.len() > limit {
+                                    tracing::info!(
+                                        "Capping {} catalog from {} to {} models",
+                                        provider_id,
+                                        models.len(),
+                                        limit
+                                    );
+                                    models.truncate(limit);
+                                }
+                            }
                             tracing::info!(
                                 "Fetched {} models from {} API",
                                 models.len(),
@@ -1246,6 +1606,46 @@ pub async fn fetch_model_catalog(
                 }
                 None => {
                     tracing::debug!("No API key for {}, skipping model fetch", provider_id);
+                    None
+                }
+            }
+        }));
+    }
+
+    // Custom providers (self-hosted OpenAI-compatible routers, e.g. the
+    // dgx-spark-router) expose /v1/models. Fetch their live model list so the
+    // catalog reflects what the router actually serves instead of the
+    // operator's hardcoded `custom_models`, which drift out of date.
+    for provider in &providers_list {
+        if provider.provider_type != ProviderType::Custom || !provider.enabled {
+            continue;
+        }
+        let Some(base_url) = provider.base_url.clone().filter(|u| !u.trim().is_empty()) else {
+            continue;
+        };
+        let provider_id = sanitize_custom_provider_id(&provider.name);
+        // /v1/models is usually unauthenticated on these routers; send the key
+        // when present, empty otherwise.
+        let api_key = provider.api_key.clone().unwrap_or_default();
+        handles.push(tokio::spawn(async move {
+            match fetch_openai_compatible_models(&base_url, &api_key, &[], None, true).await {
+                Ok(models) if !models.is_empty() => {
+                    tracing::info!(
+                        "Fetched {} models from custom provider {} ({})",
+                        models.len(),
+                        provider_id,
+                        base_url
+                    );
+                    Some((provider_id, models))
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to fetch custom provider {} models from {}: {}",
+                        provider_id,
+                        base_url,
+                        e
+                    );
                     None
                 }
             }
@@ -1352,7 +1752,15 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
         {
             for provider in providers {
                 if provider.enabled && provider.has_credentials() {
-                    configured.insert(provider.provider_type.id().to_string());
+                    // Use the same id the provider listing exposes: custom
+                    // providers are keyed by their sanitized name (e.g.
+                    // "spark"), not the generic "custom" type id, so the
+                    // dashboard's connected-marker lookup matches.
+                    if provider.provider_type == ProviderType::Custom {
+                        configured.insert(sanitize_custom_provider_id(&provider.name));
+                    } else {
+                        configured.insert(provider.provider_type.id().to_string());
+                    }
                 }
             }
         }
@@ -1368,6 +1776,40 @@ fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String>
 /// and descriptions. Only includes providers that are actually configured
 /// and authenticated. This endpoint is used by the frontend to render
 /// a grouped model selector.
+/// Replace each custom provider's operator-configured `custom_models` with the
+/// live model list fetched from its `/v1/models` (cached in `model_catalog`).
+/// Built-in providers are left untouched — they keep MERGE semantics so a
+/// subscription probe can't hide valid defaults. Custom providers (self-hosted
+/// OpenAI-compatible routers like the dgx-spark-router) instead treat the
+/// router's reported models as the source of truth.
+fn apply_live_custom_provider_models(
+    providers: &mut [Provider],
+    store_providers: &[crate::ai_providers::AIProvider],
+    cached: &HashMap<String, Vec<CatalogEntry>>,
+    include_unverified: bool,
+) {
+    let custom_provider_ids: HashSet<String> = store_providers
+        .iter()
+        .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+        .map(|p| sanitize_custom_provider_id(&p.name))
+        .collect();
+    for provider in providers.iter_mut() {
+        if !custom_provider_ids.contains(&provider.id) {
+            continue;
+        }
+        if let Some(entries) = cached.get(&provider.id) {
+            let live: Vec<ProviderModel> = entries
+                .iter()
+                .filter(|e| include_unverified || e.is_selectable_by_default())
+                .map(CatalogEntry::to_provider_model)
+                .collect();
+            if !live.is_empty() {
+                provider.models = live;
+            }
+        }
+    }
+}
+
 pub async fn list_providers(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ProvidersQuery>,
@@ -1380,7 +1822,6 @@ pub async fn list_providers(
     // the defaults would hide valid choices such as newly released Claude Opus.
     let cached = state.model_catalog.read().await;
     merge_cached_provider_models(&mut config, &cached, query.include_unverified);
-    drop(cached);
 
     // Get the set of configured provider IDs
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
@@ -1399,7 +1840,18 @@ pub async fn list_providers(
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, query.include_all);
 
-    Json(ProvidersResponse { providers })
+    apply_live_custom_provider_models(
+        &mut providers,
+        &store_providers,
+        &cached,
+        query.include_unverified,
+    );
+    drop(cached);
+
+    Json(ProvidersResponse {
+        providers,
+        configured_ids: configured.into_iter().collect(),
+    })
 }
 
 /// Full catalog of every supported model across all providers — configured or
@@ -1419,13 +1871,14 @@ pub async fn list_full_model_catalog(
     // models and providers that aren't configured yet.
     let cached = state.model_catalog.read().await;
     merge_cached_provider_models(&mut config, &cached, true);
-    drop(cached);
 
     let configured = get_configured_provider_ids(state.config.working_dir.as_path());
 
     let mut providers = config.providers;
     let store_providers = state.ai_providers.list().await;
     merge_store_provider_models(&mut providers, &store_providers, true);
+    apply_live_custom_provider_models(&mut providers, &store_providers, &cached, true);
+    drop(cached);
 
     let mut models = Vec::new();
     for provider in &providers {
@@ -1840,6 +2293,74 @@ mod tests {
     }
 
     #[test]
+    fn default_openrouter_catalog_uses_vendor_prefixed_model_ids() {
+        let defaults = default_providers_config();
+        let openrouter = defaults
+            .providers
+            .iter()
+            .find(|provider| provider.id == "open-router")
+            .expect("openrouter provider");
+
+        assert!(openrouter
+            .models
+            .iter()
+            .any(|model| model.id == "anthropic/claude-opus-4.8"));
+        assert!(openrouter.models.iter().all(|model| model.id.contains('/')));
+    }
+
+    #[test]
+    fn models_dev_provider_key_maps_openrouter() {
+        assert_eq!(models_dev_provider_key("open-router"), "openrouter");
+        assert_eq!(models_dev_provider_key("anthropic"), "anthropic");
+    }
+
+    #[test]
+    fn cap_catalog_entries_prioritizes_seeds_then_truncates() {
+        let now = chrono::Utc::now();
+        let make = |id: &str| CatalogEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider_id: OPENROUTER_PROVIDER_ID.to_string(),
+            sources: vec![CatalogSource::ModelsDev],
+            availability: CatalogAvailability::Known,
+            last_checked_at: now,
+            description: None,
+        };
+        let mut entries: Vec<CatalogEntry> = (0..150)
+            .map(|i| make(&format!("vendor/model-{i:03}")))
+            .collect();
+        entries.push(make("anthropic/claude-opus-4.8"));
+        entries.push(make("openai/gpt-5.5"));
+
+        let capped = cap_catalog_entries(
+            entries,
+            MAX_CATALOG_MODELS_PER_PROVIDER,
+            OPENROUTER_SEED_MODEL_IDS,
+        );
+        assert_eq!(capped.len(), MAX_CATALOG_MODELS_PER_PROVIDER);
+        assert_eq!(capped[0].id, "anthropic/claude-opus-4.8");
+        assert!(capped.iter().any(|entry| entry.id == "openai/gpt-5.5"));
+    }
+
+    #[test]
+    fn truncate_description_bounds_long_text() {
+        // Short descriptions pass through unchanged (after trimming).
+        assert_eq!(truncate_description("  Short blurb  "), "Short blurb");
+
+        // Long descriptions are capped and get an ellipsis.
+        let long = "x".repeat(MAX_MODEL_DESCRIPTION_CHARS + 50);
+        let out = truncate_description(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), MAX_MODEL_DESCRIPTION_CHARS + 1);
+
+        // Multibyte text isn't split mid-codepoint.
+        let emoji = "🚀".repeat(MAX_MODEL_DESCRIPTION_CHARS + 10);
+        let out = truncate_description(&emoji);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), MAX_MODEL_DESCRIPTION_CHARS + 1);
+    }
+
+    #[test]
     fn default_xai_catalog_includes_grok_build_for_model_routing() {
         let defaults = default_providers_config();
         let xai = defaults
@@ -2032,6 +2553,13 @@ mod tests {
                 is_anthropic: false,
             },
             TestTarget {
+                provider_id: "open-router",
+                provider_type: ProviderType::OpenRouter,
+                base_url: "https://openrouter.ai/api/v1",
+                prefix_filters: vec![],
+                is_anthropic: false,
+            },
+            TestTarget {
                 provider_id: "xai",
                 provider_type: ProviderType::Xai,
                 base_url: "https://api.x.ai/v1",
@@ -2065,9 +2593,9 @@ mod tests {
         let mut any_stale = false;
 
         for target in &targets {
-            let api_key = get_api_key_for_provider(target.provider_type, &[]);
-            let api_key = match api_key {
+            let api_key = match get_api_key_for_provider(target.provider_type, &[]) {
                 Some(k) => k,
+                None if target.provider_id == OPENROUTER_PROVIDER_ID => String::new(),
                 None => {
                     eprintln!(
                         "[SKIP] {}: no API key found (set {} or configure in OpenCode auth)",
@@ -2080,11 +2608,24 @@ mod tests {
 
             any_checked = true;
 
+            let (models_query, sort_results_by_id) = if target.provider_id == OPENROUTER_PROVIDER_ID
+            {
+                (Some("?sort=most-popular"), false)
+            } else {
+                (None, true)
+            };
+
             let fetched = if target.is_anthropic {
                 fetch_anthropic_models(&api_key).await
             } else {
-                fetch_openai_compatible_models(target.base_url, &api_key, &target.prefix_filters)
-                    .await
+                fetch_openai_compatible_models(
+                    target.base_url,
+                    &api_key,
+                    &target.prefix_filters,
+                    models_query,
+                    sort_results_by_id,
+                )
+                .await
             };
 
             match fetched {
@@ -2166,7 +2707,7 @@ mod tests {
         if !any_checked {
             eprintln!("\n[INFO] No API keys were available. Set environment variables to check staleness:");
             eprintln!(
-                "  ANTHROPIC_API_KEY, OPENAI_API_KEY, XAI_API_KEY, CEREBRAS_API_KEY, ZHIPU_API_KEY"
+                "  ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, XAI_API_KEY, CEREBRAS_API_KEY, ZHIPU_API_KEY"
             );
         }
 

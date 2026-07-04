@@ -152,14 +152,14 @@ function ServerInfoCard() {
 
 export default function MonitoringPage() {
   return (
-    <div className="flex gap-4 p-6 h-screen">
+    <div className="flex flex-col gap-4 p-6 lg:flex-row lg:h-screen">
       {/* Server Info - Left column */}
-      <div className="w-[200px] shrink-0">
+      <div className="w-full shrink-0 lg:w-[200px]">
         <ServerInfoCard />
       </div>
 
       {/* System Monitor - Right column */}
-      <div className="flex-1 rounded-xl bg-white/[0.02] border border-white/[0.04] p-4 min-w-0 overflow-hidden">
+      <div className="flex-1 rounded-xl bg-white/[0.02] border border-white/[0.04] p-4 min-w-0 overflow-hidden max-lg:flex-none max-lg:h-[560px]">
         <SystemMonitor className="w-full h-full" />
       </div>
     </div>

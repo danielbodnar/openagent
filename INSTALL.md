@@ -30,6 +30,6 @@ systemd-nspawn container isolation.
 | **Platform** | Any OS with Docker | Ubuntu 24.04 LTS |
 | **Setup time** | ~5 minutes | ~30 minutes |
 | **Container workspaces** | Yes (with `privileged: true`) | Yes (native systemd-nspawn) |
-| **Desktop automation** | Yes (headless Xvfb) | Yes (native X11 or Xvfb) |
+| **Desktop automation** | Yes (headless Wayland/Sway) | Yes (native X11 or Xvfb) |
 | **Performance** | Good (slight overhead on macOS) | Best (native Linux) |
 | **Updates** | `docker compose build && up -d` | Git pull + cargo build, or one-click from dashboard |

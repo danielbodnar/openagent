@@ -616,19 +616,15 @@ tailscale up --advertise-exit-node
 Approve it in the Tailscale admin console (Machines → your node → “Approve exit
 node”).
 
-### 8.2 Use the `residential` workspace template
+### 8.2 Use a Tailscale workspace template
 
-This repo ships a sample template at:
+Create a workspace template that installs Tailscale — manage templates from the
+dashboard under **Config → Workspace Templates**, or store them in your Library
+repo. The template installs Tailscale and adds helper scripts:
 
-```
-library-template/workspace-template/residential.json
-```
-
-It installs Tailscale and adds helper scripts:
-
-- `sandboxed.sh-network-up` (brings up host0 veth + DHCP + DNS)
-- `sandboxed.sh-tailscale-up` (starts tailscaled + sets exit node)
-- `sandboxed.sh-tailscale-check` (prints Tailscale status + public IP)
+- `sandboxed-network-up` (brings up host0 veth + DHCP + DNS)
+- `sandboxed-tailscale-up` (starts tailscaled + sets exit node)
+- `sandboxed-tailscale-check` (prints Tailscale status + public IP)
 
 Set these **workspace env vars** (not global env):
 
@@ -640,8 +636,8 @@ Set these **workspace env vars** (not global env):
 Then inside the workspace:
 
 ```bash
-sandboxed.sh-tailscale-up
-sandboxed.sh-tailscale-check
+sandboxed-tailscale-up
+sandboxed-tailscale-check
 ```
 
 If the public IP matches your home ISP, the exit node is working.
@@ -950,7 +946,7 @@ bun install
 NEXT_PUBLIC_API_URL=https://agent.yourdomain.com bun dev
 ```
 
-Then open `http://localhost:3000`.
+Then open `http://localhost:3001` (the dev server runs on port 3001).
 
 ### 12.3 iOS App
 

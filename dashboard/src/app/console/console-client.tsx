@@ -1778,7 +1778,7 @@ export default function ConsoleClient() {
   };
 
   return (
-    <div className="flex min-h-screen flex-col p-4">
+    <div className="flex min-h-[calc(100vh-3rem)] flex-col p-4 lg:min-h-screen">
       {/* Main panel with integrated tab bar */}
       <div className="relative flex-1 min-h-0 flex flex-col rounded-lg border border-white/10 bg-[#0d0d0d] overflow-hidden">
         {/* Tab bar - inside the panel */}

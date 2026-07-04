@@ -759,7 +759,7 @@ export default function SettingsPage() {
 
   if (loading && !fileContent) {
     return (
-      <div className="h-screen flex flex-col p-6 gap-4 overflow-hidden">
+      <div className="h-[calc(100vh-3rem)] lg:h-screen flex flex-col p-6 gap-4 overflow-hidden">
         <div className="h-16 rounded-xl bg-white/[0.02] border border-white/[0.06]" />
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2">
@@ -769,14 +769,14 @@ export default function SettingsPage() {
           </div>
           <div className="h-10 w-40 rounded-lg bg-white/[0.04] border border-white/[0.06]" />
         </div>
-        <div className="flex gap-4 flex-1 min-h-0">
-          <div className="w-64 flex-shrink-0 rounded-xl bg-white/[0.02] border border-white/[0.06] p-4 space-y-3">
+        <div className="flex flex-1 min-h-0 flex-col gap-4 lg:flex-row">
+          <div className="w-full flex-shrink-0 rounded-xl bg-white/[0.02] border border-white/[0.06] p-4 space-y-3 max-lg:h-56 lg:w-64">
             <div className="h-4 w-28 rounded bg-white/[0.06]" />
             {Array.from({ length: 7 }).map((_, index) => (
               <div key={index} className="h-12 rounded-lg bg-white/[0.04]" />
             ))}
           </div>
-          <div className="flex-1 rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-4">
+          <div className="flex-1 min-h-0 rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-4">
             <div className="h-6 w-48 rounded bg-white/[0.06]" />
             <div className="code-block h-full min-h-0 p-0" />
           </div>
@@ -786,7 +786,7 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="h-screen flex flex-col p-6 gap-4 overflow-hidden">
+    <div className="h-[calc(100vh-3rem)] lg:h-screen flex flex-col p-6 gap-4 overflow-hidden">
       {/* Git Status Bar */}
       {status && (
         <div className="p-4 rounded-xl bg-white/[0.02] border border-white/[0.06]">
@@ -893,9 +893,9 @@ export default function SettingsPage() {
       )}
 
       {/* Harness Tabs and Profile Selector */}
-      <div className="flex items-center justify-between mb-2">
+      <div className="mb-2 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
         {/* Harness Tabs - Left */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {enabledHarnesses.map((harnessId) => (
             <button
               key={harnessId}
@@ -913,10 +913,10 @@ export default function SettingsPage() {
         </div>
 
         {/* Profile Selector - Right */}
-        <div className="relative" ref={profileDropdownRef}>
+        <div className="relative w-full lg:w-auto" ref={profileDropdownRef}>
           <button
             onClick={() => setShowProfileDropdown(!showProfileDropdown)}
-            className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium border border-white/[0.08] bg-white/[0.04] hover:bg-white/[0.06] text-white/80 transition-colors"
+            className="flex w-full items-center justify-between gap-2 px-3 py-2 rounded-lg text-sm font-medium border border-white/[0.08] bg-white/[0.04] hover:bg-white/[0.06] text-white/80 transition-colors lg:w-auto lg:justify-start"
           >
             <Layers className="h-4 w-4 text-white/50" />
             <span>{selectedProfile}</span>
@@ -925,7 +925,7 @@ export default function SettingsPage() {
 
           {/* Profile Dropdown */}
           {showProfileDropdown && (
-            <div className="absolute right-0 top-full mt-1 w-56 rounded-lg border border-white/[0.08] bg-[#1a1a1f] shadow-xl z-50">
+            <div className="absolute left-0 right-0 top-full mt-1 rounded-lg border border-white/[0.08] bg-[#1a1a1f] shadow-xl z-50 lg:left-auto lg:w-56">
               <div className="p-1">
                 {profiles.map((profile) => (
                   <button
@@ -1039,9 +1039,9 @@ export default function SettingsPage() {
       )}
 
       {/* Main Content: File Browser + Editor */}
-      <div className="flex gap-4 flex-1 min-h-0">
+      <div className="flex flex-1 min-h-0 flex-col gap-4 lg:flex-row">
         {/* File Browser Sidebar */}
-        <div className="w-64 flex-shrink-0 rounded-xl bg-white/[0.02] border border-white/[0.06] p-4 flex flex-col">
+        <div className="flex w-full flex-shrink-0 flex-col rounded-xl bg-white/[0.02] border border-white/[0.06] p-4 max-lg:h-56 lg:w-64">
           <div className="flex items-center gap-2 mb-4">
             <FolderOpen className="h-4 w-4 text-white/50" />
             <span className="text-sm font-medium text-white">{harnessConfig.dir}/</span>
@@ -1108,7 +1108,7 @@ export default function SettingsPage() {
         </div>
 
         {/* Editor */}
-        <div className="flex-1 flex flex-col min-h-0">
+        <div className="flex-1 min-w-0 flex flex-col min-h-0">
           {/* Editor Header */}
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-3">

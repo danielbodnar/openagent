@@ -11,8 +11,8 @@ Developer-focused UI for monitoring and controlling the Sandboxed.sh backend.
 cd dashboard
 bun install
 
-# If the backend is on :3000, run the dashboard on :3001 to avoid port conflicts.
-PORT=3001 bun dev
+# The dev server runs on :3001 (backend stays on :3000, so no port conflict).
+bun dev
 ```
 
 Configure the backend URL via:
@@ -20,4 +20,4 @@ Configure the backend URL via:
 
 ## Auth
 
-If the backend reports `auth_required=true` from `GET /api/health`, the dashboard will prompt for credentials and store a JWT in `sessionStorage`. In multi-user mode (`auth_mode=multi_user`), it asks for username + password.
+If the backend reports `auth_required=true` from `GET /api/health`, the dashboard will prompt for credentials and store a JWT in `localStorage`. In multi-user mode (`auth_mode=multi_user`), it asks for username + password.

@@ -75,8 +75,16 @@ class ApiService(
         val call = client.newCall(req)
         cont.invokeOnCancellation { call.cancel() }
         call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = cont.resumeWithException(e)
-            override fun onResponse(call: Call, response: Response) = cont.resume(response)
+            // Guard against resuming a continuation that has already been
+            // cancelled (e.g. ViewModel cleared while the request was in
+            // flight). Without the check, an uncaught IllegalStateException
+            // on the OkHttp dispatcher thread crashes the process.
+            override fun onFailure(call: Call, e: IOException) {
+                if (cont.isActive) cont.resumeWithException(e)
+            }
+            override fun onResponse(call: Call, response: Response) {
+                if (cont.isActive) cont.resume(response) else response.close()
+            }
         })
     }
 
@@ -137,9 +145,10 @@ class ApiService(
         obj["deleted_count"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
     }
 
-    suspend fun missionEvents(id: String, sinceSeq: Long? = null, limit: Int? = null, latest: Boolean? = null, types: String? = null): Pair<List<StoredEvent>, Long?> = withContext(Dispatchers.IO) {
+    suspend fun missionEvents(id: String, sinceSeq: Long? = null, beforeSeq: Long? = null, limit: Int? = null, latest: Boolean? = null, types: String? = null): Pair<List<StoredEvent>, Long?> = withContext(Dispatchers.IO) {
         val q = buildMap<String, String?> {
             if (sinceSeq != null) put("since_seq", sinceSeq.toString())
+            if (beforeSeq != null) put("before_seq", beforeSeq.toString())
             if (limit != null) put("limit", limit.toString())
             if (latest != null) put("latest", latest.toString())
             if (types != null) put("types", types)
@@ -155,7 +164,8 @@ class ApiService(
         }
     }
 
-    suspend fun sendMessage(content: String): ControlMessageResponse = postJson("/api/control/message", ControlMessageRequest(content))
+    suspend fun sendMessage(content: String, missionId: String? = null, clientMessageId: String? = null): ControlMessageResponse =
+        postJson("/api/control/message", ControlMessageRequest(content, missionId, clientMessageId))
     suspend fun cancelControl(): GenericOk = postEmpty("/api/control/cancel")
     suspend fun getQueue(): List<QueuedMessage> = getList("/api/control/queue")
     suspend fun deleteQueueItem(id: String) = withContext(Dispatchers.IO) {
@@ -247,6 +257,19 @@ class ApiService(
 
     suspend fun deleteAutomation(id: String) = withContext(Dispatchers.IO) {
         val req = newRequestBuilder(urlOf("/api/control/automations/$id")).delete().build()
+        executeText(req)
+    }
+
+    // ---- Ask (non-interrupting sidecar co-pilot) ----
+    // Thread list/detail/delete are plain JSON; the streamed turn lives in AskClient.
+    suspend fun listAskThreads(missionId: String): List<sh.sandboxed.dashboard.data.AskThread> =
+        getList("/api/control/missions/$missionId/ask/threads")
+
+    suspend fun getAskThread(missionId: String, threadId: String): sh.sandboxed.dashboard.data.AskThreadDetail =
+        getJson("/api/control/missions/$missionId/ask/threads/$threadId")
+
+    suspend fun deleteAskThread(missionId: String, threadId: String) = withContext(Dispatchers.IO) {
+        val req = newRequestBuilder(urlOf("/api/control/missions/$missionId/ask/threads/$threadId")).delete().build()
         executeText(req)
     }
 }

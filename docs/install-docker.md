@@ -58,7 +58,7 @@ By default, workspaces run in host/fallback mode — processes execute directly 
 
 ```yaml
 services:
-  sandboxed.sh:
+  sandboxed-sh:
     # ...
     privileged: true
     cgroup: host
@@ -91,7 +91,7 @@ Two Docker volumes keep data across container restarts:
 
 | Volume | Mount point | Contents |
 |---|---|---|
-| `sandboxed.sh-data` | `/root/.sandboxed-sh` | SQLite database, library, container rootfs, settings |
+| `sandboxed-data` | `/root/.sandboxed-sh` | SQLite database, library, container rootfs, settings |
 | `claude-auth` | `/root/.claude` | Claude Code OAuth credentials |
 
 To back up your data, use `docker volume inspect` to find the volume paths, or bind-mount them to host directories instead.
@@ -100,7 +100,7 @@ To back up your data, use `docker volume inspect` to find the volume paths, or b
 
 The multi-stage build produces a single image with everything pre-installed:
 
-- **Rust backend** — `sandboxed-sh`, `desktop-mcp`, `workspace-mcp` binaries
+- **Rust backend** — `sandboxed-sh`, `desktop-mcp`, `workspace-mcp`, `orchestrator-mcp`, `assistant-mcp` binaries
 - **Next.js dashboard** — standalone build served on port 3001 internally
 - **Caddy** — reverse proxy that unifies backend + dashboard on port 80
 - **Claude Code CLI** — installed via npm
@@ -108,7 +108,7 @@ The multi-stage build produces a single image with everything pre-installed:
 - **Grok CLI** — installed via npm when available
 - **Bun** and **Node.js 20**
 - **systemd-container + debootstrap** — for container workspace isolation
-- **Desktop automation** — Xvfb, i3, Chromium, xdotool, scrot, ImageMagick, Tesseract OCR
+- **Desktop automation** — Sway (Wayland), grim, wtype, wlrctl, wf-recorder, Chromium, ImageMagick, Tesseract OCR
 - **Utilities** — git, curl, jq, SSH client, gnupg
 
 ## Production deployment
@@ -156,7 +156,7 @@ docker compose up -d
 | Permission denied on SSH keys | Ensure `~/.ssh` on the host is readable by your user |
 | Port conflict on 3000 | Change the port mapping (e.g. `"8080:80"`) in `docker-compose.yml` |
 | Build takes too long | Rust compilation is the bottleneck (~5–10 min first time). Subsequent builds use Docker layer caching. |
-| Backend not starting | Check logs with `docker compose logs -f sandboxed.sh` |
+| Backend not starting | Check logs with `docker compose logs -f sandboxed-sh` |
 
 ## Comparison with native installation
 
